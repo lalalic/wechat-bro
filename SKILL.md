@@ -131,9 +131,13 @@ Get single contact details.  Arg: `id`.
 Send a text message (always watermarked).  Args: `to`, `content`.
 - `@contactid` supported
 - markdown formatting is auto‑converted to Unicode bold/italic/mono (see below).
+- `````marpit / `````mermaid code blocks are auto‑rendered to files/images (multiple blocks supported).
 ```json
 → {"cmd":"send","to":"testneo","content":"@alice check the **PR**"}
 ← {"ok":true,"data":{"sent":true,"to":"testneo"}}
+
+→ {"cmd":"send","to":"filehelper","content":"Flow:\\n```mermaid\\ngraph TD\\n  A-->B\\n```"}
+← {"ok":true,"data":{"sent":true,"to":"filehelper","files":[{"file":"diagram.png","type":"mermaid"}],"caption":"Flow:"}}
 ```
 
 ### `send-image`
@@ -178,6 +182,28 @@ Shut down gracefully.
 ```json
 → {"cmd":"exit"}
 ← {"ok":true}
+```
+
+## Auto-Render: Marpit & Mermaid
+
+When `send` content contains ````marpit` or ````mermaid` code blocks, the CLI
+auto-renders each one and sends the results as files/images.  Any text before,
+between, or after blocks is also sent as a normal message (with `@mention`).
+
+| Block | Tool | Sent as |
+|---|---|---|
+| ````marpit` | `@marp-team/marp-cli` | `slides.html`, `slides-2.html`, … |
+| ````mermaid` | `@mermaid-js/mermaid-cli` | `diagram.png`, `diagram-2.png`, … |
+
+**Multiple blocks** are supported — all ````marpit` and ````mermaid` blocks in
+content are processed in order.  Tools run via `npx` (auto-downloaded if
+missing).  Response includes a `files` array:
+
+```json
+← {"ok":true,"data":{"sent":true,"to":"filehelper","files":[
+    {"file":"diagram.png","type":"mermaid"},
+    {"file":"slides.html","type":"marpit"}
+  ],"caption":"See attached."}}
 ```
 
 ## Markdown Styling

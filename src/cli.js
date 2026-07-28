@@ -32,6 +32,9 @@
  *   send              → {sent: true, to}              (args: --to, --content)
  *                                                     @contactid in content auto-converted to @Name 
  *                                                     (always watermarked)
+ *                                                     ```marpit → slide HTML files
+ *                                                     ```mermaid → diagram PNG images
+ *                                                     (multiple blocks supported, rendered in order)
  *   send-image        → {sent: true, to, file}        (args: --to, --path, [--filename])
  *   send-file         → {sent: true, to, file}        (args: --to, --path, --filename)
  *   send-voice        → {sent, to, transcription}     (args: --to, --path)
@@ -94,6 +97,7 @@ function toLoginUrl(qrUrl) {
 }
 
 let lastQrUrl = null
+let chromePath = null  // detected in main(), used by mermaid render
 
 // ── Write JSON to stdout (with newline) ───────────────────────────────────
 function write(obj) {
@@ -109,7 +113,7 @@ async function main() {
   // Ensure data directory exists
   fs.mkdirSync(DATA_DIR, { recursive: true })
 
-  const chromePath = process.env.CHROME_PATH || findChrome()
+  chromePath = process.env.CHROME_PATH || findChrome()
   log('Chrome:', chromePath, HEADED ? '(headed)' : '(headless)')
 
   const browser = await puppeteer.launch({
@@ -162,6 +166,15 @@ async function main() {
     // Append message events to JSONL file for external agents
     if ((event === 'message' || event.startsWith('message:')) && msgFd) {
       try { fs.writeSync(msgFd, JSON.stringify(line) + '\n') } catch {}
+    }
+    // Show QR code: stderr + open image in browser when headless
+    if (event === 'scan' && data && data.url) {
+      try { qrTerm.generate(data.url, { small: true }) } catch {}
+      if (!HEADED && data.url !== lastQrUrl) {
+        lastQrUrl = data.url
+        const openCmd = process.platform === 'win32' ? 'start' : (process.platform === 'darwin' ? 'open' : 'xdg-open')
+        execSync(`${openCmd} "${data.url}" 2>/dev/null || true`, { shell: true })
+      }
     }
   })
 
@@ -218,6 +231,69 @@ async function main() {
   process.exit(0)
 }
 
+// ── Send text with @mention conversion (shared helper) ──────────────────
+async function sendText(page, to, content) {
+  return page.evaluate((to, content) => {
+    const WB = window.WechatyBro
+    const resolved = WB._resolveUserName(to) || to
+    const isRoom = resolved.startsWith('@@')
+    content = content.replace(/@(\w[\w@.-]*)/g, (match, id) => {
+      const un = WB._resolveUserName(id)
+      if (!un) return match
+      const mention = isRoom ? WB.at(un, resolved) : WB.at(un)
+      return mention || match
+    })
+    return WB.send(to, content, true)
+  }, to, content)
+}
+
+// ── Parse content into segments ─────────────────────────────────────────
+// Returns [{ type: 'text'|'marpit'|'mermaid', content: string }]
+function parseSegments(content) {
+  const segs = []
+  let remaining = content
+  while (remaining.length) {
+    // Find the next fenced block (marpit or mermaid) at line start
+    let best = null
+    for (const lang of ['marpit', 'mermaid']) {
+      const fence = '```' + lang + '\n'
+      // Only match at position 0 or after a newline
+      let idx = -1
+      if (remaining.startsWith(fence)) {
+        idx = 0
+      } else {
+        idx = remaining.indexOf('\n' + fence)
+        if (idx !== -1) idx += 1  // point to the fence itself
+      }
+      if (idx !== -1 && (best === null || idx < best.idx)) {
+        best = { idx, lang, fenceLen: fence.length }
+      }
+    }
+    if (!best) break  // no more blocks
+
+    // Text before the block
+    if (best.idx > 0) {
+      const before = remaining.slice(0, best.idx).trim()
+      if (before) segs.push({ type: 'text', content: before })
+    }
+
+    // The block itself
+    const blockStart = best.idx + best.fenceLen
+    const endIdx = remaining.indexOf('```', blockStart)
+    if (endIdx === -1) { // unclosed fence → treat rest as text
+      segs.push({ type: 'text', content: remaining.slice(best.idx).trim() })
+      remaining = ''
+      break
+    }
+    segs.push({ type: best.lang, content: remaining.slice(blockStart, endIdx).trim() })
+    remaining = remaining.slice(endIdx + 3)
+  }
+  // Trailing text
+  const trail = remaining.trim()
+  if (trail) segs.push({ type: 'text', content: trail })
+  return segs
+}
+
 // ── Command dispatcher ────────────────────────────────────────────────────
 async function dispatch(cmd, args, page) {
   switch (cmd) {
@@ -238,23 +314,77 @@ async function dispatch(cmd, args, page) {
     case 'send':
       if (!args.to) throw new Error('Missing --to')
       if (!args.content) throw new Error('Missing --content')
-      return page.evaluate((to, content) => {
-        // Auto-convert @contactid → @Name\u2005 using the room context
-        // so the agent can write  @alice check this  and it becomes a real mention.
-        const WB = window.WechatyBro
-        const resolved = WB._resolveUserName(to) || to
-        const isRoom = resolved.startsWith('@@')
-        content = content.replace(/@(\w[\w@.-]*)/g, (match, id) => {
-          // resolve the mentioned id
-          const un = WB._resolveUserName(id)
-          if (!un) return match  // not a known contact, leave as-is
-          // Check if the target is within the same room (if this is a room msg)
-          const mention = isRoom ? WB.at(un, resolved) : WB.at(un)
-          return mention || match
-        })
-        const ok = WB.send(to, content, true)
-        return { sent: ok, to }
-      }, args.to, args.content)
+
+      // ── Parse content into segments ──────────────────────────────────
+      const segs = parseSegments(args.content)
+      const renderable = segs.filter(s => s.type === 'marpit' || s.type === 'mermaid')
+
+      if (renderable.length === 0) {
+        // Plain text — no blocks to render
+        return sendText(page, args.to, args.content)
+      }
+
+      // ── Render each block, collect text segments ─────────────────────
+      let marpitN = 0, mermaidN = 0
+      const files = []
+      const captionParts = []
+      const tmpDirs = []
+
+      for (const seg of segs) {
+        if (seg.type === 'text') {
+          captionParts.push(seg.content)
+          continue
+        }
+
+        if (seg.type === 'marpit') {
+          marpitN++
+          const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wx-marpit-'))
+          tmpDirs.push(tmpDir)
+          const mdFile = path.join(tmpDir, 'slides.md')
+          const outFile = path.join(tmpDir, 'slides.html')
+          const fname = marpitN === 1 ? 'slides.html' : `slides-${marpitN}.html`
+          try {
+            fs.writeFileSync(mdFile, seg.content)
+            execSync(`npx @marp-team/marp-cli "${mdFile}" -o "${outFile}"`, { timeout: 30000, stdio: 'pipe' })
+            const htmlBuf = fs.readFileSync(outFile)
+            await sendFile(page, args.to, htmlBuf, fname)
+            files.push({ file: fname, type: 'marpit' })
+          } catch (e) {
+            throw new Error(`marpit render failed: ${e.message}`)
+          }
+        }
+
+        if (seg.type === 'mermaid') {
+          mermaidN++
+          const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wx-mermaid-'))
+          tmpDirs.push(tmpDir)
+          const mmdFile = path.join(tmpDir, 'diagram.mmd')
+          const pngFile = path.join(tmpDir, 'diagram.png')
+          const fname = mermaidN === 1 ? 'diagram.png' : `diagram-${mermaidN}.png`
+          try {
+            fs.writeFileSync(mmdFile, seg.content)
+            execSync(`npx @mermaid-js/mermaid-cli -i "${mmdFile}" -o "${pngFile}"`, {
+              timeout: 120000,
+              stdio: 'pipe',
+              env: { ...process.env, PUPPETEER_EXECUTABLE_PATH: chromePath },
+            })
+            const pngBuf = fs.readFileSync(pngFile)
+            await sendImage(page, args.to, pngBuf, fname)
+            files.push({ file: fname, type: 'mermaid' })
+          } catch (e) {
+            throw new Error(`mermaid render failed: ${e.message}`)
+          }
+        }
+      }
+
+      // ── Cleanup temp dirs ────────────────────────────────────────────
+      for (const d of tmpDirs) try { fs.rmSync(d, { recursive: true }) } catch {}
+
+      // ── Send remaining text ──────────────────────────────────────────
+      const caption = captionParts.join('\n\n')
+      if (caption) await sendText(page, args.to, caption)
+
+      return { sent: true, to: args.to, files, caption: caption || undefined }
 
     case 'send-image':
       if (!args.to) throw new Error('Missing --to')
@@ -300,7 +430,13 @@ async function dispatch(cmd, args, page) {
   }
 }
 
-main().catch(e => {
-  log('Fatal:', e.message)
-  process.exit(1)
-})
+// Only auto-run when executed directly (not when required for tests)
+if (require.main === module) {
+  main().catch(e => {
+    log('Fatal:', e.message)
+    process.exit(1)
+  })
+}
+
+// Exported for unit tests
+module.exports = { parseSegments }
