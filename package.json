@@ -1,0 +1,39 @@
+{
+  "name": "wechat-bro",
+  "version": "0.1.0",
+  "description": "AI agent interface for WeChat Web — send/receive messages, manage contacts, upload media, transcribe voice",
+  "type": "commonjs",
+  "bin": {
+    "wechat-bro": "./src/cli.js"
+  },
+  "files": [
+    "src/",
+    "SKILL.md",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node src/cli.js",
+    "test": "node test/test-inject.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "puppeteer-core": "^25.4.0",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lalalic/wechat-bro.git"
+  },
+  "keywords": [
+    "wechat",
+    "weixin",
+    "chatbot",
+    "agent",
+    "ai",
+    "copilot",
+    "wx.qq.com"
+  ],
+  "license": "MIT"
+}

@@ -1,0 +1,5 @@
+node_modules/
+.wx-cookies.json
+test-room-messages.js
+*.log
+.DS_Store
