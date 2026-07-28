@@ -33,7 +33,7 @@ AI agent interface for WeChat Web. Injects into [wx.qq.com](https://wx.qq.com) a
 npm install
 ```
 
-Requires Chrome/Chromium on the system. Auto-detects common install locations on macOS, Linux, and Windows.
+Auto-detects system Chrome/Chromium on macOS, Linux, and Windows. If none is found, downloads Chromium automatically to `~/.wechat-bro/chromium/`.
 
 ## Quick Start
 
@@ -59,7 +59,7 @@ Events stream as JSON lines to stdout:
 ### Option 2: With Puppeteer
 
 ```js
-const puppeteer = require('puppeteer-core')
+const puppeteer = require('puppeteer')
 const fs = require('fs')
 const { sendImage, sendFile } = require('./src/upload')
 

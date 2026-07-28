@@ -51,12 +51,15 @@ const path = require('path')
 const os = require('os')
 const { execSync } = require('child_process')
 const readline = require('readline')
-const puppeteer = require('puppeteer-core')
+const puppeteer = require('puppeteer')
 const qrTerm = require('qrcode-terminal')
 const { transcribeVoice, transcribeFile } = require('./transcribe')
 const { sendImage, sendFile } = require('./upload')
 
 const DATA_DIR = path.join(os.homedir(), '.wechat-bro')
+// Tell puppeteer where to find/store Chromium
+process.env.PUPPETEER_CACHE_DIR = path.join(DATA_DIR, 'chromium')
+
 const COOKIE_FILE = path.join(DATA_DIR, 'cookies.json')
 const MESSAGES_FILE = path.join(DATA_DIR, 'messages.jsonl')
 
@@ -67,7 +70,7 @@ const HEADED = process.argv.includes('--headed')
 const LOGIN_TIMEOUT = 300_000
 
 // ── Chrome detection ──────────────────────────────────────────────────────
-function findChrome() {
+async function findChrome() {
   const { platform } = process
   const isWin = platform === 'win32'
   const candidates = [
@@ -88,7 +91,18 @@ function findChrome() {
     const nullDev = isWin ? 'nul' : '/dev/null'
     return execSync(`${whichCmd} google-chrome chrome chromium chromium-browser 2>${nullDev}`, { encoding: 'utf-8', shell: true }).trim().split(/\r?\n/)[0]
   } catch {}
-  throw new Error('Chrome not found. Set CHROME_PATH env var.')
+  // Fallback: puppeteer's bundled Chromium (auto-downloaded to ~/.wechat-bro/chromium/)
+  try {
+    const p = typeof puppeteer.executablePath === 'function' ? await puppeteer.executablePath() : puppeteer.executablePath()
+    if (p && fs.existsSync(p)) return p
+  } catch {}
+  log('Chromium not found — downloading (this may take a while)...')
+  const browserDir = path.join(DATA_DIR, 'chromium')
+  fs.mkdirSync(browserDir, { recursive: true })
+  execSync(`npx @puppeteer/browsers install chrome@stable --path "${browserDir}"`, { timeout: 300000, stdio: 'inherit' })
+  const p = typeof puppeteer.executablePath === 'function' ? await puppeteer.executablePath() : puppeteer.executablePath()
+  if (p && fs.existsSync(p)) return p
+  throw new Error('Chromium download failed. Set CHROME_PATH env var.')
 }
 
 function toLoginUrl(qrUrl) {
@@ -113,7 +127,7 @@ async function main() {
   // Ensure data directory exists
   fs.mkdirSync(DATA_DIR, { recursive: true })
 
-  chromePath = process.env.CHROME_PATH || findChrome()
+  chromePath = process.env.CHROME_PATH || await findChrome()
   log('Chrome:', chromePath, HEADED ? '(headed)' : '(headless)')
 
   const browser = await puppeteer.launch({

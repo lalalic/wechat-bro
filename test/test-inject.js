@@ -26,7 +26,7 @@
 
 'use strict'
 
-const puppeteer = require('puppeteer-core')
+const puppeteer = require('puppeteer')
 const fs = require('fs')
 const path = require('path')
 const os = require('os')

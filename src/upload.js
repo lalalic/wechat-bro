@@ -115,7 +115,7 @@ async function uploadMedia(page, to, fileBuffer, filename) {
 
 /**
  * Send an image to a contact.
- * @param {import('puppeteer-core').Page} page
+ * @param {import('puppeteer').Page} page
  * @param {string} to - pyId or UserName
  * @param {Buffer} imageBuffer - image file contents
  * @param {string} [filename='image.png']
@@ -129,7 +129,7 @@ async function sendImage(page, to, imageBuffer, filename) {
 
 /**
  * Send a file to a contact.
- * @param {import('puppeteer-core').Page} page
+ * @param {import('puppeteer').Page} page
  * @param {string} to - pyId or UserName
  * @param {Buffer} fileBuffer - file contents
  * @param {string} filename - e.g. 'report.pdf'

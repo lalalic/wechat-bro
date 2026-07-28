@@ -13,13 +13,14 @@
   ],
   "scripts": {
     "start": "node src/cli.js",
-    "test": "node test/test-inject.js"
+    "test": "node test/test-inject.js",
+    "postinstall": "node -e \"const p=require('path'),o=require('os'),d=p.join(o.homedir(),'.wechat-bro','chromium');process.env.PUPPETEER_CACHE_DIR=d;const pup=require('puppeteer');(async()=>{try{await pup.executablePath()}catch{require('child_process').execSync('npx @puppeteer/browsers install chrome@stable --path \\\"'+d+'\\\"',{stdio:'inherit',timeout:300000})}})()\""
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
-    "puppeteer-core": "^25.4.0",
+    "puppeteer": "^25.4.0",
     "qrcode-terminal": "^0.12.0"
   },
   "repository": {
