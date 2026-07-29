@@ -1,19 +1,20 @@
 # wechat-bro
 
-AI agent interface for WeChat Web. Injects into [wx.qq.com](https://wx.qq.com) and exposes a JSON-line protocol for automation.
+AI multi-agent interface for WeChat Web. Injects into [wx.qq.com](https://wx.qq.com) and exposes a WebSocket protocol for multi-agent automation.
 
-**Works with**: Puppeteer, Playwright, Electron, or any environment that runs Chromium with DevTools Protocol.
+**Works with**: Any WebSocket client (agent frameworks, Copilot extensions, custom scripts).
 
 ## Architecture
 
 ```
-┌──────────────┐   stdin (JSON)    ┌──────────────────┐
-│  AI Agent    │ ───────────────→  │  src/cli.js      │──→ wx.qq.com
-│  (Copilot…)  │ ←───────────────  │  (long‑lived)    │──→ Chrome
-└──────────────┘   stdout (JSON)   └──────────────────┘
-                       │
-                       ▼ write message events
-              ~/.wechat-bro/messages.jsonl
+                    ┌──────────────────┐
+ Agent A ──ws──────→│                  │
+ Agent B ──ws──────→│  src/cli.js      │──→ wx.qq.com
+ Agent C ──ws──────→│  (long‑lived)    │──→ Chrome
+                    └──────────────────┘
+                           │
+                           ▼ stdout (events + backward compat stdin)
+                           ▼ ~/.wechat-bro/messages.jsonl
 ```
 
 **Files:**
@@ -21,7 +22,8 @@ AI agent interface for WeChat Web. Injects into [wx.qq.com](https://wx.qq.com) a
 | Path | Role |
 |---|---|
 | `src/wechat-bro.js` | Browser-side script. Injects `window.WechatyBro` into wx.qq.com. |
-| `src/cli.js` | Stdin/stdout JSON-line interface for AI agents. |
+| `src/cli.js` | WebSocket server (port 9231) + stdin interface for AI agents. |
+| `src/ws-server.js` | WebSocket server module with multi-agent broadcast. |
 | `src/upload.js` | Media upload via `curl -6`. Exports `sendImage()`, `sendFile()`. |
 | `src/transcribe.js` | Voice transcription via Whisper STT. |
 | `test/test-inject.js` | 102 integration tests with real Chrome + WeChat account. |
@@ -39,10 +41,13 @@ Auto-detects system Chrome/Chromium on macOS, Linux, and Windows. If none is fou
 
 ```bash
 # First run (will show QR code for login):
-echo '{"cmd":"status"}' | npx wechat-bro --headed
+wechat-bro --headed
 
 # Subsequent runs — headless with saved cookies:
-echo '{"cmd":"contacts"}' | npx wechat-bro
+wechat-bro
+
+# Connect agents via WebSocket:
+ws://localhost:9231
 ```
 
 Events stream as JSON lines to stdout:

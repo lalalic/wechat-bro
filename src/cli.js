@@ -1,28 +1,23 @@
 #!/usr/bin/env node
 
 /**
- * cli.js — Stdin/stdout JSON-line interface for AI agents.
+ * cli.js — WebSocket + stdin JSON-line interface for AI agents.
  *
- * A single long-running process. Reads JSON commands from stdin, writes
- * JSON responses and streaming events to stdout.
+ * Runs a single long-lived Chrome process logged into wx.qq.com.
+ * Supports multiple agents via WebSocket (ws://localhost:9231).
+ * Also reads JSON commands from stdin for backward compatibility.
  *
  * Usage:
- *   node cli.js                    # Headless
+ *   node cli.js                    # Headless, WebSocket on :9231
  *   node cli.js --headed           # Show browser
  *   node cli.js --first-login      # Force QR re-login
+ *   node cli.js --ws-port 9231     # Custom WebSocket port
  *
- * Protocol (JSON lines on stdin/stdout):
- *
- *   ← {"event":"heartbeat","data":"heartbeat@browser","ts":...}
- *   → {"cmd":"contacts","id":"1"}
- *   ← {"ok":true,"id":"1","data":[{...}]}
- *   → {"cmd":"send","to":"filehelper","content":"Hello"}
- *   ← {"ok":true,"data":{"sent":true,"to":"filehelper"}}
- *   → {"cmd":"exit"}
- *   ← {"ok":true}
- *
- * The `id` field is optional — if included in the request, it's echoed
- * in the response so the agent can correlate requests and responses.
+ * WebSocket Protocol:
+ *   Agent → Server:  {"cmd":"auth","agent":"testneo"}   # optional, identify
+ *   Agent → Server:  {"cmd":"contacts","id":"req-1"}    # any command
+ *   Server → Agent:  {"ok":true,"id":"req-1","data":[]} # response
+ *   Server → Agent:  {"event":"message","data":{},"ts":...} # broadcast event
  *
  * Commands:
  *   contacts          → [{id, name, UserName, isRoomContact, memberCount}]
@@ -30,17 +25,12 @@
  *   room-members      → [{id, name, UserName, ...}]  (args: --id <roomId>)
  *   get-contact       → {id, name, ...}               (args: --id <contactId>)
  *   send              → {sent: true, to}              (args: --to, --content)
- *                                                     @contactid in content auto-converted to @Name 
- *                                                     (always watermarked)
- *                                                     ```marpit → slide HTML files
- *                                                     ```mermaid → diagram PNG images
- *                                                     (multiple blocks supported, rendered in order)
  *   send-image        → {sent: true, to, file}        (args: --to, --path, [--filename])
  *   send-file         → {sent: true, to, file}        (args: --to, --path, --filename)
  *   send-voice        → {sent, to, transcription}     (args: --to, --path)
- *                                                     transcribes audio via Whisper, sends as text
  *   status            → {loggedIn, contactsReady, lastMsgTime}
  *   supported-emojis  → [string]
+ *   ping              → {pong: true, ts: ...}         (liveness check)
  *   exit              → shut down
  */
 
@@ -55,6 +45,7 @@ const puppeteer = require('puppeteer')
 const qrTerm = require('qrcode-terminal')
 const { transcribeVoice, transcribeFile } = require('./transcribe')
 const { sendImage, sendFile } = require('./upload')
+const wsServer = require('./ws-server')
 
 const DATA_DIR = path.join(os.homedir(), '.wechat-bro')
 // Tell puppeteer where to find/store Chromium
@@ -112,15 +103,33 @@ function toLoginUrl(qrUrl) {
 
 let lastQrUrl = null
 let chromePath = null  // detected in main(), used by mermaid render
+let _wsBroadcast = null  // set by main() for event broadcasting
 
-// ── Write JSON to stdout (with newline) ───────────────────────────────────
+// ── Write JSON to stdout (with newline) + broadcast to WebSocket ──────────
 function write(obj) {
   process.stdout.write(JSON.stringify(obj) + '\n')
+  // Broadcast events (not responses) to WebSocket clients
+  if (_wsBroadcast && obj && obj.event) {
+    _wsBroadcast(obj)
+  }
 }
 
 function log(...args) {
   process.stderr.write(`[cli] ${args.join(' ')}\n`)
 }
+
+// ── Graceful shutdown ─────────────────────────────────────────────────────
+let _wsServer = null  // set by main()
+
+function shutdown() {
+  log('Shutting down...')
+  if (_wsServer) {
+    try { _wsServer.close() } catch {}
+  }
+}
+
+process.on('SIGINT', () => { shutdown(); process.exit(0) })
+process.on('SIGTERM', () => { shutdown(); process.exit(0) })
 
 // ── Main ──────────────────────────────────────────────────────────────────
 async function main() {
@@ -129,6 +138,17 @@ async function main() {
 
   chromePath = process.env.CHROME_PATH || await findChrome()
   log('Chrome:', chromePath, HEADED ? '(headed)' : '(headless)')
+
+  // ── WebSocket server (dispatch updated below after page is ready) ──────
+  const WS_PORT = parseInt(process.env.WS_PORT || process.argv.find(a => a.startsWith('--ws-port='))?.split('=')[1] || '9231', 10)
+  let wsDispatch = async () => { throw new Error('dispatch not ready') }
+  const ws = wsServer.create({
+    port: WS_PORT,
+    dispatch: (cmd, args) => wsDispatch(cmd, args),
+  })
+  _wsBroadcast = ws.broadcast
+  _wsServer = ws
+  log(`WebSocket server: ws://localhost:${WS_PORT}`)
 
   const browser = await puppeteer.launch({
     executablePath: chromePath,
@@ -211,6 +231,15 @@ async function main() {
 
   // Emit a "ready" event so the agent knows it can start sending commands
   write({ event: 'ready', data: { loggedIn: isLoggedIn, contactsReady: true } })
+
+  // ── Wire up WebSocket dispatch (now that page is ready) ───────────────
+  wsDispatch = async (cmd, args) => {
+    if (cmd === 'exit') {
+      await browser.close()
+      process.exit(0)
+    }
+    return dispatch(cmd, args, page)
+  }
 
   // ── Stdin reader — JSON commands ──────────────────────────────────────
   const rl = readline.createInterface({ input: process.stdin, terminal: false })

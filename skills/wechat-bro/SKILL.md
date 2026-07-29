@@ -10,45 +10,42 @@ description: >-
 
 ## Overview
 
-**wechat-bro** is a stdin/stdout JSON‑line process that lets an AI agent
+**wechat-bro** is a WebSocket + stdin JSON‑line process that lets AI agents
 interact with WeChat Web.  It launches a headless Chrome, logs into
-[wx.qq.com](https://wx.qq.com), and keeps a persistent session.  The agent
-sends JSON commands on **stdin** and reads JSON responses + streaming events
-from **stdout**.
+[wx.qq.com](https://wx.qq.com), and keeps a persistent session.  Multiple
+agents can connect simultaneously via WebSocket.
 
-```
-┌──────────────┐   stdin (JSON)    ┌──────────────────┐
-│   AI Agent   │ ───────────────→  │  wechat-bro-cli  │──→ wx.qq.com
-│  (Copilot…)  │ ←───────────────  │  (long‑lived)    │──→ Chrome
-└──────────────┘   stdout (JSON)   └──────────────────┘
+```asciiart
+                    ┌──────────────────┐
+ Agent A ──ws──────→│                  │
+ Agent B ──ws──────→│  wechat-bro-cli  │──→ wx.qq.com
+ Agent C ──ws──────→│  (long‑lived)    │──→ Chrome
+                    └──────────────────┘
+                           │
+                           ▼ stdout (events + backward compat stdin)
 ```
 
 ## Quick Start
 
 ```bash
-# Install from npm (or use via npx):
-npm install -g wechat-bro
+npx wechat-bro --help
 
-# First run (will show QR code for login):
-echo '{"cmd":"status"}' | wechat-bro --headed
-
-# Or via npx without installing:
-echo '{"cmd":"status"}' | npx wechat-bro --headed
-
-# Subsequent runs reuse saved cookies — headless works:
-echo '{"cmd":"contacts"}' | wechat-bro
+# Connect from an agent (WebSocket):
+ws://localhost:9231
 ```
 
-Once running, the process stays alive until stdin closes or it receives
-`{"cmd":"exit"}`.  Events stream continuously to stdout.
+The process stays alive until it receives `{"cmd":"exit"}`.
 
-## Protocol
+## WebSocket Protocol
 
-### Request format (stdin)
+Connect to `ws://localhost:9231`.  Send/receive JSON messages.
 
-One JSON object per line:
+### Agent → Server (request)
+
 ```json
-{"cmd":"contacts","id":"req-1"}
+{"cmd":"auth","agent":"testneo"}   # optional identification
+{"cmd":"contacts","id":"req-1"}    # any command
+{"cmd":"ping"}                     # liveness check
 ```
 
 | field | required | description |
@@ -56,7 +53,7 @@ One JSON object per line:
 | `cmd` | yes | Command name (see below) |
 | `id` | no | Opaque string echoed in response for correlation |
 
-### Response format (stdout)
+### Server → Agent (response)
 
 ```json
 {"ok":true,"id":"req-1","data":[...]}
@@ -69,15 +66,15 @@ One JSON object per line:
 | `data` | Command result |
 | `error` | Error message (when `ok` is false) |
 
-### Streaming events
+### Server → Agent (events — broadcast to all connected agents)
 
-Interleaved with responses.  Every event has the shape:
 ```json
-{"event":"<type>","data":{...},"ts":<unix_ms>}
+{"event":"message","data":{...},"ts":<unix_ms>}
 ```
 
 | event | when | data |
 |---|---|---|
+| `connected` | On connect | `{clientId, serverId}` |
 | `ready` | After login + contacts loaded | `{loggedIn, contactsReady}` |
 | `scan` | QR code displayed/updated | `{code, url, loginUrl, userAvatar?}` |
 | `login` | User logged in | `{id, name, UserName, …}` |
@@ -89,6 +86,14 @@ Interleaved with responses.  Every event has the shape:
 | `message:voice` | Incoming voice memo | Same + `voiceBase64` + `voiceText` (transcribed) |
 | `message:*` | Other types | Same pattern |
 | `heartbeat` | Every ~30s liveness check | `"heartbeat@browser"` |
+
+### stdin mode
+
+The process also accepts JSON commands on stdin (one per line) for pipe mode:
+
+```bash
+echo '{"cmd":"contacts"}' | npx wechat-bro
+```
 
 ## Commands
 
@@ -190,11 +195,6 @@ When `send` content contains ````marpit` or ````mermaid` code blocks, the CLI
 auto-renders each one and sends the results as files/images.  Any text before,
 between, or after blocks is also sent as a normal message (with `@mention`).
 
-| Block | Tool | Sent as |
-|---|---|---|
-| ````marpit` | `@marp-team/marp-cli` | `slides.html`, `slides-2.html`, … |
-| ````mermaid` | `@mermaid-js/mermaid-cli` | `diagram.png`, `diagram-2.png`, … |
-
 **Multiple blocks** are supported — all ````marpit` and ````mermaid` blocks in
 content are processed in order.  Tools run via `npx` (auto-downloaded if
 missing).  Response includes a `files` array:
@@ -221,68 +221,41 @@ missing).  Response includes a `files` array:
 | `# Heading` | **Heading** + separator |
 | `> quote` | ❙ quote (blockquote) |
 
-## Agent Integration: Watching messages.jsonl
+## Agent Integration
+Strongly recommended: 
+* use the `wechat-orchestrator` agent to manage multiple contacts
+* delegate contact conversations to `wechat-contact-maintainer` subagents.
+* use wechat-bro stdin mode to send commands and receive command result in JSONL format.
+* use wechat-bro WebSocket mode to monitor specified contacts message and send to llm then let llm follow up.
 
-LLM agent frameworks work in a **request/response tool loop**.  Polling or
-blocking for messages wastes tokens or blocks the agent.  Instead, wechat-bro
-appends incoming message events to a **JSONL file** that an external agent can
-watch independently.
+### wechat-orchestrator Agent
+The `wechat-orchestrator` agent is responsible for:
+- create `wechat-contact-maintainer` subagents for specified contact to delegate conversations.
+  - make conversation rules, including general and contact-specific rules, and pass them to subagents.
+  - provide context to subagents, including contact ID, name, message content, and whether it's a group chat.
+  - persistent session and context across restarts, including contact list and subagent states.
+- maintain a list of monitored contacts and their subagents. save the list to disk for persistence across restarts.
+  - pi agent: use `pi-subagents` `chain` to maintain the list of subagents.
+  - other agents(codex, claude, copilot): figure out yourself
+- communicate to user via wechat `filehelper` contact
+- constantly update general and specific rules for subagents based on user feedback.
 
-### Data directory
+#### general rules
+- remind user to respond to contacts that subagents report on.
+- ask contact subagent to provide its own conversation information, such as summary, context, and history, to help the orchestrator make better decisions.
+- save user uploaded knowledge base to `~/.wechat-bro/contacts/<contact-id>/knowledge/` folder, including text, pdf, and other documents.
 
-All persistent data lives under `~/.wechat-bro/`:
 
-| File | Purpose |
-|---|---|
-| `cookies.json` | Saved login session (auto-loaded on restart) |
-| `messages.jsonl` | Incoming message events, one JSON line per event |
+### wechat-contact-maintainer Agent
+The `wechat-contact-maintainer` agent handles individual contact conversations. It receives context from the orchestrator and uses `wechat-bro` to send replies. It is designed to maintain a natural and helpful conversation with the assigned contact, using their preferred language and style.
 
-### Watching for new messages
-
-External agents (Copilot extensions, Claude MCP servers, pi pipeline steps)
-can **tail `~/.wechat-bro/messages.jsonl`** or watch for changes using
-`fs.watch` / `inotify` / `fswatch`.
-
-```bash
-# Simple tail (last ~10 lines)
-tail -n 10 ~/.wechat-bro/messages.jsonl
-
-# Continuous follow (new messages as they arrive)
-tail -f ~/.wechat-bro/messages.jsonl | while read line; do
-  echo "New message: $line"
-  # inject into agent conversation...
-done
-```
-
-The JSONL file contains only **message events** (`message`, `message:text`,
-`message:image`, `message:voice`, etc.) — one per line.  Heartbeats and
-other system events are not written to the file (they still stream to stdout).
-
-Each line:
-```json
-{"event":"message:text","data":{"Content":"你好","from":"alice",…},"ts":…}
-```
-
-## Voice Transcription
-
-Voice messages are automatically transcribed via Whisper STT:
-```bash
-uvx --from openai-whisper whisper <audio> --output_format=txt --language=zh
-```
-The transcribed text is attached as `voiceText` in the `message:voice` event.
-
-## Contact Identification
-
-Contacts have **stable PYQuanPin‑based IDs** that persist across login
-sessions (unlike `UserName` which changes).  The ID is derived from
-`RemarkPYQuanPin` or `PYQuanPin`, lowercased.
-
-All methods accept either a stable ID (`alice`), a UserName (`@abc…`), or
-a special name (`filehelper`, `weixin`).
-
-## Media Upload
-
-Files are uploaded via `curl -6` to `file.wx.qq.com` (requires IPv6).
-Use the `send-image` and `send-file` commands, or the
-`src/upload.js` module directly.
-
+#### general rules
+- **don't** provide any personal information about the user or the orchestrator agent.
+- **make responses natural, friendly, grounding on the contact's message and context.**
+- **if don't know the answer**, report to the wechat orchestrator agent.
+- **use the contact's preferred language for replies.** default: 中文
+- learn for the contact's preferences and style, and adapt responses accordingly.
+- remember learnings from account owner's message
+- save assets to own `~/.wechat-bro/contacts/<contact-id>/` folder
+  - organize assets by type (images, audio, documents, etc.)
+  - `knowledge/`: user uploaded knowledge base, including text, pdf, and other documents.
