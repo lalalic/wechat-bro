@@ -43,6 +43,7 @@ const { execSync } = require('child_process')
 const readline = require('readline')
 const puppeteer = require('puppeteer')
 const qrTerm = require('qrcode-terminal')
+const WebSocket = require('ws')
 const { transcribeVoice, transcribeFile } = require('./transcribe')
 const { sendImage, sendFile } = require('./upload')
 const wsServer = require('./ws-server')
@@ -58,6 +59,7 @@ const WX_URL = 'https://wx.qq.com'
 const INJECT_SCRIPT = fs.readFileSync(path.join(__dirname, 'wechat-bro.js'), 'utf-8')
 const FIRST_LOGIN = process.argv.includes('--first-login')
 const HEADED = process.argv.includes('--headed')
+const QUIET = process.argv.includes('--quiet') || !process.stdin.isTTY
 const LOGIN_TIMEOUT = 300_000
 
 // ── Chrome detection ──────────────────────────────────────────────────────
@@ -107,7 +109,11 @@ let _wsBroadcast = null  // set by main() for event broadcasting
 
 // ── Write JSON to stdout (with newline) + broadcast to WebSocket ──────────
 function write(obj) {
-  process.stdout.write(JSON.stringify(obj) + '\n')
+  // In quiet mode (piped stdin), only write command responses, not events
+  const isResponse = obj && obj.ok !== undefined
+  if (!QUIET || isResponse) {
+    process.stdout.write(JSON.stringify(obj) + '\n')
+  }
   // Broadcast events (not responses) to WebSocket clients
   if (_wsBroadcast && obj && obj.event) {
     _wsBroadcast(obj)
@@ -115,6 +121,7 @@ function write(obj) {
 }
 
 function log(...args) {
+  if (QUIET) return
   process.stderr.write(`[cli] ${args.join(' ')}\n`)
 }
 
@@ -131,19 +138,113 @@ function shutdown() {
 process.on('SIGINT', () => { shutdown(); process.exit(0) })
 process.on('SIGTERM', () => { shutdown(); process.exit(0) })
 
+// ── Try connecting to existing daemon (client mode) ──────────────────────
+/**
+ * Connect to an existing daemon's WebSocket and relay stdin commands.
+ * Returns true if connection succeeded (caller should exit).
+ */
+async function tryConnectAsClient(port) {
+  return new Promise((resolve) => {
+    const ws = new WebSocket(`ws://localhost:${port}`)
+    const timeout = setTimeout(() => {
+      ws.close()
+      resolve(false)
+    }, 2000)
+
+    ws.on('open', () => {
+      clearTimeout(timeout)
+      // Connected to existing daemon — enter client mode
+      runClientMode(ws)
+      resolve(true)
+    })
+
+    ws.on('error', () => {
+      clearTimeout(timeout)
+      resolve(false)
+    })
+  })
+}
+
+/**
+ * Read stdin, send each command via WebSocket to the daemon,
+ * print the JSON response to stdout, then exit.
+ */
+async function runClientMode(ws) {
+  const rl = readline.createInterface({ input: process.stdin, terminal: false })
+  const pending = new Map()
+  let nextId = 1
+
+  ws.on('message', (raw) => {
+    let msg
+    try { msg = JSON.parse(raw.toString()) } catch { return }
+
+    // Match response to pending request
+    if (msg.id && pending.has(msg.id)) {
+      const p = pending.get(msg.id)
+      clearTimeout(p.timeout)
+      pending.delete(msg.id)
+      p.resolve(msg)
+    }
+    // Ignore broadcast events (no matching request id)
+  })
+
+  ws.on('close', () => {
+    // Reject all pending requests so the process doesn't hang
+    for (const [id, p] of pending) {
+      clearTimeout(p.timeout)
+      pending.delete(id)
+      p.reject(new Error('daemon disconnected'))
+    }
+  })
+
+  try {
+    for await (const line of rl) {
+      if (!line.trim()) continue
+
+      const id = `stdin-${nextId++}`
+      let req
+      try { req = JSON.parse(line) } catch {
+        process.stdout.write(JSON.stringify({ ok: false, error: 'invalid json', id: null }) + '\n')
+        continue
+      }
+      req.id = id
+
+      const response = await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('timeout')), 30000)
+        pending.set(id, { resolve, reject, timeout })
+        ws.send(JSON.stringify(req))
+      })
+
+      process.stdout.write(JSON.stringify(response) + '\n')
+    }
+  } catch (e) {
+    process.stdout.write(JSON.stringify({ ok: false, error: e.message, id: null }) + '\n')
+  }
+
+  ws.close()
+  process.exit(0)
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────
 async function main() {
-  // Ensure data directory exists
+  const WS_PORT = parseInt(process.env.WS_PORT || process.argv.find(a => a.startsWith('--ws-port='))?.split('=')[1] || '9231', 10)
+
+  // When stdin is piped, try connecting to an existing daemon first
+  if (!process.stdin.isTTY) {
+    const connected = await tryConnectAsClient(WS_PORT)
+    if (connected) return // client mode handled everything, we're done
+  }
+
+  // No existing daemon — start one (Chrome + WebSocket server)
   fs.mkdirSync(DATA_DIR, { recursive: true })
 
   chromePath = process.env.CHROME_PATH || await findChrome()
   log('Chrome:', chromePath, HEADED ? '(headed)' : '(headless)')
 
-  // ── WebSocket server (dispatch updated below after page is ready) ──────
-  const WS_PORT = parseInt(process.env.WS_PORT || process.argv.find(a => a.startsWith('--ws-port='))?.split('=')[1] || '9231', 10)
   let wsDispatch = async () => { throw new Error('dispatch not ready') }
   const ws = wsServer.create({
     port: WS_PORT,
+    quiet: QUIET,
     dispatch: (cmd, args) => wsDispatch(cmd, args),
   })
   _wsBroadcast = ws.broadcast

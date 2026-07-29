@@ -30,14 +30,21 @@ function makeId() {
  *
  * @param {object} opts
  * @param {number} opts.port - Port to listen on (default 9231)
+ * @param {boolean} opts.quiet - Suppress log output (default false)
  * @param {function} opts.dispatch - async (cmd, args) => result or throw
  * @param {function} opts.broadcastEvent - optional external handler for broadcasting
  * @returns {{ server: WebSocket.Server, broadcast: function, close: function, getClients: function }}
  */
 function create(opts = {}) {
   const port = opts.port || 9231
+  const quiet = !!opts.quiet
   const dispatch = opts.dispatch || (() => { throw new Error('no dispatch') })
   const onBroadcast = opts.broadcastEvent || null
+
+  function wsLog(...args) {
+    if (quiet) return
+    console.error('[ws]', ...args)
+  }
 
   /** Map of clientId → { ws, agentName } */
   const clients = new Map()
@@ -50,7 +57,7 @@ function create(opts = {}) {
     clients.set(clientId, clientInfo)
 
     const addr = req.socket.remoteAddress || 'unknown'
-    console.error(`[ws] Client ${clientId} connected from ${addr} (${clients.size} total)`)
+    wsLog(`Client ${clientId} connected from ${addr} (${clients.size} total)`) 
 
     // Send welcome with client ID
     ws.send(JSON.stringify({ event: 'connected', data: { clientId, serverId: 'wechat-bro' } }))
@@ -69,7 +76,7 @@ function create(opts = {}) {
       // Special: auth command — identify this agent
       if (cmd === 'auth') {
         clientInfo.agentName = req.agent || req.name || null
-        console.error(`[ws] Client ${clientId} identified as "${clientInfo.agentName}"`)
+        wsLog(`Client ${clientId} identified as "${clientInfo.agentName}"`) 
         ws.send(JSON.stringify({ ok: true, id, data: { clientId, agent: clientInfo.agentName } }))
         return
       }
@@ -91,21 +98,21 @@ function create(opts = {}) {
 
     ws.on('close', () => {
       clients.delete(clientId)
-      console.error(`[ws] Client ${clientId}${clientInfo.agentName ? ` (${clientInfo.agentName})` : ''} disconnected (${clients.size} remaining)`)
+      wsLog(`Client ${clientId}${clientInfo.agentName ? ` (${clientInfo.agentName})` : ''} disconnected (${clients.size} remaining)`) 
     })
 
     ws.on('error', (err) => {
-      console.error(`[ws] Error ${clientId}:`, err.message)
+      wsLog(`Error ${clientId}:`, err.message) 
       clients.delete(clientId)
     })
   })
 
   server.on('listening', () => {
-    console.error(`[ws] WebSocket server listening on ws://localhost:${port}`)
+    wsLog(`WebSocket server listening on ws://localhost:${port}`) 
   })
 
   server.on('error', (err) => {
-    console.error(`[ws] Server error:`, err.message)
+    wsLog(`Server error:`, err.message) 
   })
 
   /**
@@ -122,7 +129,7 @@ function create(opts = {}) {
           count++
         }
       } catch (e) {
-        console.error(`[ws] Broadcast error to ${cid}:`, e.message)
+        wsLog(`Broadcast error to ${cid}:`, e.message) 
       }
     }
     if (onBroadcast) onBroadcast(msg, count)
@@ -141,7 +148,7 @@ function create(opts = {}) {
         return true
       }
     } catch (e) {
-      console.error(`[ws] sendTo error ${clientId}:`, e.message)
+      wsLog(`sendTo error ${clientId}:`, e.message)
     }
     return false
   }
