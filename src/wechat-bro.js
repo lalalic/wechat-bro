@@ -87,18 +87,23 @@
 
     const result = Object.keys(contact).reduce(function (acc, key) {
       if(typeof(contact[key])=="function"){ 
-        if(key.startsWith("get")) {
-          let value = contact[key]()
-          if(!empty(value)){
-            let propName = key.slice(3)
-            acc[propName] = value
+        try {
+          if(key.startsWith("get")) {
+            let value = contact[key]()
+            if(!empty(value)){
+              let propName = key.slice(3)
+              acc[propName] = value
+            }
+          }else if(key.startsWith("is")) {
+            if(!!contact[key]()){
+              acc[key] = true
+            }
+          }else if(key.startsWith("has")) {
+            acc[key]= !!contact[key]()
           }
-        }else if(key.startsWith("is")) {
-          if(!!contact[key]()){
-            acc[key] = true
-          }
-        }else if(key.startsWith("has")) {
-          acc[key]= !!contact[key]()
+        } catch (e) {
+          // Skip methods that throw (e.g. isInChatroom during init).
+          // A single throwing method should not crash the whole contact.
         }
         return acc
       }else if(empty(contact[key])){
@@ -1374,10 +1379,10 @@
     }
 
     var userName = getUserName()
-    var user = userName ? WechatyBro.getContact(userName) : { id: null }
+    var user = userName && WechatyBro.getContact(userName)
 
     // Retry if user info not ready yet
-    if ((!user.name && !user.NickName) && attempt < 10) {
+    if ((!user?.name) && attempt < 10) {
       setTimeout(function () { doLogin(source, attempt + 1) }, 500)
       return
     }
@@ -1390,7 +1395,6 @@
     WechatyBro.vars.loginState = true
     WechatyBro.vars.scanCode = null
     WechatyBro.vars.scanUrl = null
-    log('LOGIN confirmed via:', source, '| user:', user.name || user.id)
     WechatyBro.emit('login', user)
 
     // Start watching for contacts to be fully loaded (PYQuanPin etc.)
