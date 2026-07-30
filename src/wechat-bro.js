@@ -1,5 +1,5 @@
 /**
- * WeChat Browser-Side Core — Event-Driven Edition
+ * WeChat Web Bridge — Event-Driven Edition
  *
  * Hooks into AngularJS internals to detect login/logout/QR events reactively
  * (no polling). Communicates with main process via window.sendToPuppeteer().
@@ -69,6 +69,57 @@
     } catch (e) {
       return null
     }
+  }
+
+  function asContact(contact, isForList=false){
+    const empty=value=>value===0 || value===false || value==="" || (Array.isArray(value) && value.length===0)
+    const base={
+      id: WechatyBro._resolveId(contact.UserName),
+      name: contact.getDisplayName?.(),
+      isRoomContact: contact.isRoomContact?.(),
+      isFileHelper: contact.isFileHelper?.(),
+      isContact: contact.isContact?.(),
+    }
+
+    if(isForList){
+      return base
+    }
+
+    const result = Object.keys(contact).reduce(function (acc, key) {
+      if(typeof(contact[key])=="function"){ 
+        if(key.startsWith("get")) {
+          let value = contact[key]()
+          if(!empty(value)){
+            let propName = key.slice(3)
+            acc[propName] = value
+          }
+        }else if(key.startsWith("is")) {
+          if(!!contact[key]()){
+            acc[key] = true
+          }
+        }else if(key.startsWith("has")) {
+          acc[key]= !!contact[key]()
+        }
+        return acc
+      }else if(empty(contact[key])){
+        
+      }else{
+        acc[key] = contact[key]
+      }
+      return acc
+    }, base)
+
+    if(result.MemberList){
+      result.MemberList = result.MemberList.map(contact=>({
+        id: WechatyBro._resolveId(contact.UserName),
+        name: cleanName(contact.DisplayName),
+      }))
+    }
+
+    if(!WechatyBro.requireThumb){
+      delete result.HeadImgUrl
+    }
+    return result
   }
 
   /** Convert emoji <img> tags to Unicode chars, then strip remaining HTML */
@@ -252,9 +303,7 @@
         var pyGroups = {}  // pyId → [UserName, ...]
         contacts.forEach(function (c) {
           if (!c.UserName) return
-          var py = (c.RemarkPYQuanPin && c.RemarkPYQuanPin.length > 0)
-            ? c.RemarkPYQuanPin : (c.PYQuanPin || c.UserName)
-          py = py.toLowerCase().replace(/<[^>]+>/g, '').replace(/[^a-z0-9_]/g, '')
+          var py = c.PYQuanPin
           if (!pyGroups[py]) pyGroups[py] = []
           pyGroups[py].push(c.UserName)
         })
@@ -267,7 +316,7 @@
             WechatyBro._userNameToId[userNames[0]] = py
           } else {
             userNames.forEach(function (un, i) {
-              var id = i === 0 ? py : py + '_' + (i + 1)
+              var id = `${py}_${all[un].AttrStatus}`
               WechatyBro._idToUserName[id] = un
               WechatyBro._userNameToId[un] = id
             })
@@ -304,6 +353,10 @@
 
     angularIsReady: angularIsReady,
 
+    getAccount: function () {
+      return this.getContact(getUserName())
+    },
+
     getContact: function (id) {
       try {
         var injector = angular.element(document).injector()
@@ -311,49 +364,53 @@
         // Resolve id: accept either pyId or UserName
         var userName = WechatyBro._resolveUserName(id) || id
         var contact = contactFactory.getContact(userName)
-        if (!contact) return { id: id, UserName: userName }
-        var stableId = WechatyBro._resolveId(contact.UserName)
-          || (contact.RemarkPYQuanPin || contact.PYQuanPin || contact.UserName)
-        return {
-          id: stableId,
-          name: cleanName(contact.RemarkName) || cleanName(contact.NickName),
-          UserName: contact.UserName,
-          HeadImgUrl: contact.HeadImgUrl,
-          Sex: contact.Sex,
-          isRoomContact: !!(contact.UserName && contact.UserName.startsWith('@@')),
-        }
+        if (!contact) return { id: id}
+        return asContact(contact)
       } catch (e) {
-        return { id: id, UserName: id }
+        return { id: id}
       }
     },
 
-    contactList: function () {
+    contactList: function (filter=a=>true) {
       try {
         var injector = angular.element(document).injector()
         var contactFactory = injector.get('contactFactory')
         var accountFactory = injector.get('accountFactory')
         var selfUserName = accountFactory.getUserName() || ''
         var all = contactFactory.getAllContacts()
-        return Object.values(all).map(function (c) {
-          var isRoom = !!(c.UserName && c.UserName.startsWith('@@'))
-          var stableId = WechatyBro._resolveId(c.UserName)
-            || (c.RemarkPYQuanPin || c.PYQuanPin || c.UserName)
-          return {
-            id: stableId,
-            name: cleanName(c.RemarkName) || cleanName(c.NickName),
-            UserName: c.UserName,
-            HeadImgUrl: c.HeadImgUrl,
-            isRoomContact: isRoom,
-            isRoomOwner: isRoom && c.ChatRoomOwner === selfUserName,
-            memberCount: isRoom && c.MemberList ? c.MemberList.length : 0,
-            VerifyFlag: c.VerifyFlag || 0,
-            ContactFlag: c.ContactFlag || 0,
-            StarFriend: c.StarFriend || 0,
-            KeyWord: c.KeyWord || '',
-          }
-        })
+        return Object.values(all).filter(filter).map(a=>asContact(a, true))
       } catch (e) {
         log('contactList error:', e.message)
+        return []
+      }
+    },
+
+     /**
+     * Get members of a group chat (room).
+     * Calls getChatRoomMembersContact to populate member details if needed.
+     * @param {string} roomId - pyId or UserName of the room (@@...)
+     * @returns {Array<{id, name, UserName, NickName, DisplayName}>}
+     */
+    getRoomMembers: function (roomId) {
+      try {
+        var injector = angular.element(document).injector()
+        var contactFactory = injector.get('contactFactory')
+        var userName = WechatyBro._resolveUserName(roomId) || roomId
+        var room = contactFactory.getContact(userName)
+        if (!room || !room.MemberList) return []
+
+        // Fetch full member details if first member has empty NickName
+        if (room.MemberList.length > 0 && !room.MemberList[0].NickName) {
+          try { contactFactory.getChatRoomMembersContact(userName) } catch (e) {}
+        }
+
+        return room.MemberList.map(function (m) {
+          // Look up full contact for stable ID and better names
+          var full = contactFactory.getContact(m.UserName)
+          return asContact(full || m, true)
+        })
+      } catch (e) {
+        log('getRoomMembers error:', e.message)
         return []
       }
     },
@@ -482,49 +539,6 @@
         '[Love]','[No]','[OK]','[InLove]','[Blowkiss]','[Waddle]','[Tremble]','[Twirl]','[Kotow]','[Dramatic]',
         '[Jump]','[Surrender]','[Hooray]','[Facepalm]','[Smirk]','[Smart]','[Concerned]','[Packet]','[Chicken]',
       ]
-    },
-
-    /**
-     * Get members of a group chat (room).
-     * Calls getChatRoomMembersContact to populate member details if needed.
-     * @param {string} roomId - pyId or UserName of the room (@@...)
-     * @returns {Array<{id, name, UserName, NickName, DisplayName}>}
-     */
-    getRoomMembers: function (roomId) {
-      try {
-        var injector = angular.element(document).injector()
-        var contactFactory = injector.get('contactFactory')
-        var userName = WechatyBro._resolveUserName(roomId) || roomId
-        var room = contactFactory.getContact(userName)
-        if (!room || !room.MemberList) return []
-
-        // Fetch full member details if first member has empty NickName
-        if (room.MemberList.length > 0 && !room.MemberList[0].NickName) {
-          try { contactFactory.getChatRoomMembersContact(userName) } catch (e) {}
-        }
-
-        return room.MemberList.map(function (m) {
-          // Look up full contact for stable ID and better names
-          var full = contactFactory.getContact(m.UserName)
-          var nickName = cleanName(m.NickName || (full && full.NickName) || '')
-          var remarkName = cleanName((full && full.RemarkName) || '')
-          var displayName = cleanName(m.DisplayName || '')
-          var stableId = WechatyBro._resolveId(m.UserName)
-            || (full && (full.RemarkPYQuanPin || full.PYQuanPin))
-            || m.UserName
-          return {
-            id: stableId,
-            name: remarkName || displayName || nickName,
-            UserName: m.UserName,
-            NickName: nickName,
-            RemarkName: remarkName,
-            DisplayName: displayName,
-          }
-        })
-      } catch (e) {
-        log('getRoomMembers error:', e.message)
-        return []
-      }
     },
 
     /**
@@ -834,6 +848,59 @@
       retObj.code = 200
       retObj.message = 'WechatyBro Init Succ'
       return retObj
+    },
+
+    config(key, value){
+      switch(key){
+        case 'requireThumb':
+          WechatyBro.requireThumb = !!value
+          break
+        default:
+          log('set: unknown key', key)
+      }
+    },
+
+    /**
+     * Change a contact's remark name (备注名).
+     * Uses the webwxoplog API via Angular's $http.
+     * @param {string} id - pyId or UserName of the contact
+     * @param {string} newRemark - new remark name
+     * @returns {Promise<boolean>} true if successful
+     */
+    setRemark: function (id, newRemark) {
+      try {
+        var injector = angular.element(document).injector()
+        var http = injector.get('$http')
+        var accountFactory = injector.get('accountFactory')
+        var userName = WechatyBro._resolveUserName(id) || id
+
+        var br = accountFactory.getBaseRequest()
+        var req = br.BaseRequest || br
+
+        return http({
+          method: 'POST',
+          url: '/cgi-bin/mmwebwx-bin/webwxoplog',
+          params: { pass_ticket: accountFactory.getPassticket() || '' },
+          data: {
+            BaseRequest: req,
+            CmdId: 2,
+            RemarkName: newRemark,
+            UserName: userName,
+          },
+        }).then(function (resp) {
+          var ok = resp.data && resp.data.BaseResponse && resp.data.BaseResponse.Ret === 0
+          if (ok) {
+            log('setRemark success:', userName, '->', newRemark)
+          } else {
+            var msg = (resp.data && resp.data.BaseResponse && resp.data.BaseResponse.ErrMsg) || 'unknown error'
+            log('setRemark failed:', userName, msg)
+          }
+          return !!ok
+        })
+      } catch (e) {
+        log('setRemark error:', e.message)
+        return false
+      }
     },
   }
 

@@ -106,12 +106,14 @@ function toLoginUrl(qrUrl) {
 let lastQrUrl = null
 let chromePath = null  // detected in main(), used by mermaid render
 let _wsBroadcast = null  // set by main() for event broadcasting
+let _cliMode = false  // true when running a single CLI command (suppress events on stdout)
 
 // ── Write JSON to stdout (with newline) + broadcast to WebSocket ──────────
 function write(obj) {
-  // In quiet mode (piped stdin), only write command responses, not events
+  // In quiet/CLI mode, only write command responses, not events
   const isResponse = obj && obj.ok !== undefined
-  if (!QUIET || isResponse) {
+  const suppressEvent = (_cliMode || QUIET) && obj && obj.event
+  if (!suppressEvent && (!QUIET || isResponse)) {
     process.stdout.write(JSON.stringify(obj) + '\n')
   }
   // Broadcast events (not responses) to WebSocket clients
@@ -138,12 +140,85 @@ function shutdown() {
 process.on('SIGINT', () => { shutdown(); process.exit(0) })
 process.on('SIGTERM', () => { shutdown(); process.exit(0) })
 
+// ── CLI command parser ────────────────────────────────────────────────────
+/**
+ * Parse a command from positional CLI args (not starting with --).
+ * Returns null when no command is given (plain daemon mode).
+ *
+ * Examples:
+ *   npx wechat-bro status          → { cmd: 'status' }
+ *   npx wechat-bro send --to a --content "hi"  → { cmd: 'send', to: 'a', content: 'hi' }
+ */
+function parseCliCommand() {
+  const args = process.argv.slice(2)
+  const knownFlags = new Set(['--first-login', '--headed', '--quiet'])
+  const positional = []
+  for (let i = 0; i < args.length; i++) {
+    if (knownFlags.has(args[i])) continue
+    if (args[i].startsWith('--ws-port=')) continue
+    positional.push(args[i])
+  }
+  if (positional.length === 0) return null
+
+  const request = { cmd: positional[0] }
+  for (let i = 1; i < positional.length; i++) {
+    const arg = positional[i]
+    if (arg.startsWith('--')) {
+      const eqIdx = arg.indexOf('=')
+      if (eqIdx !== -1) {
+        request[arg.slice(2, eqIdx)] = arg.slice(eqIdx + 1)
+      } else {
+        const key = arg.slice(2)
+        if (i + 1 < positional.length && !positional[i + 1].startsWith('--')) {
+          request[key] = positional[++i]
+        } else {
+          request[key] = true
+        }
+      }
+    }
+  }
+  return request
+}
+
+/**
+ * Send one command via WebSocket, print the response, then exit.
+ */
+async function sendCommandViaWs(ws, request) {
+  const id = request.id || 'cli-cmd'
+  request.id = id
+
+  ws.on('message', (raw) => {
+    let msg
+    try { msg = JSON.parse(raw.toString()) } catch { return }
+    if (msg.id === id) {
+      process.stdout.write(JSON.stringify(msg, null, process.argv.indexOf('--pretty') !== -1 ? 2 : 0) + '\n')
+      ws.close()
+      process.exit(0)
+    }
+  })
+
+  ws.on('close', () => {
+    if (!process.exitCode) process.exit(1)
+  })
+
+  // Safety timeout
+  setTimeout(() => {
+    process.stdout.write(JSON.stringify({ ok: false, error: 'timeout', id }) + '\n')
+    ws.close()
+    process.exit(1)
+  }, 30000)
+
+  ws.send(JSON.stringify(request))
+}
+
 // ── Try connecting to existing daemon (client mode) ──────────────────────
 /**
- * Connect to an existing daemon's WebSocket and relay stdin commands.
+ * Connect to an existing daemon's WebSocket.
+ * If `request` is provided, sends that single command and exits.
+ * If `request` is null, relays stdin lines as commands (pipe mode).
  * Returns true if connection succeeded (caller should exit).
  */
-async function tryConnectAsClient(port) {
+async function tryConnectAsClient(port, request) {
   return new Promise((resolve) => {
     const ws = new WebSocket(`ws://localhost:${port}`)
     const timeout = setTimeout(() => {
@@ -153,8 +228,11 @@ async function tryConnectAsClient(port) {
 
     ws.on('open', () => {
       clearTimeout(timeout)
-      // Connected to existing daemon — enter client mode
-      runClientMode(ws)
+      if (request) {
+        sendCommandViaWs(ws, request)
+      } else {
+        runClientMode(ws)
+      }
       resolve(true)
     })
 
@@ -228,14 +306,16 @@ async function runClientMode(ws) {
 // ── Main ──────────────────────────────────────────────────────────────────
 async function main() {
   const WS_PORT = parseInt(process.env.WS_PORT || process.argv.find(a => a.startsWith('--ws-port='))?.split('=')[1] || '9231', 10)
+  const cliRequest = parseCliCommand()
 
-  // When stdin is piped, try connecting to an existing daemon first
-  if (!process.stdin.isTTY) {
-    const connected = await tryConnectAsClient(WS_PORT)
+  // When we have a CLI command or piped stdin, try connecting to an existing daemon first
+  if (cliRequest || !process.stdin.isTTY) {
+    const connected = await tryConnectAsClient(WS_PORT, cliRequest || undefined)
     if (connected) return // client mode handled everything, we're done
   }
 
   // No existing daemon — start one (Chrome + WebSocket server)
+  if (cliRequest) _cliMode = true
   fs.mkdirSync(DATA_DIR, { recursive: true })
 
   chromePath = process.env.CHROME_PATH || await findChrome()
@@ -342,6 +422,18 @@ async function main() {
     return dispatch(cmd, args, page)
   }
 
+  // ── Single CLI command mode ───────────────────────────────────────────
+  if (cliRequest) {
+    try {
+      const result = await dispatch(cliRequest.cmd, cliRequest, page)
+      write({ ok: true, id: null, data: result })
+    } catch (e) {
+      write({ ok: false, id: null, error: e.message || String(e) })
+    }
+    await browser.close()
+    process.exit(0)
+  }
+
   // ── Stdin reader — JSON commands ──────────────────────────────────────
   const rl = readline.createInterface({ input: process.stdin, terminal: false })
 
@@ -442,10 +534,13 @@ function parseSegments(content) {
 async function dispatch(cmd, args, page) {
   switch (cmd) {
     case 'contacts':
-      return page.evaluate(() => window.WechatyBro.contactList().map(c => ({ id: c.id, name: c.name, UserName: c.UserName, isRoomContact: c.isRoomContact, memberCount: c.memberCount })))
+      return page.evaluate(() => window.WechatyBro.contactList())
 
     case 'rooms':
-      return page.evaluate(() => window.WechatyBro.contactList().filter(c => c.isRoomContact).map(c => ({ id: c.id, name: c.name, UserName: c.UserName, memberCount: c.memberCount })))
+      return page.evaluate(() => window.WechatyBro.contactList(a=>a.isRoomContact()))
+
+    case 'search':
+      return page.evaluate((q) => window.WechatyBro.contactList(a => a.getDisplayName()?.includes(q)), args.q)
 
     case 'room-members':
       if (!args.id) throw new Error('Missing --id')
@@ -564,10 +659,16 @@ async function dispatch(cmd, args, page) {
         contactsReady: !!window.WechatyBro.vars.contactsReady,
         lastMsgTime: window.WechatyBro._lastMsgTime || 0,
         initState: !!window.WechatyBro.vars.initState,
+        account: window.WechatyBro.getAccount()
       }))
 
     case 'supported-emojis':
       return page.evaluate(() => window.WechatyBro.getSupportedEmojis())
+
+    case 'config':
+      if (!args.key) throw new Error('Missing --key')
+      if (!args.value) throw new Error('Missing --value')
+      return page.evaluate((key, value) => window.WechatyBro.config(key, value), args.key, args.value)
 
     default:
       throw new Error(`Unknown command: ${cmd}`)
