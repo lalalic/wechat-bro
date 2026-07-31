@@ -362,8 +362,8 @@ async function main() {
     ok(simResult.MsgType === 1, 'default MsgType is 1 (text)')
     ok(simResult.Content === 'Test from test-inject.js', 'Content preserved')
     ok(simResult.MsgId && simResult.MsgId.startsWith('sim_'), 'MsgId starts with sim_')
-    ok(simResult.from && simResult.from.name === dmTarget.name,
-       `from.name resolves: ${simResult.from.name}`)
+    ok(simResult.from === dmTarget.name,
+       `from resolves to contact name: ${simResult.from}`)
   } else {
     ok(true, 'no DM target available — simulateMessage DM test skipped')
   }
@@ -386,8 +386,9 @@ async function main() {
       }, room.name, namedMember.name, mentionName)
 
       ok(simRoom !== undefined, 'simulateMessage room message returns result')
-      ok(simRoom.from && simRoom.from.name === room.name, 'from.name is the room')
-      ok(simRoom.sender !== undefined, 'sender is set for room message')
+      ok(simRoom.from === room.name, 'from is the room name')
+      ok(typeof simRoom.sender === 'string' && simRoom.sender.length > 0,
+         'sender is a contact name string for room message')
       if (mentionName && mentionName.length > 0) {
         ok(Array.isArray(simRoom.mentions),
            `mentions array exists (mentionName="${mentionName}")`)
@@ -722,8 +723,10 @@ async function main() {
     if (firstSim) {
       ok(firstSim.data.MsgId && firstSim.data.MsgId.startsWith('sim_'),
          'simulateMessage MsgId starts with sim_')
-      ok(firstSim.data.from !== undefined, 'simulateMessage data has from field')
-      ok(firstSim.data.to !== undefined, 'simulateMessage data has to field')
+      ok(typeof firstSim.data.from === 'string' && firstSim.data.from.length > 0,
+         'simulateMessage data.from is a contact name string')
+      ok(firstSim.data.to === 'me' || (typeof firstSim.data.to === 'string' && firstSim.data.to.length > 0),
+         'simulateMessage data.to is a contact name string')
     }
   }
 

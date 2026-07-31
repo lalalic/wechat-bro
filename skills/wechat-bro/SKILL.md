@@ -1,9 +1,6 @@
 ---
 name: wechat-bro
-description: >-
-  Interact with WeChat from an AI agent — send/receive messages, manage
-  contacts, upload media, transcribe voice, and more. Uses a headless Chrome
-  process that injects into wx.qq.com and communicates via stdin/stdout JSON.
+description: Interact with WeChat from an AI agent — send/receive messages, manage contacts, upload media, transcribe voice, and more.
 ---
 
 # wechat-bro — WeChat Agent Skill
@@ -28,7 +25,7 @@ agents can connect simultaneously via WebSocket.
 ## Identity Model
 
 Identify every contact by its **`name`** — the name you'd use to address them
-(e.g. `李诚`, `Alice`, `Dev Team`). The account owner is always `"me"`.
+(e.g. `李三`, `Alice`, `Dev Team`). The account owner is always `"me"`.
 
 The exact `name` string returned by any command can be reused as-is in the next
 command's `to` field — no transformation needed.
@@ -42,8 +39,8 @@ resolve to the same chat.
 error instead of guessing — surface it to the user to disambiguate:
 
 ```json
-→ {"cmd":"send-text","to":"李诚","content":"hi"}
-← {"ok":false,"error":"name \"李诚\" matches 2 contacts; please disambiguate (e.g. set a unique remark name with setRemark)"}
+→ {"cmd":"send-text","to":"李三","content":"hi"}
+← {"ok":false,"error":"name \"李三\" matches 2 contacts; please disambiguate (e.g. set a unique remark name with setRemark)"}
 ```
 
 ### @mentions in rooms
@@ -115,11 +112,11 @@ Connect to `ws://localhost:9231`.  Send/receive JSON messages.
 | `scan` | QR code displayed/updated | `{code, url, loginUrl, userAvatar?}`. `userAvatar` (when present, code 201) is a **file path** to the downloaded avatar at `~/.wechat-bro/userAvatar.png` |
 | `login` | User logged in | `{name, …}` (self; `name` is `"me"`) |
 | `logout` | User logged out | source string |
-| `contacts-ready` | Contact list fully loaded (count stabilized) | `{total, elapsedMs}` |
-| `message:text` | Incoming text message | Full message object with `from`/`to` |
+| `contacts-ready` | Contact list loaded (count stabilized) | `{total, elapsedMs}` |
+| `message:text` | Incoming text message | Message object with `from`/`to` as **contact names** (strings; `"me"` for self; `sender` for room messages) |
 | `message:image` | Incoming image | Same + `imageFile` (path to downloaded image in `~/.wechat-bro/download/`) |
 | `message:voice` | Incoming voice memo | Same + `voiceFile` (path to audio) + `voiceText` (transcribed) |
-| `message:*` | Other types | Same pattern |
+| `message: xxx` | Other types: 'verify','card', 'video', 'emoticon', 'location','app', 'status', 'microvideo','system', 'recalled' | Same pattern |
 | `heartbeat` | Every ~30s liveness check | `"heartbeat@browser"` |
 
 ### stdin mode
@@ -248,7 +245,7 @@ missing).  Response includes a `files` array:
 
 ## Markdown Styling
 
-`send()` auto‑converts markdown to Unicode mathematical bold/italic/mono:
+`send-text` content supports markdown:
 
 | Markdown | Rendered |
 |---|---|

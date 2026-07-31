@@ -395,6 +395,21 @@
       return WechatyBro._userNameToName[userName] || null
     },
 
+    /** Get the agent-facing contact NAME for a UserName in message events.
+     *  'me' for self, otherwise the cleaned display name. Falls back to a live
+     *  contact lookup when the name map is stale/missing (e.g. late-loaded
+     *  rooms), so events never leak internal @hash UserNames. null if unknown. */
+    _eventContactName: function (userName) {
+      if (!userName) return null
+      var name = WechatyBro._resolveName(userName)
+      if (name) return name
+      try {
+        var c = WechatyBro.getContact(userName)
+        if (c && c.name) return c.name
+      } catch (e) { /* ignore */ }
+      return null
+    },
+
     /** Get the agent-facing name for a room member entry.
      *  Priority: friend's contact name (RemarkName/NickName via getDisplayName)
      *  > member's global NickName > member's room DisplayName (alias).
@@ -735,13 +750,13 @@
         Content: content,
         MsgType: msgType || 1,
         MsgId: 'sim_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
-        from: WechatyBro.getContact(fromUN),
-        to: WechatyBro.getContact(getUserName()),
+        from: WechatyBro._eventContactName(fromUN),
+        to: WechatyBro._eventContactName(getUserName()),
       }
 
       // Room messages: resolve sender and parse @mentions
       if (isRoom && senderUN) {
-        data.sender = WechatyBro.getContact(senderUN)
+        data.sender = WechatyBro._eventContactName(senderUN)
       }
 
       if (isRoom && content) {
@@ -1671,7 +1686,7 @@
     }
     var typeName = MSG_TYPE_NAMES[data.MsgType] || 'unknown'
     // Don't leak internal @hash UserNames — the external contract is name-only.
-    // (from/to/sender are already name-only contact objects via asContact.)
+    // (from/to/sender are already name-only contact name strings.)
     try { delete data.FromUserName; delete data.ToUserName; delete data.ActualSender } catch (e) {}
     // WechatyBro.emit('message', data)
     WechatyBro.emit('message:' + typeName, data)
@@ -1685,14 +1700,14 @@
     }
 
     var off = rootScope.$on('message:add:success', function (event, data) {
-      data.from = WechatyBro.getContact(data.FromUserName)
-      data.to = WechatyBro.getContact(data.ToUserName)
+      data.from = WechatyBro._eventContactName(data.FromUserName)
+      data.to = WechatyBro._eventContactName(data.ToUserName)
 
       // Room messages: FromUserName is the room, actual sender is in Content prefix
       if (data.FromUserName && data.FromUserName.startsWith('@@') && data.Content) {
         var match = data.Content.match(/^(@[a-f0-9]+):\n([\s\S]*)/)
         if (match) {
-          data.sender = WechatyBro.getContact(match[1])
+          data.sender = WechatyBro._eventContactName(match[1])
           data.Content = match[2]
         }
 

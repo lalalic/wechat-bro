@@ -56,8 +56,8 @@ Events stream as JSON lines to stdout:
 {"event":"scan","data":{"code":201,"userAvatar":"/Users/<you>/.wechat-bro/userAvatar.png"}}
 {"event":"login","data":{"name":"me","NickName":"李诚"}}
 {"event":"contacts-ready","data":{"total":248,"elapsedMs":25001}}
-{"event":"message","data":{"MsgType":1,"Content":"hello","from":{"name":"Alice"},"to":{"name":"me"}}}
-{"event":"message","data":{"MsgType":1,"Content":"hey all","from":{"name":"Dev Team","isRoomContact":true},"sender":{"name":"Alice"},"mentions":[],"mentionMe":false}}
+{"event":"message","data":{"MsgType":1,"Content":"hello","from":"Alice","to":"me"}}
+{"event":"message","data":{"MsgType":1,"Content":"hey all","from":"Dev Team","sender":"Alice","mentions":[],"mentionMe":false}}
 {"event":"message:text","data":{"MsgType":1,"Content":"hello"}}
 {"event":"logout","data":"..."}
 ```
@@ -450,7 +450,7 @@ node test-inject.js
 | `scan` | `{code, url, loginUrl}` | QR code shown. `code`: 0=new, 408=waiting, 201=scanned, 200=confirmed |
 | `login` | `{name, NickName, HeadImgUrl, Sex}` | User logged in. `name` is `"me"` (the account owner's constant identity) |
 | `contacts-ready` | `{total, elapsedMs}` | Contact list fully loaded (count stabilized across batches) |
-| `message` | Full message object with `from`/`to` contacts | Any message received |
+| `message` | Full message object with `from`/`to` as **contact names** | Any message received |
 | `message:text` | Same | Text message (MsgType 1) |
 | `message:image` | Same + `imageFile` (file path) | Image (MsgType 3) — saved to `~/.wechat-bro/download/` |
 | `message:voice` | Same + `voiceFile` (file path) + `voiceText` | Voice memo (MsgType 34) — audio saved to `~/.wechat-bro/download/`, transcribed |
@@ -474,10 +474,10 @@ All `message` and `message:*` events include:
 
 | Field | Type | Description |
 |---|---|---|
-| `from` | Contact | Sender contact (for rooms: the room itself) |
-| `to` | Contact | Recipient contact |
-| `sender` | Contact / undefined | **Room only**: individual sender within the room |
-| `mentions` | string[] / undefined | **Room only**: stable IDs of @mentioned contacts |
+| `from` | string | Sender contact **name** (for rooms: the room name) |
+| `to` | string | Recipient contact **name** (usually `"me"` for incoming messages) |
+| `sender` | string / undefined | **Room only**: name of the individual sender within the room |
+| `mentions` | string[] / undefined | **Room only**: names of @mentioned contacts |
 | `mentionMe` | boolean / undefined | **Room only**: `true` if the account owner was @mentioned |
 | `Content` | string | Message text (cleaned — sender prefix stripped for room messages) |
 | `MsgType` | number | WeChat message type (1=text, 3=image, ...) |
@@ -486,9 +486,9 @@ All `message` and `message:*` events include:
 **Room message example**:
 ```jsonl
 {"event":"message","data":{
-  "from":{"id":"mygroup","name":"Dev Team","isRoomContact":true},
-  "sender":{"id":"alice","name":"Alice"},
-  "Content":"@Me\u2005 check the PR",
+  "from":"Dev Team",
+  "sender":"Alice",
+  "Content":"@\"me\" check the PR",
   "mentions":["me"],
   "mentionMe":true,
   "MsgType":1
