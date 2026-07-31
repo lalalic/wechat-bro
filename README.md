@@ -445,8 +445,8 @@ node test-inject.js
 | `contacts-ready` | `{total, elapsedMs}` | Contact list fully loaded (count stabilized across batches) |
 | `message` | Full message object with `from`/`to` contacts | Any message received |
 | `message:text` | Same | Text message (MsgType 1) |
-| `message:image` | Same | Image (MsgType 3) |
-| `message:voice` | Same + `voiceData` base64 | Voice memo (MsgType 34) — auto-downloaded |
+| `message:image` | Same + `imageFile` (file path) | Image (MsgType 3) — saved to `~/.wechat-bro/download/` |
+| `message:voice` | Same + `voiceFile` (file path) + `voiceText` | Voice memo (MsgType 34) — audio saved to `~/.wechat-bro/download/`, transcribed |
 | `message:video` | Same | Video (MsgType 43) |
 | `message:emoticon` | Same | Custom sticker (MsgType 47) |
 | `message:location` | Same | Location share (MsgType 48) |

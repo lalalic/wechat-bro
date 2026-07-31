@@ -27,51 +27,35 @@ agents can connect simultaneously via WebSocket.
 
 ## Identity Model
 
-**Outside wechat-bro, contacts are identified by `name` only** — never an `id` or a
-WeChat `UserName` (`@hash`). Those internal keys are not exposed. The `name` is the
-contact's display name (`RemarkName`/`NickName` — what users actually call them);
-the account owner is always `"me"`.
+Identify every contact by its **`name`** — the name you'd use to address them
+(e.g. `李诚`, `Alice`, `Dev Team`). The account owner is always `"me"`.
 
-WeChat display names can contain HTML (e.g. emoji `<img>` tags). wechat-bro
-normalizes them with `cleanName` (emoji→Unicode, HTML stripped) and uses that
-**canonical** form everywhere — in lists, events, and the internal name map. This
-is idempotent, so the exact string you receive can be echoed straight back in a
-command and will match.
+The exact `name` string returned by any command can be reused as-is in the next
+command's `to` field — no transformation needed.
 
 **Ambiguity is an error.** If a name matches more than one contact (or none),
 `send` / `send-image` / `send-file` / `room-members` / `get-contact` return an
-error instead of guessing. Surface it to the user to resolve — e.g. they set a
-unique remark name first, then retry:
+error instead of guessing — surface it to the user to disambiguate:
 
 ```json
 → {"cmd":"send","to":"李诚","content":"hi"}
 ← {"ok":false,"error":"name \"李诚\" matches 2 contacts; please disambiguate (e.g. set a unique remark name with setRemark)"}
 ```
 
-| concept | value | notes |
-|---|---|---|
-| `name` | display name (e.g. `李诚`, `Dev Team`), `me` for self | the only identity exposed externally |
-| `UserName` | WeChat's internal `@hash` | never returned to callers; resolved internally at call time |
+### @mentions in rooms
+
+Use the **`@"<name>"`** format (double-quoted) anywhere in `send` content to
+mention someone. The quoted name must match a member of the target room.
 
 ```json
-// Agent ↔ wechat-bro uses names only:
-→ {"cmd":"send","to":"李诚","content":"hi"}
-← {"ok":true,"data":{"sent":true,"to":"李诚"}}
+→ {"cmd":"send","to":"Dev Team","content":"@\"Alice Chen\" check this"}
 ```
 
-### Room members & @mentions
+Incoming room messages arrive with the same `@"<name>"` form in `Content`, and
+the resolved names are also listed in the message's `mentions` array. Unquoted
+`@name` is treated as literal text, not a mention.
 
-Room members are also identified by their **contact name** (RemarkName/NickName),
-not the room-specific alias (DisplayName) that WeChat shows inside the group. This
-keeps one universal identity:
-
-- `room-members` returns `name` = the member's contact name (`"me"` for self).
-- **Incoming** room messages: WeChat's wire format `@<alias>\u2005` is rewritten to `@"<contactName>"` in the text the agent sees, so it matches the member list. `mentions[]` carries the same contact names.
-- **Outgoing**: write `@"<contactName>"` in `content` (double-quoted — whitespace-safe). wechat-bro resolves the name to the member and renders the correct `@<alias>\u2005` for WeChat. Unquoted `@name` is NOT rewritten (treated as literal text).
-
-A member who is **not** your contact (stranger) has no contact name — their
-`name` falls back to NickName (or room alias), and they can be @mentioned in the
-room but not DM'd.
+A stranger in a room (not your contact) can be @mentioned but not DM'd.
 
 ## Quick Start
 
@@ -124,14 +108,13 @@ Connect to `ws://localhost:9231`.  Send/receive JSON messages.
 |---|---|---|
 | `connected` | On connect | `{clientId, serverId}` |
 | `ready` | After login + contacts loaded | `{loggedIn, contactsReady}` |
-| `scan` | QR code displayed/updated | `{code, url, loginUrl, userAvatar?}` |
+| `scan` | QR code displayed/updated | `{code, url, loginUrl, userAvatar?}`. When scanned (code 201), the user's avatar is saved to `~/.wechat-bro/userAvatar.png` |
 | `login` | User logged in | `{name, …}` (self; `name` is `"me"`) |
 | `logout` | User logged out | source string |
 | `contacts-ready` | Contact list fully loaded (count stabilized) | `{total, elapsedMs}` |
-| `message` | Any incoming message | Full message object with `from`/`to` |
-| `message:text` | Incoming text message | Same as `message` |
-| `message:image` | Incoming image | Same + `imageBase64` (auto‑downloaded) |
-| `message:voice` | Incoming voice memo | Same + `voiceBase64` + `voiceText` (transcribed) |
+| `message:text` | Incoming text message | Full message object with `from`/`to` |
+| `message:image` | Incoming image | Same + `imageFile` (path to downloaded image in `~/.wechat-bro/download/`) |
+| `message:voice` | Incoming voice memo | Same + `voiceFile` (path to audio) + `voiceText` (transcribed) |
 | `message:*` | Other types | Same pattern |
 | `heartbeat` | Every ~30s liveness check | `"heartbeat@browser"` |
 
@@ -146,7 +129,7 @@ echo '{"cmd":"contacts"}' | npx wechat-bro
 ## Commands
 
 ### `contacts`
-List all contacts (name only — no `id`/`UserName` exposed).
+List all contacts.
 ```json
 → {"cmd":"contacts"}
 ← {"ok":true,"data":[
@@ -164,9 +147,8 @@ List only group chats.
   ]}
 ```
 
-### `room-members` (WebSocket protocol)
-Get members of a room.  Arg: `id` (the room **name**).
-Errors if the name is ambiguous/unknown.
+### `room-members`
+Get members of a room.  Arg: `id` (the room **name**) over WebSocket, or `--name` on the CLI.
 ```json
 → {"cmd":"room-members","id":"Dev Team"}
 ← {"ok":true,"data":[
@@ -174,33 +156,27 @@ Errors if the name is ambiguous/unknown.
     {"name":"小A"}
   ]}
 ```
-
-### `room-members` (CLI)
 ```bash
 npx wechat-bro room-members --name "Dev Team"
 ```
 
-### `get-contact` (WebSocket protocol)
-Get single contact details.  Arg: `id` (the contact **name**).
-Errors if the name is ambiguous/unknown.
+### `get-contact`
+Get single contact details.  Arg: `id` (the contact **name**) over WebSocket, or `--name` on the CLI.
+Does NOT include the member list — use `room-members` for that.
 ```json
 → {"cmd":"get-contact","id":"Alice"}
 ← {"ok":true,"data":{"name":"Alice","isRoomContact":false,…}}
 ```
-
-### `get-contact` (CLI)
 ```bash
 npx wechat-bro get-contact --name "Alice"
 ```
 
-> **Note on `--id` vs `--name`:** In the JSON protocol (WebSocket), the `id` field serves double duty as both request correlation id and the contact identifier. This works when each request uses unique correlation ids. The CLI, however, auto-generates `id: 'cli-cmd'` for correlation which would clobber a contact identifier — so CLI commands use `--name` instead.
-
 ### `send`
-Send a text message (always watermarked).  Args: `to` (name), `content`.
-- `to` must match exactly **one** contact; otherwise an ambiguity/no-match error is returned.
-- `@"name"` mentions supported (whitespace-safe, CJK-safe; unquoted `@name` is literal)
-- markdown formatting is auto‑converted to Unicode bold/italic/mono (see below).
-- `````marpit / `````mermaid code blocks are auto‑rendered to files/images (multiple blocks supported).
+Send a text message.  Args: `to` (name), `content`.
+- `to` must match exactly one contact.
+- `@"name"` mentions supported (see @mentions above).
+- markdown formatting is auto‑converted (see Markdown Styling below).
+- `````marpit / `````mermaid code blocks are auto‑rendered to files/images.
 ```json
 → {"cmd":"send","to":"Dev Team","content":"@\"Alice\" check the **PR**"}
 ← {"ok":true,"data":{"sent":true,"to":"Dev Team"}}
@@ -239,10 +215,10 @@ Get current login/contacts state.
 ← {"ok":true,"data":{"loggedIn":true,"contactsReady":true,"lastMsgTime":1785200000,"initState":true}}
 ```
 
-### `supported-emojis`
+### `emojis`
 List all supported emoji codes (~210).
 ```json
-→ {"cmd":"supported-emojis"}
+→ {"cmd":"emojis"}
 ← {"ok":true,"data":["[微笑]","[撇嘴]",…,"[Smile]","[Rose]",…]}
 ```
 

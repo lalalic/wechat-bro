@@ -10,8 +10,7 @@
  * Usage:
  *   node cli.js                    # Headless, WebSocket on :9231
  *   node cli.js --headed           # Show browser
- *   node cli.js --first-login      # Force QR re-login
- *   node cli.js --ws-port 9231     # Custom WebSocket port
+ *   node cli.js --port 9231       # Custom WebSocket port
  *
  * WebSocket Protocol:
  *   Agent → Server:  {"cmd":"auth","agent":"testneo"}   # optional, identify
@@ -29,7 +28,7 @@
  *   send-file         → {sent: true, to, file}        (args: --to, --path, --filename)
  *   send-voice        → {sent, to, transcription}     (args: --to, --path)
  *   status            → {loggedIn, contactsReady, lastMsgTime}
- *   supported-emojis  → [string]
+ *   emojis            → [string]
  *   ping              → {pong: true, ts: ...}         (liveness check)
  *   exit              → shut down
  */
@@ -54,10 +53,10 @@ process.env.PUPPETEER_CACHE_DIR = path.join(DATA_DIR, 'chromium')
 
 const COOKIE_FILE = path.join(DATA_DIR, 'cookies.json')
 const MESSAGES_FILE = path.join(DATA_DIR, 'messages.jsonl')
+const DOWNLOAD_DIR = path.join(DATA_DIR, 'download')
 
 const WX_URL = 'https://wx.qq.com'
 const INJECT_SCRIPT = fs.readFileSync(path.join(__dirname, 'wechat-bro.js'), 'utf-8')
-const FIRST_LOGIN = process.argv.includes('--first-login')
 const HEADED = process.argv.includes('--headed')
 const QUIET = process.argv.includes('--quiet') || !process.stdin.isTTY
 const LOGIN_TIMEOUT = 300_000
@@ -108,6 +107,67 @@ let chromePath = null  // detected in main(), used by mermaid render
 let _wsBroadcast = null  // set by main() for event broadcasting
 let _cliMode = false  // true when running a single CLI command (suppress events on stdout)
 
+// ── Persist binary content (base64) in events to disk → file path ────────
+// Fields with binary content and their file extension. When present in an
+// event's data, the base64 is decoded, written to DOWNLOAD_DIR, and the field
+// is replaced with the file path so events stay small & agent-friendly.
+const BINARY_FIELDS = {
+  voiceBase64: { ext: 'amr', mime: 'audio' },
+  imageBase64: { ext: 'jpg', mime: 'image' },
+}
+
+function saveBinaryContent(data) {
+  if (!data || typeof data !== 'object') return
+  fs.mkdirSync(DOWNLOAD_DIR, { recursive: true })
+  for (const [field, { ext }] of Object.entries(BINARY_FIELDS)) {
+    const b64 = data[field]
+    if (!b64 || typeof b64 !== 'string') continue
+    try {
+      const buf = Buffer.from(b64, 'base64')
+      if (buf.length === 0) continue
+      // Use MsgId for stable, dedup-friendly filenames
+      const base = data.MsgId || (field + '_' + Date.now())
+      const file = path.join(DOWNLOAD_DIR, base + '.' + ext)
+      fs.writeFileSync(file, buf)
+      delete data[field]
+      data[field.replace('Base64', 'File')] = file
+      log('saved binary:', file, '(' + buf.length + ' bytes)')
+    } catch (e) {
+      log('saveBinaryContent error for', field + ':', e.message)
+    }
+  }
+}
+
+// ── Save scan event's user avatar → ~/.wechat-bro/userAvatar.png ─────────
+const USER_AVATAR_FILE = path.join(DATA_DIR, 'userAvatar.png')
+
+function saveUserAvatar(avatarUrl) {
+  if (!avatarUrl || typeof avatarUrl !== 'string') return
+  // Resolve relative avatar URLs (e.g. /cgi-bin/mmwebwx-bin/webwxgeticon?...)
+  let fullUrl = avatarUrl
+  if (fullUrl.startsWith('/')) {
+    try {
+      const u = new URL(WX_URL)
+      fullUrl = u.origin + fullUrl
+    } catch { return }
+  }
+  if (!fullUrl.startsWith('http://') && !fullUrl.startsWith('https://')) return
+
+  fetch(fullUrl, { redirect: 'follow', signal: AbortSignal.timeout(10000) })
+    .then((res) => {
+      if (!res.ok) throw new Error('HTTP ' + res.status)
+      return res.arrayBuffer()
+    })
+    .then((buf) => {
+      if (!buf || buf.byteLength === 0) return
+      fs.writeFileSync(USER_AVATAR_FILE, Buffer.from(buf))
+      log('saved user avatar:', USER_AVATAR_FILE, '(' + buf.byteLength + ' bytes)')
+    })
+    .catch((e) => {
+      log('saveUserAvatar error:', e.message)
+    })
+}
+
 // ── Write JSON to stdout (with newline) + broadcast to WebSocket ──────────
 function write(obj) {
   // In quiet/CLI mode, only write command responses, not events
@@ -141,6 +201,21 @@ process.on('SIGINT', () => { shutdown(); process.exit(0) })
 process.on('SIGTERM', () => { shutdown(); process.exit(0) })
 
 // ── CLI command parser ────────────────────────────────────────────────────
+// ── Port resolution (--port, --port=N, backward-compat --ws-port) ───────
+function extractPort(argv) {
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]
+    if (a === '--port' || a === '--ws-port') {
+      if (i + 1 < argv.length && !argv[i + 1].startsWith('--')) return argv[i + 1]
+    } else if (a.startsWith('--port=')) {
+      return a.split('=')[1]
+    } else if (a.startsWith('--ws-port=')) {
+      return a.split('=')[1]
+    }
+  }
+  return null
+}
+
 /**
  * Parse a command from positional CLI args (not starting with --).
  * Returns null when no command is given (plain daemon mode).
@@ -151,11 +226,16 @@ process.on('SIGTERM', () => { shutdown(); process.exit(0) })
  */
 function parseCliCommand() {
   const args = process.argv.slice(2)
-  const knownFlags = new Set(['--first-login', '--headed', '--quiet'])
+  const knownFlags = new Set(['--headed', '--quiet'])
   const positional = []
   for (let i = 0; i < args.length; i++) {
     if (knownFlags.has(args[i])) continue
-    if (args[i].startsWith('--ws-port=')) continue
+    // Skip --port/--ws-port and its value
+    if (args[i] === '--port' || args[i] === '--ws-port') {
+      if (i + 1 < args.length && !args[i + 1].startsWith('--')) i++
+      continue
+    }
+    if (args[i].startsWith('--port=') || args[i].startsWith('--ws-port=')) continue
     positional.push(args[i])
   }
   if (positional.length === 0) return null
@@ -303,9 +383,60 @@ async function runClientMode(ws) {
   process.exit(0)
 }
 
+// ── Help / version ────────────────────────────────────────────────────────
+function printHelp() {
+  const help = `wechat-bro — AI agent interface for WeChat Web
+
+Usage:
+  wechat-bro                        Start daemon (WebSocket ws://localhost:9231)
+  wechat-bro <command> [--flags]    Run one command (starts daemon if none running)
+  wechat-bro --help                 Show this help
+  wechat-bro --version              Show version
+
+Flags:
+  --headed          Show browser window (default: headless)
+  --port <port>     WebSocket port (default: 9231, env WS_PORT)
+  --quiet           Suppress non-JSON log output
+  --pretty          Pretty-print command responses (JSON with 2-space indent)
+
+Commands:
+  contacts                     List all contacts [{name, isRoomContact, memberCount}]
+  rooms                        List group chats only
+  room-members --name <room>   List members of a room (contact names)
+  get-contact --name <contact> Get single contact details
+  search --q <query>           Search contacts by name
+  send --to <name> --content <text>
+                               Send a text message. @\\"name\\" = mention in rooms.
+                               Marpit/mermaid code blocks are auto-rendered.
+  send-image --to <name> --path <file> [--filename <name>]
+  send-file  --to <name> --path <file> --filename <name>
+  send-voice --to <name> --path <file>   (transcribe + send as text)
+  status                       Show login/contacts state
+  emojis                       List supported emoji codes
+  config --key <k> --value <v> Set a config option
+  exit                         Shut down the daemon
+
+Events stream to stdout as JSON lines; messages also appended to
+~/.wechat-bro/messages.jsonl. Binary media is saved to ~/.wechat-bro/download/.
+`
+  process.stdout.write(help)
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────
 async function main() {
-  const WS_PORT = parseInt(process.env.WS_PORT || process.argv.find(a => a.startsWith('--ws-port='))?.split('=')[1] || '9231', 10)
+  const argv = process.argv.slice(2)
+  if (argv.includes('--help') || argv.includes('-h')) {
+    printHelp()
+    process.exit(0)
+  }
+  if (argv.includes('--version') || argv.includes('-v')) {
+    let version = '0.0.0'
+    try { version = require('../package.json').version } catch {}
+    process.stdout.write(version + '\n')
+    process.exit(0)
+  }
+
+  const WS_PORT = parseInt(process.env.WS_PORT || extractPort(argv) || '9231', 10)
   const cliRequest = parseCliCommand()
 
   // When we have a CLI command or piped stdin, try connecting to an existing daemon first
@@ -355,7 +486,7 @@ async function main() {
   })
 
   // Load cookies
-  if (!FIRST_LOGIN && fs.existsSync(COOKIE_FILE)) {
+  if (fs.existsSync(COOKIE_FILE)) {
     try {
       const raw = JSON.parse(fs.readFileSync(COOKIE_FILE, 'utf-8'))
       const arr = Array.isArray(raw) ? raw : (raw.cookies || [])
@@ -376,6 +507,10 @@ async function main() {
     if (data && data.voiceBase64 && (event === 'message:voice' || (event === 'message' && data.MsgType === 34))) {
       transcribeVoice(data)
     }
+    // Persist binary payloads (voice/image base64) to ~/.wechat-bro/download
+    // and replace the field with a file path — keeps events small and gives
+    // agents a path they can open directly.
+    saveBinaryContent(data)
     const line = { event, data, ts: Date.now() }
     write(line)
     // Append message events to JSONL file for external agents
@@ -383,13 +518,17 @@ async function main() {
       try { fs.writeSync(msgFd, JSON.stringify(line) + '\n') } catch {}
     }
     // Show QR code: stderr + open image in browser when headless
-    if (event === 'scan' && data && data.url) {
-      try { qrTerm.generate(data.url, { small: true }) } catch {}
-      if (!HEADED && data.url !== lastQrUrl) {
-        lastQrUrl = data.url
-        const openCmd = process.platform === 'win32' ? 'start' : (process.platform === 'darwin' ? 'open' : 'xdg-open')
-        execSync(`${openCmd} "${data.url}" 2>/dev/null || true`, { shell: true })
+    if (event === 'scan' && data) {
+      if (data.url) {
+        try { qrTerm.generate(data.url, { small: true }) } catch {}
+        if (!HEADED && data.url !== lastQrUrl) {
+          lastQrUrl = data.url
+          const openCmd = process.platform === 'win32' ? 'start' : (process.platform === 'darwin' ? 'open' : 'xdg-open')
+          execSync(`${openCmd} "${data.url}" 2>/dev/null || true`, { shell: true })
+        }
       }
+      // When phone scans the QR, WeChat exposes the user's avatar — persist it
+      saveUserAvatar(data.userAvatar)
     }
   })
 
@@ -668,7 +807,8 @@ async function dispatch(cmd, args, page) {
         account: window.WechatyBro.getAccount()
       }))
 
-    case 'supported-emojis':
+    case 'emojis':
+    case 'supported-emojis':   // backward-compat alias
       return page.evaluate(() => window.WechatyBro.getSupportedEmojis())
 
     case 'config':

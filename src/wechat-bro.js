@@ -122,13 +122,9 @@
       return acc
     }, base)
 
-    if(result.MemberList){
-      var _cf = null
-      try { _cf = angular.element(document).injector().get('contactFactory') } catch (e) {}
-      result.MemberList = result.MemberList.map(function (m) {
-        return { name: WechatyBro._memberContactName(m, _cf) }
-      })
-    }
+    // MemberList is NOT returned on contact objects — use the dedicated
+    // `room-members` command to fetch members of a room.
+    delete result.MemberList
 
     if(!WechatyBro.requireThumb){
       delete result.HeadImgUrl
