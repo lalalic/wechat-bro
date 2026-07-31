@@ -774,9 +774,9 @@
                 if (resolvedUN === selfUserName) data.mentionMe = true
                 var contactName = WechatyBro._memberContactName(memberMatch, contactFactory) || mName
                 data.mentions.push(contactName)
-                if (contactName !== mName) {
-                  data.Content = data.Content.split('@' + mName + '\u2005').join('@' + contactName + '\u2005')
-                }
+                // Rewrite WeChat wire format @<alias>\u2005 → agent format @"<contactName>"
+                // so the agent reads the same identifier it would use to address them.
+                data.Content = data.Content.split('@' + mName + '\u2005').join('@"' + contactName + '"')
               } else {
                 data.mentions.push(mName)
               }
@@ -1736,11 +1736,9 @@
                 // Resolve to universal contact name (friend name or global nick).
                 var contactName = WechatyBro._memberContactName(memberMatch, contactFactory) || mName
                 data.mentions.push(contactName)
-                // Rewrite @<alias>\u2005 → @<contactName>\u2005 in Content so
-                // the agent sees the same name it would use to address them.
-                if (contactName !== mName) {
-                  data.Content = data.Content.split('@' + mName + '\u2005').join('@' + contactName + '\u2005')
-                }
+                // Rewrite WeChat wire format @<alias>\u2005 → agent format @"<contactName>"
+                // so the agent sees the same name it would use to address them.
+                data.Content = data.Content.split('@' + mName + '\u2005').join('@"' + contactName + '"')
               } else {
                 // Unresolved — keep original text & name as-is.
                 data.mentions.push(mName)

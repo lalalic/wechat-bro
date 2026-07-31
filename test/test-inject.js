@@ -391,6 +391,10 @@ async function main() {
       if (mentionName && mentionName.length > 0) {
         ok(Array.isArray(simRoom.mentions),
            `mentions array exists (mentionName="${mentionName}")`)
+        // The incoming WeChat wire format @<alias>\u2005 should be rewritten
+        // to the agent-facing @"<contactName>" form in Content.
+        ok(simRoom.Content.includes(`@"${mentionName}"`),
+           `incoming mention rewritten to @"${mentionName}" in Content (got: "${simRoom.Content}")`)
       } else {
         ok(true, 'no mention name available — mentions check skipped')
       }
@@ -832,6 +836,9 @@ async function main() {
              'at least one @mention detected: ' + JSON.stringify(mentionResult.mentions))
           ok(mentionResult.mentionMe === false || mentionResult.mentionMe === true,
              'mentionMe is a boolean')
+          // Content must be rewritten to @"<contactName>" form
+          ok(mentionResult.Content.includes(`@"${mentionName}"`),
+             `incoming @<alias>\u2005 rewritten to @"${mentionName}" (got: "${mentionResult.Content}")`)
         } else {
           ok(true, 'no named member available — @parser test skipped')
         }

@@ -66,10 +66,8 @@ not the room-specific alias (DisplayName) that WeChat shows inside the group. Th
 keeps one universal identity:
 
 - `room-members` returns `name` = the member's contact name (`"me"` for self).
-- Incoming room messages: `@<alias>` in the text is rewritten to `@<contactName>`
-  so what the agent reads matches what it can address. `mentions[]` carries contact names.
-- Outgoing: write `@<contactName>` in `content`; wechat-bro resolves it to the
-  member and renders the correct `@alias\u2005` for WeChat.
+- **Incoming** room messages: WeChat's wire format `@<alias>\u2005` is rewritten to `@"<contactName>"` in the text the agent sees, so it matches the member list. `mentions[]` carries the same contact names.
+- **Outgoing**: write `@"<contactName>"` in `content` (double-quoted — whitespace-safe). wechat-bro resolves the name to the member and renders the correct `@<alias>\u2005` for WeChat. Unquoted `@name` is NOT rewritten (treated as literal text).
 
 A member who is **not** your contact (stranger) has no contact name — their
 `name` falls back to NickName (or room alias), and they can be @mentioned in the
@@ -200,11 +198,11 @@ npx wechat-bro get-contact --name "Alice"
 ### `send`
 Send a text message (always watermarked).  Args: `to` (name), `content`.
 - `to` must match exactly **one** contact; otherwise an ambiguity/no-match error is returned.
-- `@name` mentions supported (CJK names supported)
+- `@"name"` mentions supported (whitespace-safe, CJK-safe; unquoted `@name` is literal)
 - markdown formatting is auto‑converted to Unicode bold/italic/mono (see below).
 - `````marpit / `````mermaid code blocks are auto‑rendered to files/images (multiple blocks supported).
 ```json
-→ {"cmd":"send","to":"Dev Team","content":"@Alice check the **PR**"}
+→ {"cmd":"send","to":"Dev Team","content":"@\"Alice\" check the **PR**"}
 ← {"ok":true,"data":{"sent":true,"to":"Dev Team"}}
 
 → {"cmd":"send","to":"filehelper","content":"Flow:\\n```mermaid\\ngraph TD\\n  A-->B\\n```"}

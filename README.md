@@ -531,20 +531,17 @@ await page.evaluate(() => WechatyBro.send('Alice', '## Report\n- Item 1\n- Item 
 // With emoji
 await page.evaluate(() => WechatyBro.send('Alice', 'Hello! [Smile][Rose]'))
 
-// With @mention in a room — write @<contactName>; wechat-bro renders @alias\u2005
+// With @mention in a room — write @"<contactName>" (quoted, whitespace-safe);
+// wechat-bro renders WeChat's @<alias>\u2005 internally.
 await page.evaluate(() => {
-  WechatyBro.send('Dev Team', '@Alice check this out!')
+  WechatyBro.send('Dev Team', '@"Alice Chen" check this out!')
 })
 ```
 
-**`at(userId, roomId?)`** — Build an @mention string. Resolves a contact name to the room alias (DisplayName) if set, otherwise the contact's NickName. Emoji in names are converted from HTML to Unicode. Returns `"@Name\u2005"` (thin space delimiter).
+**`at(userId, roomId?)`** — **Internal** helper that builds WeChat's wire-format `@<DisplayName>\u2005`. Agents should NOT call this directly — write `@"<name>"` in `send` content instead. Exposed only because `sendText` uses it during outgoing rewriting. Returns `"@Name\u2005"` (thin space delimiter).
 ```js
-// Use in room messages
-await page.evaluate(() => {
-  var msg = WechatyBro.at('Alice', 'Dev Team') + WechatyBro.at('Bob', 'Dev Team') + 'meeting at 3pm'
-  WechatyBro.send('Dev Team', msg)
-})
-// Sends: "@Alice @Bob meeting at 3pm"
+// DO NOT call at() directly from agent code. Prefer send() with @"name":
+await page.evaluate(() => WechatyBro.send('Dev Team', '@"Alice Chen" @"Bob" meeting at 3pm'))
 ```
 
 **`getSupportedEmojis()`** — Get list of 209 supported emoji codes.

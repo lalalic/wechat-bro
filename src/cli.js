@@ -475,11 +475,12 @@ async function sendText(page, to, content) {
     // any mention rewriting), so the agent gets a clear disambiguation error.
     const resolved = WB._requireUserName(to)
     const isRoom = resolved.startsWith('@@')
-    // @mention conversion: '@<name>' → WeChat '@<name>\u2005'.
-    // Name chars can be CJK, so match anything that isn't whitespace, '@', or the
-    // WeChat thin-space terminator, up to the next space/thin-space/end of string.
-    content = content.replace(/@([^\s\u2005@]+)(?=[\s\u2005]|$)/g, (match, id) => {
-      const un = WB._resolveUserName(id)
+    // @mention conversion: agent writes @"<contact name>" (quoted, whitespace-safe).
+    // We resolve the name → UserName and render WeChat's @<DisplayName>\u2005.
+    // Unknown names are left untouched (agent may have meant a literal @). Names
+    // containing a literal `"` cannot be represented — extremely rare in WeChat.
+    content = content.replace(/@"([^"]+)"/g, (match, name) => {
+      const un = WB._resolveUserName(name)
       if (!un) return match
       const mention = isRoom ? WB.at(un, resolved) : WB.at(un)
       return mention || match
