@@ -53,6 +53,7 @@ ws://localhost:9231
 Events stream as JSON lines to stdout:
 ```jsonl
 {"event":"scan","data":{"code":0,"url":"https://login.weixin.qq.com/qrcode/...","loginUrl":"https://login.weixin.qq.com/l/..."}}
+{"event":"scan","data":{"code":201,"userAvatar":"/Users/<you>/.wechat-bro/userAvatar.png"}}
 {"event":"login","data":{"name":"me","NickName":"李诚"}}
 {"event":"contacts-ready","data":{"total":248,"elapsedMs":25001}}
 {"event":"message","data":{"MsgType":1,"Content":"hello","from":{"name":"Alice"},"to":{"name":"me"}}}
@@ -60,6 +61,11 @@ Events stream as JSON lines to stdout:
 {"event":"message:text","data":{"MsgType":1,"Content":"hello"}}
 {"event":"logout","data":"..."}
 ```
+
+> **Login QR**: the QR code is **not** drawn in the terminal. On a `scan`
+> event, when running headless the QR URL is opened in your default browser
+> so you can scan it. When scanned (code 201), `userAvatar` is a **file path**
+> to the downloaded avatar at `~/.wechat-bro/userAvatar.png`.
 
 ### Option 2: With Puppeteer
 
@@ -95,7 +101,8 @@ await page.evaluate(() => WechatyBro.init())
 
 // --- After login + contacts-ready event ---
 
-// Send text — `to` is a contact NAME (e.g. "Alice", "李诚", "me", "filehelper")
+// Send text — `to` is a contact NAME (e.g. "Alice", "李诚", "me", "filehelper";
+// "文件传输助手" also resolves to FileHelper automatically)
 await page.evaluate(() => WechatyBro.send('Alice', 'Hello! [Smile][Rose]'))
 
 // Send image (upload happens in Node.js, send happens in browser)
@@ -513,7 +520,7 @@ const avatar = await page.evaluate(n => new Promise(r => WechatyBro.getContactIm
 
 ### Messaging
 
-**`send(to, content, watermark?)`** — Send text message. `to` is a contact **name** (or `"me"` / `"filehelper"`). Auto-converts markdown to Unicode styling. Pass `true` as 3rd arg to add invisible AI watermark.
+**`send(to, content, watermark?)`** — Send text message. `to` is a contact **name** (or `"me"` / `"filehelper"` / `"文件传输助手"`). Auto-converts markdown to Unicode styling. Pass `true` as 3rd arg to add invisible AI watermark.
 ```js
 // Simple text
 await page.evaluate(() => WechatyBro.send('Alice', 'Hello!'))

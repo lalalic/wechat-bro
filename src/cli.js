@@ -19,15 +19,15 @@
  *   Server → Agent:  {"event":"message","data":{},"ts":...} # broadcast event
  *
  * Commands:
- *   contacts          → [{id, name, UserName, isRoomContact, memberCount}]
- *   rooms             → [{id, name, UserName, memberCount}] (rooms only)
- *   room-members      → [{id, name, UserName, ...}]  (args: --id <roomId>)
- *   get-contact       → {id, name, ...}               (args: --id <contactId>)
- *   send              → {sent: true, to}              (args: --to, --content)
+ *   contacts          → [name]                       (individuals only)
+ *   rooms             → [name]                       (group chats only)
+ *   room-members      → [name]                       (args: --name <room>)
+ *   get-contact       → {name, isRoomContact, ...}   (args: --name <contact|room>)
+ *   send-text         → {sent: true, to}              (args: --to, --content)
  *   send-image        → {sent: true, to, file}        (args: --to, --path, [--filename])
  *   send-file         → {sent: true, to, file}        (args: --to, --path, --filename)
  *   send-voice        → {sent, to, transcription}     (args: --to, --path)
- *   status            → {loggedIn, contactsReady, lastMsgTime}
+ *   status            → {loggedIn, contactsReady, lastMsgTime, account}
  *   emojis            → [string]
  *   ping              → {pong: true, ts: ...}         (liveness check)
  *   exit              → shut down
@@ -41,7 +41,10 @@ const os = require('os')
 const { execSync } = require('child_process')
 const readline = require('readline')
 const puppeteer = require('puppeteer')
-const qrTerm = require('qrcode-terminal')
+// NOTE: WeChat login QR code is intentionally NOT drawn in the terminal.
+// The scan event emits {url} — open it in a browser window (headless mode)
+// or paste the URL into any browser to scan. This keeps terminal output
+// clean JSON lines for agents.
 const WebSocket = require('ws')
 const { transcribeVoice, transcribeFile } = require('./transcribe')
 const { sendImage, sendFile } = require('./upload')
@@ -139,10 +142,15 @@ function saveBinaryContent(data) {
 }
 
 // ── Save scan event's user avatar → ~/.wechat-bro/userAvatar.png ─────────
+// Replaces data.userAvatar (URL) with the file path synchronously so the
+// event always carries a path; the actual bytes are downloaded async.
 const USER_AVATAR_FILE = path.join(DATA_DIR, 'userAvatar.png')
 
-function saveUserAvatar(avatarUrl) {
+function saveUserAvatar(data) {
+  if (!data || typeof data !== 'object') return
+  const avatarUrl = data.userAvatar
   if (!avatarUrl || typeof avatarUrl !== 'string') return
+
   // Resolve relative avatar URLs (e.g. /cgi-bin/mmwebwx-bin/webwxgeticon?...)
   let fullUrl = avatarUrl
   if (fullUrl.startsWith('/')) {
@@ -153,6 +161,10 @@ function saveUserAvatar(avatarUrl) {
   }
   if (!fullUrl.startsWith('http://') && !fullUrl.startsWith('https://')) return
 
+  // Replace URL with deterministic file path in the event (before write(line))
+  data.userAvatar = USER_AVATAR_FILE
+
+  // Async download — populate the file
   fetch(fullUrl, { redirect: 'follow', signal: AbortSignal.timeout(10000) })
     .then((res) => {
       if (!res.ok) throw new Error('HTTP ' + res.status)
@@ -222,7 +234,7 @@ function extractPort(argv) {
  *
  * Examples:
  *   npx wechat-bro status          → { cmd: 'status' }
- *   npx wechat-bro send --to a --content "hi"  → { cmd: 'send', to: 'a', content: 'hi' }
+ *   npx wechat-bro send-text --to a --content "hi"  → { cmd: 'send-text', to: 'a', content: 'hi' }
  */
 function parseCliCommand() {
   const args = process.argv.slice(2)
@@ -400,12 +412,11 @@ Flags:
   --pretty          Pretty-print command responses (JSON with 2-space indent)
 
 Commands:
-  contacts                     List all contacts [{name, isRoomContact, memberCount}]
-  rooms                        List group chats only
-  room-members --name <room>   List members of a room (contact names)
-  get-contact --name <contact> Get single contact details
-  search --q <query>           Search contacts by name
-  send --to <name> --content <text>
+  contacts                     List individual contacts (names only)
+  rooms                        List group chats (names only)
+  room-members --name <room>   List members of a room (names only)
+  get-contact --name <name>    Get details for a contact OR room
+  send-text --to <name> --content <text>
                                Send a text message. @\\"name\\" = mention in rooms.
                                Marpit/mermaid code blocks are auto-rendered.
   send-image --to <name> --path <file> [--filename <name>]
@@ -511,24 +522,25 @@ async function main() {
     // and replace the field with a file path — keeps events small and gives
     // agents a path they can open directly.
     saveBinaryContent(data)
+    // For scan events: persist the user avatar URL to disk and swap the field
+    // for the file path before emitting the event.
+    if (event === 'scan') saveUserAvatar(data)
     const line = { event, data, ts: Date.now() }
     write(line)
     // Append message events to JSONL file for external agents
     if ((event === 'message' || event.startsWith('message:')) && msgFd) {
       try { fs.writeSync(msgFd, JSON.stringify(line) + '\n') } catch {}
     }
-    // Show QR code: stderr + open image in browser when headless
+    // On scan event: when running headless, open the QR URL in a browser
+    // window so the user can scan it. (Not drawn in terminal — keep stdout
+    // clean for agent piping. The user avatar is persisted above by
+    // saveUserAvatar, which also swaps data.userAvatar for the file path.)
     if (event === 'scan' && data) {
-      if (data.url) {
-        try { qrTerm.generate(data.url, { small: true }) } catch {}
-        if (!HEADED && data.url !== lastQrUrl) {
-          lastQrUrl = data.url
-          const openCmd = process.platform === 'win32' ? 'start' : (process.platform === 'darwin' ? 'open' : 'xdg-open')
-          execSync(`${openCmd} "${data.url}" 2>/dev/null || true`, { shell: true })
-        }
+      if (data.url && !HEADED && data.url !== lastQrUrl) {
+        lastQrUrl = data.url
+        const openCmd = process.platform === 'win32' ? 'start' : (process.platform === 'darwin' ? 'open' : 'xdg-open')
+        execSync(`${openCmd} "${data.url}" 2>/dev/null || true`, { shell: true })
       }
-      // When phone scans the QR, WeChat exposes the user's avatar — persist it
-      saveUserAvatar(data.userAvatar)
     }
   })
 
@@ -679,23 +691,32 @@ function parseSegments(content) {
 async function dispatch(cmd, args, page) {
   switch (cmd) {
     case 'contacts':
-      return page.evaluate(() => window.WechatyBro.contactList())
+      // Individuals only (isContact===true, not a room). Names only.
+      return page.evaluate(() =>
+        window.WechatyBro.contactList(c => c.isContact && c.isContact() === true && !(c.isRoomContact && c.isRoomContact()))
+          .map(c => c.name)
+      )
 
     case 'rooms':
-      return page.evaluate(() => window.WechatyBro.contactList(a=>a.isRoomContact()))
-
-    case 'search':
-      return page.evaluate((q) => window.WechatyBro.contactList(a => a.getDisplayName()?.includes(q)), args.q)
+      // Group chats only. Names only.
+      return page.evaluate(() =>
+        window.WechatyBro.contactList(a => a.isRoomContact && a.isRoomContact() === true)
+          .map(r => r.name)
+      )
 
     case 'room-members':
-      if (!args.name && !args.id) throw new Error('Missing --name (room name)')
-      return page.evaluate((rid) => window.WechatyBro.getRoomMembers(rid), args.name || args.id)
+      if (!args.name) throw new Error('Missing --name (room name)')
+      // Names only.
+      const _members = await page.evaluate((rid) => window.WechatyBro.getRoomMembers(rid), args.name)
+      return _members.map(m => m.name)
 
     case 'get-contact':
-      if (!args.name && !args.id) throw new Error('Missing --name (contact name)')
-      return page.evaluate((cid) => window.WechatyBro.getContact(cid), args.name || args.id)
+      // Works for any contact OR room (resolved by name).
+      if (!args.name) throw new Error('Missing --name (contact or room name)')
+      return page.evaluate((cid) => window.WechatyBro.getContact(cid), args.name)
 
-    case 'send':
+    case 'send-text':
+    case 'send':   // backward-compat alias
       if (!args.to) throw new Error('Missing --to')
       if (!args.content) throw new Error('Missing --content')
 
@@ -725,13 +746,20 @@ async function dispatch(cmd, args, page) {
           const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wx-marpit-'))
           tmpDirs.push(tmpDir)
           const mdFile = path.join(tmpDir, 'slides.md')
-          const outFile = path.join(tmpDir, 'slides.html')
-          const fname = marpitN === 1 ? 'slides.html' : `slides-${marpitN}.html`
+          const outFile = path.join(tmpDir, 'slides.pdf')
+          const fname = marpitN === 1 ? 'slides.pdf' : `slides-${marpitN}.pdf`
           try {
             fs.writeFileSync(mdFile, seg.content)
-            execSync(`npx @marp-team/marp-cli "${mdFile}" -o "${outFile}"`, { timeout: 30000, stdio: 'pipe' })
-            const htmlBuf = fs.readFileSync(outFile)
-            await sendFile(page, args.to, htmlBuf, fname)
+            // --pdf: WeChat cannot display HTML; PDF is universally viewable.
+            // Reuse the detected Chrome (same as mermaid) so we don't download
+            // a separate Chromium just for marp.
+            execSync(`npx @marp-team/marp-cli --pdf --chrome-path "${chromePath}" "${mdFile}" -o "${outFile}"`, {
+              timeout: 30000,
+              stdio: 'pipe',
+              env: { ...process.env, PUPPETEER_EXECUTABLE_PATH: chromePath, CHROME_PATH: chromePath },
+            })
+            const pdfBuf = fs.readFileSync(outFile)
+            await sendFile(page, args.to, pdfBuf, fname)
             files.push({ file: fname, type: 'marpit' })
           } catch (e) {
             throw new Error(`marpit render failed: ${e.message}`)

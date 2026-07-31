@@ -75,6 +75,14 @@
   // WeChat UserName (@hash) is resolved internally at call time.
   var INTERNAL_KEYS = { UserName: 1, Uin: 1, PYQuanPin: 1, PYInitial: 1, RemarkPYQuanPin: 1, RemarkPYInitial: 1, EncryChatRoomId: 1 }
 
+  // Localized display-name aliases for system accounts → canonical UserName.
+  // FileHelper shows as "文件传输助手" in zh-CN; normalize so both names work
+  // everywhere (send, get-contact, room-members, mentions). Add more here as
+  // needed (e.g. "weixin" variants).
+  var SYSTEM_ALIASES = {
+    '文件传输助手': 'filehelper',
+  }
+
   function asContact(contact, isForList=false){
     const empty=value=>value===0 || value===false || value==="" || (Array.isArray(value) && value.length===0)
     var selfUN = getUserName()
@@ -343,6 +351,8 @@
      *  Accepts a display name, '@hash' UserName, 'me', or a system account. */
     _resolveUserName: function (id) {
       if (!id) return null
+      // Normalize localized system-account display names → canonical UserName
+      if (SYSTEM_ALIASES[id]) id = SYSTEM_ALIASES[id]
       // Direct UserName (starts with @) or system account — unambiguous, pass through
       if (id.charAt(0) === '@' || id === 'filehelper' || id === 'weixin') return id
       // 'me' always refers to the account owner
@@ -358,6 +368,8 @@
      *  the user to disambiguate. */
     _requireUserName: function (name) {
       if (!name) throw new Error('contact name is required')
+      // Normalize localized system-account display names → canonical UserName
+      if (SYSTEM_ALIASES[name]) name = SYSTEM_ALIASES[name]
       if (name.charAt(0) === '@' || name === 'filehelper' || name === 'weixin') return name
       if (name === 'me') {
         var self = getUserName()
@@ -1661,7 +1673,7 @@
     // Don't leak internal @hash UserNames — the external contract is name-only.
     // (from/to/sender are already name-only contact objects via asContact.)
     try { delete data.FromUserName; delete data.ToUserName; delete data.ActualSender } catch (e) {}
-    WechatyBro.emit('message', data)
+    // WechatyBro.emit('message', data)
     WechatyBro.emit('message:' + typeName, data)
   }
 

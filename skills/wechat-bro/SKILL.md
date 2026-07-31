@@ -33,22 +33,26 @@ Identify every contact by its **`name`** — the name you'd use to address them
 The exact `name` string returned by any command can be reused as-is in the next
 command's `to` field — no transformation needed.
 
+**System accounts**: `filehelper` (File Transfer Helper) is available by its
+canonical name `filehelper` **or** its localized name `文件传输助手` — both
+resolve to the same chat.
+
 **Ambiguity is an error.** If a name matches more than one contact (or none),
-`send` / `send-image` / `send-file` / `room-members` / `get-contact` return an
+`send-text` / `send-image` / `send-file` / `room-members` / `get-contact` return an
 error instead of guessing — surface it to the user to disambiguate:
 
 ```json
-→ {"cmd":"send","to":"李诚","content":"hi"}
+→ {"cmd":"send-text","to":"李诚","content":"hi"}
 ← {"ok":false,"error":"name \"李诚\" matches 2 contacts; please disambiguate (e.g. set a unique remark name with setRemark)"}
 ```
 
 ### @mentions in rooms
 
-Use the **`@"<name>"`** format (double-quoted) anywhere in `send` content to
+Use the **`@"<name>"`** format (double-quoted) anywhere in `send-text` content to
 mention someone. The quoted name must match a member of the target room.
 
 ```json
-→ {"cmd":"send","to":"Dev Team","content":"@\"Alice Chen\" check this"}
+→ {"cmd":"send-text","to":"Dev Team","content":"@\"Alice Chen\" check this"}
 ```
 
 Incoming room messages arrive with the same `@"<name>"` form in `Content`, and
@@ -108,7 +112,7 @@ Connect to `ws://localhost:9231`.  Send/receive JSON messages.
 |---|---|---|
 | `connected` | On connect | `{clientId, serverId}` |
 | `ready` | After login + contacts loaded | `{loggedIn, contactsReady}` |
-| `scan` | QR code displayed/updated | `{code, url, loginUrl, userAvatar?}`. When scanned (code 201), the user's avatar is saved to `~/.wechat-bro/userAvatar.png` |
+| `scan` | QR code displayed/updated | `{code, url, loginUrl, userAvatar?}`. `userAvatar` (when present, code 201) is a **file path** to the downloaded avatar at `~/.wechat-bro/userAvatar.png` |
 | `login` | User logged in | `{name, …}` (self; `name` is `"me"`) |
 | `logout` | User logged out | source string |
 | `contacts-ready` | Contact list fully loaded (count stabilized) | `{total, elapsedMs}` |
@@ -129,59 +133,53 @@ echo '{"cmd":"contacts"}' | npx wechat-bro
 ## Commands
 
 ### `contacts`
-List all contacts.
+List individual contacts (people, not group chats). Returns a **name list only** — use `get-contact` for details.
 ```json
 → {"cmd":"contacts"}
-← {"ok":true,"data":[
-    {"name":"Alice","isRoomContact":false,"memberCount":0},
-    {"name":"Dev Team","isRoomContact":true,"memberCount":12}
-  ]}
+← {"ok":true,"data":["Alice","Bob","小A"]}
 ```
 
 ### `rooms`
-List only group chats.
+List group chats (rooms). Returns a **name list only** — use `get-contact` or `room-members` for details.
 ```json
 → {"cmd":"rooms"}
-← {"ok":true,"data":[
-    {"name":"Dev Team","memberCount":12}
-  ]}
+← {"ok":true,"data":["Dev Team","Family","项目组"]}
 ```
 
 ### `room-members`
-Get members of a room.  Arg: `id` (the room **name**) over WebSocket, or `--name` on the CLI.
+Get members of a room. Returns a **name list only**.
+Arg: `id` (the room **name**) over WebSocket, or `--name` on the CLI.
 ```json
 → {"cmd":"room-members","id":"Dev Team"}
-← {"ok":true,"data":[
-    {"name":"Alice"},
-    {"name":"小A"}
-  ]}
+← {"ok":true,"data":["Alice","小A"]}
 ```
 ```bash
 npx wechat-bro room-members --name "Dev Team"
 ```
 
 ### `get-contact`
-Get single contact details.  Arg: `id` (the contact **name**) over WebSocket, or `--name` on the CLI.
+Get details for a single **contact or room** (resolved by name).  Arg: `id` (the **name**) over WebSocket, or `--name` on the CLI.
 Does NOT include the member list — use `room-members` for that.
 ```json
 → {"cmd":"get-contact","id":"Alice"}
 ← {"ok":true,"data":{"name":"Alice","isRoomContact":false,…}}
 ```
 ```bash
-npx wechat-bro get-contact --name "Alice"
+npx wechat-bro get-contact --name "Dev Team"
 ```
 
-### `send`
+### `send-text`
 Send a text message.  Args: `to` (name), `content`.
 - `to` must match exactly one contact.
 - `@"name"` mentions supported (see @mentions above).
 - markdown formatting is auto‑converted (see Markdown Styling below).
-- `````marpit / `````mermaid code blocks are auto‑rendered to files/images.
+- `````marpit``` blocks are rendered to **PDF** (`slides.pdf`) and `````mermaid`
+  blocks to **PNG** (`diagram.png`) — WeChat can't display HTML.
 ```json
-→ {"cmd":"send","to":"Dev Team","content":"@\"Alice\" check the **PR**"}
+→ {"cmd":"send-text","to":"Dev Team","content":"@\"Alice\" check the **PR**"}
 ← {"ok":true,"data":{"sent":true,"to":"Dev Team"}}
 
-→ {"cmd":"send","to":"filehelper","content":"Flow:\\n```mermaid\\ngraph TD\\n  A-->B\\n```"}
+→ {"cmd":"send-text","to":"filehelper","content":"Flow:\\n```mermaid\\ngraph TD\\n  A-->B\\n```"}
 ← {"ok":true,"data":{"sent":true,"to":"filehelper","files":[{"file":"diagram.png","type":"mermaid"}],"caption":"Flow:"}}
 ```
 
@@ -231,9 +229,11 @@ Shut down gracefully.
 
 ## Auto-Render: Marpit & Mermaid
 
-When `send` content contains ````marpit` or ````mermaid` code blocks, the CLI
-auto-renders each one and sends the results as files/images.  Any text before,
-between, or after blocks is also sent as a normal message (with `@mention`).
+When `send-text` content contains ````marpit` or `````mermaid` code blocks, the
+CLI auto-renders each one and sends the results as files — `````marpit` →
+**PDF** (`slides.pdf`), `````mermaid` → **PNG** (`diagram.png`).  Any text
+before, between, or after blocks is also sent as a normal message (with
+`@mention`).
 
 **Multiple blocks** are supported — all ````marpit` and ````mermaid` blocks in
 content are processed in order.  Tools run via `npx` (auto-downloaded if
@@ -242,7 +242,7 @@ missing).  Response includes a `files` array:
 ```json
 ← {"ok":true,"data":{"sent":true,"to":"filehelper","files":[
     {"file":"diagram.png","type":"mermaid"},
-    {"file":"slides.html","type":"marpit"}
+    {"file":"slides.pdf","type":"marpit"}
   ],"caption":"See attached."}}
 ```
 
