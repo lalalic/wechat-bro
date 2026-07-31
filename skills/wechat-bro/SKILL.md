@@ -25,6 +25,56 @@ agents can connect simultaneously via WebSocket.
                            ▼ stdout (events + backward compat stdin)
 ```
 
+## Identity Model
+
+**Outside wechat-bro, contacts are identified by `name` only** — never an `id` or a
+WeChat `UserName` (`@hash`). Those internal keys are not exposed. The `name` is the
+contact's display name (`RemarkName`/`NickName` — what users actually call them);
+the account owner is always `"me"`.
+
+WeChat display names can contain HTML (e.g. emoji `<img>` tags). wechat-bro
+normalizes them with `cleanName` (emoji→Unicode, HTML stripped) and uses that
+**canonical** form everywhere — in lists, events, and the internal name map. This
+is idempotent, so the exact string you receive can be echoed straight back in a
+command and will match.
+
+**Ambiguity is an error.** If a name matches more than one contact (or none),
+`send` / `send-image` / `send-file` / `room-members` / `get-contact` return an
+error instead of guessing. Surface it to the user to resolve — e.g. they set a
+unique remark name first, then retry:
+
+```json
+→ {"cmd":"send","to":"李诚","content":"hi"}
+← {"ok":false,"error":"name \"李诚\" matches 2 contacts; please disambiguate (e.g. set a unique remark name with setRemark)"}
+```
+
+| concept | value | notes |
+|---|---|---|
+| `name` | display name (e.g. `李诚`, `Dev Team`), `me` for self | the only identity exposed externally |
+| `UserName` | WeChat's internal `@hash` | never returned to callers; resolved internally at call time |
+
+```json
+// Agent ↔ wechat-bro uses names only:
+→ {"cmd":"send","to":"李诚","content":"hi"}
+← {"ok":true,"data":{"sent":true,"to":"李诚"}}
+```
+
+### Room members & @mentions
+
+Room members are also identified by their **contact name** (RemarkName/NickName),
+not the room-specific alias (DisplayName) that WeChat shows inside the group. This
+keeps one universal identity:
+
+- `room-members` returns `name` = the member's contact name (`"me"` for self).
+- Incoming room messages: `@<alias>` in the text is rewritten to `@<contactName>`
+  so what the agent reads matches what it can address. `mentions[]` carries contact names.
+- Outgoing: write `@<contactName>` in `content`; wechat-bro resolves it to the
+  member and renders the correct `@alias\u2005` for WeChat.
+
+A member who is **not** your contact (stranger) has no contact name — their
+`name` falls back to NickName (or room alias), and they can be @mentioned in the
+room but not DM'd.
+
 ## Quick Start
 
 ```bash
@@ -77,9 +127,9 @@ Connect to `ws://localhost:9231`.  Send/receive JSON messages.
 | `connected` | On connect | `{clientId, serverId}` |
 | `ready` | After login + contacts loaded | `{loggedIn, contactsReady}` |
 | `scan` | QR code displayed/updated | `{code, url, loginUrl, userAvatar?}` |
-| `login` | User logged in | `{id, name, UserName, …}` |
+| `login` | User logged in | `{name, …}` (self; `name` is `"me"`) |
 | `logout` | User logged out | source string |
-| `contacts-ready` | Contact list fully loaded | `{total, withPinyin, elapsedMs}` |
+| `contacts-ready` | Contact list fully loaded (count stabilized) | `{total, elapsedMs}` |
 | `message` | Any incoming message | Full message object with `from`/`to` |
 | `message:text` | Incoming text message | Same as `message` |
 | `message:image` | Incoming image | Same + `imageBase64` (auto‑downloaded) |
@@ -98,12 +148,12 @@ echo '{"cmd":"contacts"}' | npx wechat-bro
 ## Commands
 
 ### `contacts`
-List all contacts.
+List all contacts (name only — no `id`/`UserName` exposed).
 ```json
 → {"cmd":"contacts"}
 ← {"ok":true,"data":[
-    {"id":"alice","name":"Alice","UserName":"@…","isRoomContact":false,"memberCount":0},
-    {"id":"mygroup","name":"Dev Team","UserName":"@@…","isRoomContact":true,"memberCount":12}
+    {"name":"Alice","isRoomContact":false,"memberCount":0},
+    {"name":"Dev Team","isRoomContact":true,"memberCount":12}
   ]}
 ```
 
@@ -112,34 +162,50 @@ List only group chats.
 ```json
 → {"cmd":"rooms"}
 ← {"ok":true,"data":[
-    {"id":"mygroup","name":"Dev Team","UserName":"@@…","memberCount":12}
+    {"name":"Dev Team","memberCount":12}
   ]}
 ```
 
-### `room-members`
-Get members of a room.  Arg: `id` (room UserName or pyId).
+### `room-members` (WebSocket protocol)
+Get members of a room.  Arg: `id` (the room **name**).
+Errors if the name is ambiguous/unknown.
 ```json
-→ {"cmd":"room-members","id":"@@roomhash"}
+→ {"cmd":"room-members","id":"Dev Team"}
 ← {"ok":true,"data":[
-    {"id":"alice","name":"Alice","UserName":"@…","NickName":"Alice","DisplayName":"小A"}
+    {"name":"Alice"},
+    {"name":"小A"}
   ]}
 ```
 
-### `get-contact`
-Get single contact details.  Arg: `id`.
-```json
-→ {"cmd":"get-contact","id":"alice"}
-← {"ok":true,"data":{"id":"alice","name":"Alice","UserName":"@…","isRoomContact":false,…}}
+### `room-members` (CLI)
+```bash
+npx wechat-bro room-members --name "Dev Team"
 ```
+
+### `get-contact` (WebSocket protocol)
+Get single contact details.  Arg: `id` (the contact **name**).
+Errors if the name is ambiguous/unknown.
+```json
+→ {"cmd":"get-contact","id":"Alice"}
+← {"ok":true,"data":{"name":"Alice","isRoomContact":false,…}}
+```
+
+### `get-contact` (CLI)
+```bash
+npx wechat-bro get-contact --name "Alice"
+```
+
+> **Note on `--id` vs `--name`:** In the JSON protocol (WebSocket), the `id` field serves double duty as both request correlation id and the contact identifier. This works when each request uses unique correlation ids. The CLI, however, auto-generates `id: 'cli-cmd'` for correlation which would clobber a contact identifier — so CLI commands use `--name` instead.
 
 ### `send`
-Send a text message (always watermarked).  Args: `to`, `content`.
-- `@contactid` supported
+Send a text message (always watermarked).  Args: `to` (name), `content`.
+- `to` must match exactly **one** contact; otherwise an ambiguity/no-match error is returned.
+- `@name` mentions supported (CJK names supported)
 - markdown formatting is auto‑converted to Unicode bold/italic/mono (see below).
 - `````marpit / `````mermaid code blocks are auto‑rendered to files/images (multiple blocks supported).
 ```json
-→ {"cmd":"send","to":"testneo","content":"@alice check the **PR**"}
-← {"ok":true,"data":{"sent":true,"to":"testneo"}}
+→ {"cmd":"send","to":"Dev Team","content":"@Alice check the **PR**"}
+← {"ok":true,"data":{"sent":true,"to":"Dev Team"}}
 
 → {"cmd":"send","to":"filehelper","content":"Flow:\\n```mermaid\\ngraph TD\\n  A-->B\\n```"}
 ← {"ok":true,"data":{"sent":true,"to":"filehelper","files":[{"file":"diagram.png","type":"mermaid"}],"caption":"Flow:"}}

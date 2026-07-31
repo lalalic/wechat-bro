@@ -471,9 +471,14 @@ async function main() {
 async function sendText(page, to, content) {
   return page.evaluate((to, content) => {
     const WB = window.WechatyBro
-    const resolved = WB._resolveUserName(to) || to
+    // Strict resolve — throws on ambiguous/unknown recipient (fail fast, before
+    // any mention rewriting), so the agent gets a clear disambiguation error.
+    const resolved = WB._requireUserName(to)
     const isRoom = resolved.startsWith('@@')
-    content = content.replace(/@(\w[\w@.-]*)/g, (match, id) => {
+    // @mention conversion: '@<name>' → WeChat '@<name>\u2005'.
+    // Name chars can be CJK, so match anything that isn't whitespace, '@', or the
+    // WeChat thin-space terminator, up to the next space/thin-space/end of string.
+    content = content.replace(/@([^\s\u2005@]+)(?=[\s\u2005]|$)/g, (match, id) => {
       const un = WB._resolveUserName(id)
       if (!un) return match
       const mention = isRoom ? WB.at(un, resolved) : WB.at(un)
@@ -543,12 +548,12 @@ async function dispatch(cmd, args, page) {
       return page.evaluate((q) => window.WechatyBro.contactList(a => a.getDisplayName()?.includes(q)), args.q)
 
     case 'room-members':
-      if (!args.id) throw new Error('Missing --id')
-      return page.evaluate((rid) => window.WechatyBro.getRoomMembers(rid), args.id)
+      if (!args.name && !args.id) throw new Error('Missing --name (room name)')
+      return page.evaluate((rid) => window.WechatyBro.getRoomMembers(rid), args.name || args.id)
 
     case 'get-contact':
-      if (!args.id) throw new Error('Missing --id')
-      return page.evaluate((cid) => window.WechatyBro.getContact(cid), args.id)
+      if (!args.name && !args.id) throw new Error('Missing --name (contact name)')
+      return page.evaluate((cid) => window.WechatyBro.getContact(cid), args.name || args.id)
 
     case 'send':
       if (!args.to) throw new Error('Missing --to')

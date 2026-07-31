@@ -53,10 +53,10 @@ ws://localhost:9231
 Events stream as JSON lines to stdout:
 ```jsonl
 {"event":"scan","data":{"code":0,"url":"https://login.weixin.qq.com/qrcode/...","loginUrl":"https://login.weixin.qq.com/l/..."}}
-{"event":"login","data":{"id":"licheng","name":"李诚","NickName":"李诚"}}
-{"event":"contacts-ready","data":{"total":248,"personal":221,"withPinyin":221,"elapsedMs":1003}}
-{"event":"message","data":{"MsgType":1,"Content":"hello","from":{"name":"Alice","id":"alice"}}}
-{"event":"message","data":{"MsgType":1,"Content":"hey all","from":{"name":"Dev Team","id":"devteam","isRoomContact":true},"sender":{"name":"Alice","id":"alice"},"mentions":[],"mentionMe":false}}
+{"event":"login","data":{"name":"me","NickName":"李诚"}}
+{"event":"contacts-ready","data":{"total":248,"elapsedMs":25001}}
+{"event":"message","data":{"MsgType":1,"Content":"hello","from":{"name":"Alice"},"to":{"name":"me"}}}
+{"event":"message","data":{"MsgType":1,"Content":"hey all","from":{"name":"Dev Team","isRoomContact":true},"sender":{"name":"Alice"},"mentions":[],"mentionMe":false}}
 {"event":"message:text","data":{"MsgType":1,"Content":"hello"}}
 {"event":"logout","data":"..."}
 ```
@@ -95,16 +95,16 @@ await page.evaluate(() => WechatyBro.init())
 
 // --- After login + contacts-ready event ---
 
-// Send text (supports emoji codes)
-await page.evaluate(() => WechatyBro.send('alice', 'Hello! [Smile][Rose]'))
+// Send text — `to` is a contact NAME (e.g. "Alice", "李诚", "me", "filehelper")
+await page.evaluate(() => WechatyBro.send('Alice', 'Hello! [Smile][Rose]'))
 
 // Send image (upload happens in Node.js, send happens in browser)
 const imgBuf = fs.readFileSync('photo.jpg')
-await sendImage(page, 'alice', imgBuf, 'photo.jpg')
+await sendImage(page, 'Alice', imgBuf, 'photo.jpg')
 
 // Send file
 const pdfBuf = fs.readFileSync('report.pdf')
-await sendFile(page, 'alice', pdfBuf, 'report.pdf')
+await sendFile(page, 'Alice', pdfBuf, 'report.pdf')
 ```
 
 ### Option 3: With Playwright
@@ -441,8 +441,8 @@ node test-inject.js
 | Event | Data | When |
 |---|---|---|
 | `scan` | `{code, url, loginUrl}` | QR code shown. `code`: 0=new, 408=waiting, 201=scanned, 200=confirmed |
-| `login` | `{id, name, UserName, NickName, HeadImgUrl, Sex}` | User logged in. `id` is the stable PYQuanPin-based identifier |
-| `contacts-ready` | `{total, personal, withPinyin, elapsedMs}` | Contact list fully loaded with PYQuanPin data |
+| `login` | `{name, NickName, HeadImgUrl, Sex}` | User logged in. `name` is `"me"` (the account owner's constant identity) |
+| `contacts-ready` | `{total, elapsedMs}` | Contact list fully loaded (count stabilized across batches) |
 | `message` | Full message object with `from`/`to` contacts | Any message received |
 | `message:text` | Same | Text message (MsgType 1) |
 | `message:image` | Same | Image (MsgType 3) |
@@ -502,47 +502,47 @@ const contacts = await page.evaluate(() => WechatyBro.contactList())
 **`getRoomMembers(roomId)`** — Get members of a group chat. Names are cleaned (emoji HTML converted to Unicode).
 ```js
 const members = await page.evaluate(() => WechatyBro.getRoomMembers('mygroup'))
-// [{ id: 'alice', name: 'Alice', NickName: 'Alice', RemarkName: 'A', DisplayName: '小A', UserName: '@...' }, ...]
+// [{'name': 'Alice', 'isRoomContact': false, ...}, ...]  — name-only identity
 ```
 
-**`getContactImage(id, callback)`** — Get contact avatar as base64 data URI.
+**`getContactImage(name, callback)`** — Get contact avatar as base64 data URI.
 ```js
-const avatar = await page.evaluate(id => new Promise(r => WechatyBro.getContactImage(id, r)), 'alice')
+const avatar = await page.evaluate(n => new Promise(r => WechatyBro.getContactImage(n, r)), 'Alice')
 // "data:image/jpeg;base64,/9j/4AAQ..."
 ```
 
 ### Messaging
 
-**`send(to, content, watermark?)`** — Send text message. Auto-converts markdown to Unicode styling. Pass `true` as 3rd arg to add invisible AI watermark.
+**`send(to, content, watermark?)`** — Send text message. `to` is a contact **name** (or `"me"` / `"filehelper"`). Auto-converts markdown to Unicode styling. Pass `true` as 3rd arg to add invisible AI watermark.
 ```js
 // Simple text
-await page.evaluate(() => WechatyBro.send('alice', 'Hello!'))
+await page.evaluate(() => WechatyBro.send('Alice', 'Hello!'))
 
 // Markdown auto-styled (bold, italic, code, lists, headers, blockquotes)
-await page.evaluate(() => WechatyBro.send('alice', '**Bold** and *italic* with `code`'))
+await page.evaluate(() => WechatyBro.send('Alice', '**Bold** and *italic* with `code`'))
 
 // Numbered lists
-await page.evaluate(() => WechatyBro.send('alice', '1. First\n2. Second\n3. Third'))
+await page.evaluate(() => WechatyBro.send('Alice', '1. First\n2. Second\n3. Third'))
 // Renders: ① First  ② Second  ③ Third
 
 // With AI watermark (invisible but detectable)
-await page.evaluate(() => WechatyBro.send('alice', '## Report\n- Item 1\n- Item 2', true))
+await page.evaluate(() => WechatyBro.send('Alice', '## Report\n- Item 1\n- Item 2', true))
 
 // With emoji
-await page.evaluate(() => WechatyBro.send('alice', 'Hello! [Smile][Rose]'))
+await page.evaluate(() => WechatyBro.send('Alice', 'Hello! [Smile][Rose]'))
 
-// With @mention in a room
+// With @mention in a room — write @<contactName>; wechat-bro renders @alias\u2005
 await page.evaluate(() => {
-  WechatyBro.send('mygroup', WechatyBro.at('alice', 'mygroup') + 'check this out!')
+  WechatyBro.send('Dev Team', '@Alice check this out!')
 })
 ```
 
-**`at(userId, roomId?)`** — Build an @mention string. Uses DisplayName (room alias) if set, otherwise the contact's NickName. Emoji in names are converted from HTML to Unicode. Returns `"@Name\u2005"` (thin space delimiter).
+**`at(userId, roomId?)`** — Build an @mention string. Resolves a contact name to the room alias (DisplayName) if set, otherwise the contact's NickName. Emoji in names are converted from HTML to Unicode. Returns `"@Name\u2005"` (thin space delimiter).
 ```js
 // Use in room messages
 await page.evaluate(() => {
-  var msg = WechatyBro.at('alice', 'mygroup') + WechatyBro.at('bob', 'mygroup') + 'meeting at 3pm'
-  WechatyBro.send('mygroup', msg)
+  var msg = WechatyBro.at('Alice', 'Dev Team') + WechatyBro.at('Bob', 'Dev Team') + 'meeting at 3pm'
+  WechatyBro.send('Dev Team', msg)
 })
 // Sends: "@Alice @Bob meeting at 3pm"
 ```
@@ -655,14 +655,21 @@ Use these params to build the multipart upload request in any language. The uplo
 
 ### Contact Identification
 
-Contacts are identified by a **stable PYQuanPin-based ID** that persists across login sessions (unlike `UserName` which changes every login).
+**Outside wechat-bro, contacts are identified by `name` only.** The `name` is the
+contact's display name (`RemarkName`/`NickName` — what users actually call them),
+normalized by `cleanName` (emoji HTML → Unicode, tags stripped). The account
+owner always has the constant name `"me"`. WeChat's internal `@hash UserName` and
+any romanized ids are never exposed to callers.
 
-The ID is derived from `RemarkPYQuanPin` (if set) or `PYQuanPin`, lowercased and sanitized. Collisions (rare, ~2%) get a `_2` suffix.
+All methods (`send`, `getContact`, `sendImage`, etc.) accept a contact **name**:
+- Display name: `'Alice'`, `'李诚'`, `'Dev Team'`
+- Self: `'me'`
+- System accounts: `'filehelper'`, `'weixin'`
 
-All methods (`send`, `getContact`, `sendImage`, etc.) accept either:
-- Stable ID: `'alice'`, `'zhangsan'`
-- Original UserName: `'@abc123...'`
-- Special names: `'filehelper'`, `'weixin'`
+**Ambiguity is an error.** If a name matches more than one contact, actions
+(`send`, `send-image`, …) return an error instead of guessing. Room members are
+also addressed by contact name (their room-specific alias is handled internally);
+a stranger in a room has no contact name and can only be @mentioned, not DM'd.
 
 ## Auto-Reinject
 

@@ -3,8 +3,8 @@
  *
  * Usage:
  *   const { sendImage, sendFile } = require('./upload')
- *   await sendImage(page, 'contactPyId', fs.readFileSync('photo.jpg'), 'photo.jpg')
- *   await sendFile(page, 'contactPyId', Buffer.from('hello'), 'note.txt')
+ *   await sendImage(page, 'contactName', fs.readFileSync('photo.jpg'), 'photo.jpg')
+ *   await sendFile(page, 'contactName', Buffer.from('hello'), 'note.txt')
  */
 
 const { execFileSync } = require('child_process')
@@ -116,7 +116,7 @@ async function uploadMedia(page, to, fileBuffer, filename) {
 /**
  * Send an image to a contact.
  * @param {import('puppeteer').Page} page
- * @param {string} to - pyId or UserName
+ * @param {string} to - name or UserName
  * @param {Buffer} imageBuffer - image file contents
  * @param {string} [filename='image.png']
  * @returns {Promise<boolean>}
@@ -130,7 +130,7 @@ async function sendImage(page, to, imageBuffer, filename) {
 /**
  * Send a file to a contact.
  * @param {import('puppeteer').Page} page
- * @param {string} to - pyId or UserName
+ * @param {string} to - name or UserName
  * @param {Buffer} fileBuffer - file contents
  * @param {string} filename - e.g. 'report.pdf'
  * @returns {Promise<boolean>}

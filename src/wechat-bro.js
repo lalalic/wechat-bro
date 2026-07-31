@@ -71,11 +71,19 @@
     }
   }
 
+  // Internal identity keys — never exposed externally. `name` is the sole identity.
+  // WeChat UserName (@hash) is resolved internally at call time.
+  var INTERNAL_KEYS = { UserName: 1, Uin: 1, PYQuanPin: 1, PYInitial: 1, RemarkPYQuanPin: 1, RemarkPYInitial: 1, EncryChatRoomId: 1 }
+
   function asContact(contact, isForList=false){
     const empty=value=>value===0 || value===false || value==="" || (Array.isArray(value) && value.length===0)
+    var selfUN = getUserName()
+    var isSelf = selfUN && contact.UserName === selfUN
+    // Canonical name: HTML/emoji stripped via cleanName. cleanName is idempotent,
+    // so a value we return here can be echoed back by the agent and matched
+    // exactly against the name map. 'me' is the constant identity for self.
     const base={
-      id: WechatyBro._resolveId(contact.UserName),
-      name: contact.getDisplayName?.(),
+      name: isSelf ? 'me' : cleanName(contact.getDisplayName && contact.getDisplayName()),
       isRoomContact: contact.isRoomContact?.(),
       isFileHelper: contact.isFileHelper?.(),
       isContact: contact.isContact?.(),
@@ -106,8 +114,8 @@
           // A single throwing method should not crash the whole contact.
         }
         return acc
-      }else if(empty(contact[key])){
-        
+      }else if(INTERNAL_KEYS[key] || empty(contact[key])){
+        // skip internal identity keys & empty values
       }else{
         acc[key] = contact[key]
       }
@@ -115,10 +123,11 @@
     }, base)
 
     if(result.MemberList){
-      result.MemberList = result.MemberList.map(contact=>({
-        id: WechatyBro._resolveId(contact.UserName),
-        name: cleanName(contact.DisplayName),
-      }))
+      var _cf = null
+      try { _cf = angular.element(document).injector().get('contactFactory') } catch (e) {}
+      result.MemberList = result.MemberList.map(function (m) {
+        return { name: WechatyBro._memberContactName(m, _cf) }
+      })
     }
 
     if(!WechatyBro.requireThumb){
@@ -229,9 +238,12 @@
     },
     glue: {},
 
-    // Contact ID maps: pyId ↔ UserName
-    _idToUserName: {},   // 'licheng' → '@hash...'
-    _userNameToId: {},   // '@hash...' → 'licheng'
+    // Contact name ↔ UserName maps. The agent-facing identity is the contact's
+    // display `name` (what users call them); UserName (@hash) is WeChat's stable
+    // internal key, resolved at call time. name maps to an ARRAY — more than one
+    // entry means the name is ambiguous and actions must error out.
+    _nameToUserNames: {},  // '李诚' → ['@hash...']   (>1 = ambiguous)
+    _userNameToName: {},   // '@hash...' → '李诚'
 
     // Sent message tracking for AI detection (MsgId → timestamp)
     _sentMsgIds: {},
@@ -294,59 +306,109 @@
       }, 2000)  // debounce 2s
     },
 
-    /** Build stable ID maps from current contacts. Called on contacts-ready. */
-    _buildIdMaps: function () {
-      WechatyBro._idToUserName = {}
-      WechatyBro._userNameToId = {}
+    /** Build name ↔ UserName maps from current contacts. Called on contacts-ready.
+     *  `name` is the display name (cleanName(getDisplayName) — what users call the
+     *  contact, with HTML/emoji normalized so it round-trips exactly); `UserName`
+     *  (@hash) is WeChat's stable unique internal key. A name shared by multiple
+     *  contacts is recorded as ambiguous (array length > 1) — actions referencing
+     *  it must error so the user can disambiguate (e.g. set a unique remark name). */
+    _buildNameMaps: function () {
+      WechatyBro._nameToUserNames = {}
+      WechatyBro._userNameToName = {}
       try {
         var contactFactory = WechatyBro.glue.contactFactory
         if (!contactFactory) return
         var all = contactFactory.getAllContacts()
-        var contacts = Object.values(all)
+        var collisions = 0
 
-        // First pass: collect preferred pinyin per contact
-        var pyGroups = {}  // pyId → [UserName, ...]
-        contacts.forEach(function (c) {
+        Object.values(all).forEach(function (c) {
           if (!c.UserName) return
-          var py = c.PYQuanPin
-          if (!pyGroups[py]) pyGroups[py] = []
-          pyGroups[py].push(c.UserName)
-        })
-
-        // Second pass: assign IDs with dedup suffix for collisions
-        Object.keys(pyGroups).forEach(function (py) {
-          var userNames = pyGroups[py]
-          if (userNames.length === 1) {
-            WechatyBro._idToUserName[py] = userNames[0]
-            WechatyBro._userNameToId[userNames[0]] = py
+          var name = cleanName((c.getDisplayName && c.getDisplayName()) || '') || c.UserName
+          WechatyBro._userNameToName[c.UserName] = name
+          var arr = WechatyBro._nameToUserNames[name]
+          if (!arr) {
+            WechatyBro._nameToUserNames[name] = [c.UserName]
           } else {
-            userNames.forEach(function (un, i) {
-              var id = `${py}_${all[un].AttrStatus}`
-              WechatyBro._idToUserName[id] = un
-              WechatyBro._userNameToId[un] = id
-            })
+            arr.push(c.UserName)
+            collisions++
+            log('ambiguous name: "' + name + '" now has ' + arr.length + ' contacts')
           }
         })
 
-        log('ID maps built:', Object.keys(WechatyBro._idToUserName).length, 'contacts')
+        log('Name maps built:', Object.keys(WechatyBro._userNameToName).length, 'contacts',
+            collisions ? ('(' + collisions + ' duplicate names)') : '')
       } catch (e) {
-        log('_buildIdMaps error:', e.message)
+        log('_buildNameMaps error:', e.message)
       }
     },
 
-    /** Resolve a contact id (pyId or UserName) → UserName */
+    /** Lenient resolve: identifier → UserName (first match) or null.
+     *  Used internally for best-effort lookups (mention parsing, simulate).
+     *  Accepts a display name, '@hash' UserName, 'me', or a system account. */
     _resolveUserName: function (id) {
       if (!id) return null
-      // Direct UserName (starts with @ or is a system account)
+      // Direct UserName (starts with @) or system account — unambiguous, pass through
       if (id.charAt(0) === '@' || id === 'filehelper' || id === 'weixin') return id
-      // Look up in ID map
-      return WechatyBro._idToUserName[id] || WechatyBro._idToUserName[id.toLowerCase()] || null
+      // 'me' always refers to the account owner
+      if (id === 'me') return getUserName()
+      var arr = WechatyBro._nameToUserNames[id] || WechatyBro._nameToUserNames[id.toLowerCase()]
+      return (arr && arr[0]) || null
     },
 
-    /** Get the stable pyId for a UserName */
-    _resolveId: function (userName) {
+    /** Strict resolve for ACTIONS (send, upload, room-members, …). Throws on
+     *  ambiguous name (>1 match) or unknown name. '@hash' UserName, 'me', and
+     *  system accounts pass through unchanged (used internally during login).
+     *  The thrown Error message is surfaced to the calling agent so it can ask
+     *  the user to disambiguate. */
+    _requireUserName: function (name) {
+      if (!name) throw new Error('contact name is required')
+      if (name.charAt(0) === '@' || name === 'filehelper' || name === 'weixin') return name
+      if (name === 'me') {
+        var self = getUserName()
+        if (!self) throw new Error('not logged in')
+        return self
+      }
+      var arr = WechatyBro._nameToUserNames[name] || WechatyBro._nameToUserNames[name.toLowerCase()]
+      if (!arr || arr.length === 0) {
+        throw new Error('no contact found named "' + name + '"')
+      }
+      if (arr.length > 1) {
+        throw new Error('name "' + name + '" matches ' + arr.length + ' contacts; please disambiguate (e.g. set a unique remark name with setRemark)')
+      }
+      return arr[0]
+    },
+
+    /** Get the agent-facing name for a UserName. 'me' for self, otherwise the
+     *  cleaned display name (or null if unknown). Used in events/mentions. */
+    _resolveName: function (userName) {
       if (!userName) return userName
-      return WechatyBro._userNameToId[userName] || userName
+      var selfUserName = getUserName()
+      if (selfUserName && userName === selfUserName) return 'me'
+      return WechatyBro._userNameToName[userName] || null
+    },
+
+    /** Get the agent-facing name for a room member entry.
+     *  Priority: friend's contact name (RemarkName/NickName via getDisplayName)
+     *  > member's global NickName > member's room DisplayName (alias).
+     *  This makes contact name the universal identity — room aliases are only
+     *  used as a last-resort fallback for strangers with no NickName. */
+    _memberContactName: function (m, contactFactory) {
+      if (!m) return ''
+      // Self
+      var selfUserName = getUserName()
+      if (selfUserName && m.UserName === selfUserName) return 'me'
+      // Friend? Use their global contact name.
+      if (contactFactory) {
+        try {
+          var full = contactFactory.getContact(m.UserName)
+          if (full) {
+            var n = cleanName(full.getDisplayName && full.getDisplayName())
+            if (n) return n
+          }
+        } catch (e) {}
+      }
+      // Stranger — use global NickName if present, else room alias.
+      return cleanName(m.NickName) || cleanName(m.DisplayName) || ''
     },
 
     emit: function (event, data) {
@@ -363,16 +425,56 @@
     },
 
     getContact: function (id) {
+      // Strict resolve (throws on ambiguous/unknown name). @hash/'me'/system ids
+      // pass straight through — internal callers (login retry, message events) use
+      // those and must not throw.
+      var userName
+      try {
+        userName = WechatyBro._requireUserName(id)
+      } catch (e) {
+        userName = null
+      }
+
       try {
         var injector = angular.element(document).injector()
         var contactFactory = injector.get('contactFactory')
-        // Resolve id: accept either pyId or UserName
-        var userName = WechatyBro._resolveUserName(id) || id
-        var contact = contactFactory.getContact(userName)
-        if (!contact) return { id: id}
-        return asContact(contact)
+
+        // Fast path: we have a UserName from the map
+        if (userName) {
+          var contact = contactFactory.getContact(userName)
+          if (contact) return asContact(contact)
+        }
+
+        // If id looks like an @hash, try direct lookup
+        if (typeof id === 'string' && id.charAt(0) === '@') {
+          var direct = contactFactory.getContact(id)
+          if (direct) return asContact(direct)
+        }
+
+        // Fallback: scan all contacts by display name (covers contacts
+        // loaded after the last contacts-ready rebuild, e.g. late rooms).
+        var all = contactFactory.getAllContacts()
+        var contacts = Object.values(all)
+        var idClean = cleanName(id).toLowerCase()
+
+        var matches = contacts.filter(function (c) {
+          if (!c.UserName) return false
+          var cName = cleanName((c.getDisplayName && c.getDisplayName()) || '')
+          return cName.toLowerCase() === idClean
+        })
+
+        if (matches.length === 1) {
+          return asContact(matches[0])
+        }
+        if (matches.length > 1) {
+          throw new Error('name "' + id + '" matches ' + matches.length + ' contacts; please disambiguate (e.g. set a unique remark name with setRemark)')
+        }
+
+        log('getContact: no contact found for "' + id + '"')
+        return { name: null }
       } catch (e) {
-        return { id: id}
+        log('getContact error:', e.message)
+        return { name: null }
       }
     },
 
@@ -393,14 +495,15 @@
      /**
      * Get members of a group chat (room).
      * Calls getChatRoomMembersContact to populate member details if needed.
-     * @param {string} roomId - pyId or UserName of the room (@@...)
-     * @returns {Array<{id, name, UserName, NickName, DisplayName}>}
+     * Throws on ambiguous/unknown room name.
+     * @param {string} roomId - name or UserName of the room (@@...)
+     * @returns {Array<{name, isRoomContact, …}>}
      */
     getRoomMembers: function (roomId) {
+      var userName = WechatyBro._requireUserName(roomId)
       try {
         var injector = angular.element(document).injector()
         var contactFactory = injector.get('contactFactory')
-        var userName = WechatyBro._resolveUserName(roomId) || roomId
         var room = contactFactory.getContact(userName)
         if (!room || !room.MemberList) return []
 
@@ -410,9 +513,8 @@
         }
 
         return room.MemberList.map(function (m) {
-          // Look up full contact for stable ID and better names
-          var full = contactFactory.getContact(m.UserName)
-          return asContact(full || m, true)
+          // Expose contact name (universal identity), not room alias.
+          return { name: WechatyBro._memberContactName(m, contactFactory) }
         })
       } catch (e) {
         log('getRoomMembers error:', e.message)
@@ -482,10 +584,10 @@
       }
     },
 
-    /** Get contact thumbnail image as base64. Accepts pyId or UserName. */
+    /** Get contact thumbnail image as base64. Accepts name or UserName. */
     getContactImage: function (id, callback) {
       try {
-        var userName = WechatyBro._resolveUserName(id) || id
+        var userName = WechatyBro._requireUserName(id)
         var injector = angular.element(document).injector()
         var contactFactory = injector.get('contactFactory')
         var contact = contactFactory.getContact(userName)
@@ -554,7 +656,7 @@
      * Usage: send(roomId, at('alice') + 'check this out')
      *        send(roomId, 'Hey ' + at('alice') + at('bob') + 'look!')
      *
-     * @param {string} userId - pyId or UserName of user to mention
+     * @param {string} userId - name or UserName of user to mention
      * @param {string} [roomId] - optional room context (for DisplayName lookup)
      * @returns {string} e.g. "@Alice\u2005"
      */
@@ -657,22 +759,26 @@
             var members = (room && room.MemberList) || []
             for (var mi = 0; mi < mentionNames.length; mi++) {
               var mName = mentionNames[mi]
-              if (selfNickName && mName === selfNickName) {
-                data.mentionMe = true
-                data.mentions.push(WechatyBro._resolveId(selfUserName) || selfUserName)
-                continue
-              }
-              var found = false
+              var resolvedUN = null
+              var memberMatch = null
               for (var ri = 0; ri < members.length; ri++) {
                 var dn = cleanName(members[ri].DisplayName)
                 var nn = cleanName(members[ri].NickName)
                 if ((dn && dn === mName) || (nn && nn === mName)) {
-                  var mUN = members[ri].UserName
-                  if (mUN === selfUserName) data.mentionMe = true
-                  data.mentions.push(WechatyBro._resolveId(mUN) || mUN)
-                  found = true
+                  resolvedUN = members[ri].UserName
+                  memberMatch = members[ri]
                   break
                 }
+              }
+              if (resolvedUN) {
+                if (resolvedUN === selfUserName) data.mentionMe = true
+                var contactName = WechatyBro._memberContactName(memberMatch, contactFactory) || mName
+                data.mentions.push(contactName)
+                if (contactName !== mName) {
+                  data.Content = data.Content.split('@' + mName + '\u2005').join('@' + contactName + '\u2005')
+                }
+              } else {
+                data.mentions.push(mName)
               }
             }
           } catch (e) {
@@ -683,19 +789,19 @@
 
       // Emit directly (bypass Angular — no risk of interfering with WeChat)
       var typeName = MSG_TYPE_NAMES[data.MsgType] || 'unknown'
-      WechatyBro.emit('message', data)
+      // WechatyBro.emit('message', data)
       WechatyBro.emit('message:' + typeName, data)
       return data
     },
 
     send: function (to, content, watermark) {
+      // Strict resolve — throws on ambiguous/unknown recipient, surfacing to the
+      // caller so the agent can ask the user to disambiguate.
+      var userName = WechatyBro._requireUserName(to)
       try {
         var injector = angular.element(document).injector()
         var chatFactory = injector.get('chatFactory')
         var confFactory = injector.get('confFactory')
-
-        // Resolve to → UserName using ID map
-        var userName = WechatyBro._resolveUserName(to) || to
 
         // Auto-convert markdown to Unicode-styled text
         var styled = mdToUnicode(content)
@@ -721,12 +827,12 @@
     /**
      * Get upload parameters for Node.js-side media upload.
      * Upload must be done from Node.js to avoid CORS with file.wx.qq.com.
-     * @param {string} to - pyId or UserName of recipient
+     * @param {string} to - name or UserName of recipient
      * @returns {object} params needed for upload (url, auth, cookies)
      */
     getUploadParams: function (to) {
+      var userName = WechatyBro._requireUserName(to)
       try {
-        var userName = WechatyBro._resolveUserName(to) || to
         var selfUserName = getUserName()
         var injector = angular.element(document).injector()
         var accountFactory = injector.get('accountFactory')
@@ -751,16 +857,16 @@
 
     /**
      * Send an image using a pre-uploaded MediaId (upload done from Node.js).
-     * @param {string} to - pyId or UserName
+     * @param {string} to - name or UserName
      * @param {string} mediaId - from webwxuploadmedia response
      * @returns {boolean}
      */
     sendImageWithMediaId: function (to, mediaId) {
+      var userName = WechatyBro._requireUserName(to)
       try {
         var injector = angular.element(document).injector()
         var chatFactory = injector.get('chatFactory')
         var confFactory = injector.get('confFactory')
-        var userName = WechatyBro._resolveUserName(to) || to
 
         var m = chatFactory.createMessage({
           ToUserName: userName,
@@ -781,18 +887,18 @@
 
     /**
      * Send a file attachment using a pre-uploaded MediaId.
-     * @param {string} to - pyId or UserName
+     * @param {string} to - name or UserName
      * @param {string} mediaId - from webwxuploadmedia response
      * @param {string} filename - e.g. 'document.pdf'
      * @param {number} fileSize - file size in bytes
      * @returns {boolean}
      */
     sendFileWithMediaId: function (to, mediaId, filename, fileSize) {
+      var userName = WechatyBro._requireUserName(to)
       try {
         var injector = angular.element(document).injector()
         var chatFactory = injector.get('chatFactory')
         var confFactory = injector.get('confFactory')
-        var userName = WechatyBro._resolveUserName(to) || to
 
         var m = chatFactory.createMessage({
           ToUserName: userName,
@@ -868,16 +974,16 @@
     /**
      * Change a contact's remark name (备注名).
      * Uses the webwxoplog API via Angular's $http.
-     * @param {string} id - pyId or UserName of the contact
+     * @param {string} id - name or UserName of the contact
      * @param {string} newRemark - new remark name
      * @returns {Promise<boolean>} true if successful
      */
     setRemark: function (id, newRemark) {
+      var userName = WechatyBro._requireUserName(id)
       try {
         var injector = angular.element(document).injector()
         var http = injector.get('$http')
         var accountFactory = injector.get('accountFactory')
-        var userName = WechatyBro._resolveUserName(id) || id
 
         var br = accountFactory.getBaseRequest()
         var req = br.BaseRequest || br
@@ -1402,7 +1508,11 @@
   }
 
   // ==========================================================================
-  // Contacts-ready detection — poll every 5s for 2 minutes after login
+  // Contacts-ready detection — poll every 5s for 2 minutes after login.
+  // WeChat loads contacts in batches (personal contacts first, then rooms).
+  // We track the TOTAL contact count (rooms included) and rebuild the name
+  // map on every change. `contacts-ready` is emitted ONCE when the count has
+  // been stable for 2 consecutive checks (10s) — not on every increment.
   // ==========================================================================
   var _contactsReadyTimer = null
 
@@ -1410,12 +1520,13 @@
     if (_contactsReadyTimer) { clearInterval(_contactsReadyTimer); _contactsReadyTimer = null }
     WechatyBro.vars.contactsReady = false
 
-    var lastPinyinCount = 0
+    var lastTotal = 0
+    var stableChecks = 0   // consecutive checks with no count change
+    var fired = false      // have we emitted contacts-ready yet?
     var startTime = Date.now()
 
     function check() {
       if (!WechatyBro.vars.loginState) {
-        // Logged out — stop polling
         if (_contactsReadyTimer) { clearInterval(_contactsReadyTimer); _contactsReadyTimer = null }
         return
       }
@@ -1426,26 +1537,36 @@
 
         var all = contactFactory.getAllContacts()
         var contacts = Object.values(all)
-        var withPinyin = contacts.filter(function (c) {
-          return c.UserName && !c.UserName.startsWith('@@') && c.PYQuanPin && c.PYQuanPin.length > 0
-        })
+        // Count ALL contacts with a UserName — rooms (@@) included.
+        // Rooms never have PYQuanPin, so the old pinyin-only signal missed them.
+        var total = contacts.filter(function (c) { return c.UserName }).length
 
-        if (withPinyin.length > lastPinyinCount) {
-          lastPinyinCount = withPinyin.length
-          WechatyBro.vars.contactsReady = true
-          WechatyBro._buildIdMaps()
-          log('CONTACTS READY: ' + contacts.length + ' total, ' + withPinyin.length + ' with PYQuanPin')
-          WechatyBro.emit('contacts-ready', {
-            total: contacts.length,
-            withPinyin: withPinyin.length,
-            elapsedMs: Date.now() - startTime,
-          })
+        if (total !== lastTotal) {
+          // Count changed → new contacts arrived. Rebuild the name map so the
+          // newly-loaded contacts (rooms especially) are immediately usable.
+          lastTotal = total
+          stableChecks = 0
+          WechatyBro._buildNameMaps()
+          log('contacts loading: ' + total + ' contacts so far')
+        } else if (total > 0) {
+          // Count unchanged → maybe loading finished.
+          stableChecks++
+          if (!fired && stableChecks >= 2) {
+            fired = true
+            WechatyBro.vars.contactsReady = true
+            log('CONTACTS READY: ' + total + ' contacts stabilized')
+            WechatyBro.emit('contacts-ready', {
+              total: total,
+              elapsedMs: Date.now() - startTime,
+            })
+          }
         }
       } catch (e) {
         log('contacts-ready check error:', e.message)
       }
 
-      // Stop after 2 minutes
+      // Keep rebuilding maps even after ready (in case of late arrivals) but
+      // stop polling after 2 minutes.
       if (Date.now() - startTime > 120000) {
         log('contacts-ready polling complete after 2 minutes')
         if (_contactsReadyTimer) { clearInterval(_contactsReadyTimer); _contactsReadyTimer = null }
@@ -1453,7 +1574,6 @@
     }
 
     _contactsReadyTimer = setInterval(check, 5000)
-    // Also check immediately
     check()
 
     addCleanup(function () {
@@ -1473,8 +1593,8 @@
       _contactsReadyTimer = null
     }
     WechatyBro.vars.contactsReady = false
-    WechatyBro._idToUserName = {}
-    WechatyBro._userNameToId = {}
+    WechatyBro._nameToUserNames = {}
+    WechatyBro._userNameToName = {}
     WechatyBro._sentMsgIds = {}
     if (WechatyBro.vars.loginConfirmTimer) {
       clearTimeout(WechatyBro.vars.loginConfirmTimer)
@@ -1542,6 +1662,9 @@
       return
     }
     var typeName = MSG_TYPE_NAMES[data.MsgType] || 'unknown'
+    // Don't leak internal @hash UserNames — the external contract is name-only.
+    // (from/to/sender are already name-only contact objects via asContact.)
+    try { delete data.FromUserName; delete data.ToUserName; delete data.ActualSender } catch (e) {}
     WechatyBro.emit('message', data)
     WechatyBro.emit('message:' + typeName, data)
   }
@@ -1588,32 +1711,39 @@
             var members = (room && room.MemberList) || []
             for (var mi = 0; mi < mentions.length; mi++) {
               var mName = mentions[mi]
-              // Check self first
-              if (selfNickName && mName === selfNickName) {
-                data.mentionMe = true
-                data.mentions.push(WechatyBro._resolveId(selfUserName) || selfUserName)
-                continue
-              }
-              // Search room members by DisplayName or NickName
-              var found = false
+              // Search room members by DisplayName (room alias) or NickName.
+              var resolvedUN = null
+              var memberMatch = null
               for (var ri = 0; ri < members.length; ri++) {
                 var dn = cleanName(members[ri].DisplayName)
                 var nn = cleanName(members[ri].NickName)
                 if ((dn && dn === mName) || (nn && nn === mName)) {
-                  var mUN = members[ri].UserName
-                  if (mUN === selfUserName) data.mentionMe = true
-                  data.mentions.push(WechatyBro._resolveId(mUN) || mUN)
-                  found = true
+                  resolvedUN = members[ri].UserName
+                  memberMatch = members[ri]
                   break
                 }
               }
-              if (!found) {
+              if (!resolvedUN) {
                 // Fallback: try full contact lookup by NickName
                 var full = contactFactory.getContact(mName)
                 if (full && full.UserName) {
-                  if (full.UserName === selfUserName) data.mentionMe = true
-                  data.mentions.push(WechatyBro._resolveId(full.UserName) || full.UserName)
+                  resolvedUN = full.UserName
+                  memberMatch = full
                 }
+              }
+              if (resolvedUN) {
+                if (resolvedUN === selfUserName) data.mentionMe = true
+                // Resolve to universal contact name (friend name or global nick).
+                var contactName = WechatyBro._memberContactName(memberMatch, contactFactory) || mName
+                data.mentions.push(contactName)
+                // Rewrite @<alias>\u2005 → @<contactName>\u2005 in Content so
+                // the agent sees the same name it would use to address them.
+                if (contactName !== mName) {
+                  data.Content = data.Content.split('@' + mName + '\u2005').join('@' + contactName + '\u2005')
+                }
+              } else {
+                // Unresolved — keep original text & name as-is.
+                data.mentions.push(mName)
               }
             }
           } catch (e) {

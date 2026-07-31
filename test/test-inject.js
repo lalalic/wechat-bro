@@ -274,31 +274,30 @@ async function main() {
   // getContact — pick a contact from the list
   const firstContact = await page.evaluate(() => {
     const list = window.WechatyBro.contactList()
-    // Find a non-room contact
     const person = list.find(c => !c.isRoomContact && c.name)
     if (!person) return null
-    const detail = window.WechatyBro.getContact(person.UserName)
-    return { id: detail.id, name: detail.name, isRoom: detail.isRoomContact }
+    const detail = window.WechatyBro.getContact(person.name)
+    return { name: detail.name, isRoom: detail.isRoomContact }
   })
 
   if (firstContact) {
-    ok(firstContact.id && firstContact.id.length > 0,
-       `getContact resolves id for "${firstContact.name}": ${firstContact.id}`)
+    ok(firstContact.name && firstContact.name.length > 0,
+       `getContact resolves name for "${firstContact.name}"`)
   } else {
     ok(true, 'no personal contact found to test getContact (non-critical)')
   }
 
-  // contactList returns well-formed objects
+  // contactList returns well-formed, name-only objects (no id/UserName leak)
   const sampleContacts = await page.evaluate(() => {
     const list = window.WechatyBro.contactList()
     return list.slice(0, 5).map(c => ({
-      hasId: !!c.id, hasName: !!c.name, hasUserName: !!c.UserName,
+      hasName: !!c.name, hasId: !!c.id, hasUserName: !!c.UserName,
       isRoom: c.isRoomContact,
     }))
   })
   if (sampleContacts.length > 0) {
-    ok(sampleContacts.every(c => c.hasId), 'every contact has an id')
-    ok(sampleContacts.every(c => c.hasUserName), 'every contact has a UserName')
+    ok(sampleContacts.every(c => c.hasName), 'every contact has a name')
+    ok(sampleContacts.every(c => !c.id && !c.UserName), 'no contact leaks id or UserName')
   }
 
   // ── Room member API (if any rooms) ────────────────────────────────────
@@ -307,7 +306,7 @@ async function main() {
   const rooms = await page.evaluate(() => {
     const list = window.WechatyBro.contactList()
     return list.filter(c => c.isRoomContact).map(c => ({
-      id: c.id, name: c.name, UserName: c.UserName, memberCount: c.memberCount,
+      name: c.name, memberCount: c.memberCount,
     }))
   })
 
@@ -319,24 +318,24 @@ async function main() {
 
     const members = await page.evaluate((rid) => {
       return window.WechatyBro.getRoomMembers(rid)
-    }, room.UserName)
+    }, room.name)
 
     ok(Array.isArray(members), 'getRoomMembers returns array')
     ok(members.length > 0, `room has ${members.length} members`)
     if (members.length > 0) {
-      ok(members[0].id && members[0].id.length > 0, 'first member has id')
-      ok(members[0].UserName && members[0].UserName.length > 0, 'first member has UserName')
+      ok(members[0].name !== undefined, 'first member has a name field')
+      ok(!members[0].id && !members[0].UserName, 'member exposes no id/UserName')
       // Name may be empty if member hasn't set RemarkName/NickName — not a bug
       const namedCount = members.filter(m => m.name && m.name.length > 0).length
       ok(namedCount > 0 || members.length === 1,
          `at least one member has a name (${namedCount}/${members.length})`)
     }
 
-    // at() with room context
+    // at() with room context (name-only identifiers)
     if (members.length > 0) {
       const atResult = await page.evaluate((uid, rid) => {
         return window.WechatyBro.at(uid, rid)
-      }, members[0].UserName, room.UserName)
+      }, members[0].name, room.name)
       ok(atResult.includes('@'), 'at() result contains @')
       ok(atResult.includes('\u2005'), 'at() result contains thin space')
     }
@@ -350,21 +349,21 @@ async function main() {
   // Pick a contact for DM simulation
   const dmTarget = await page.evaluate(() => {
     const list = window.WechatyBro.contactList()
-    const person = list.find(c => !c.isRoomContact && c.UserName)
-    return person ? { id: person.id, UserName: person.UserName } : null
+    const person = list.find(c => !c.isRoomContact && c.name)
+    return person ? { name: person.name } : null
   })
 
   if (dmTarget) {
     const simResult = await page.evaluate((to) => {
       return window.WechatyBro.simulateMessage(to, 'Test from test-inject.js', null, 1)
-    }, dmTarget.UserName)
+    }, dmTarget.name)
 
     ok(simResult !== undefined, 'simulateMessage returns result')
     ok(simResult.MsgType === 1, 'default MsgType is 1 (text)')
     ok(simResult.Content === 'Test from test-inject.js', 'Content preserved')
     ok(simResult.MsgId && simResult.MsgId.startsWith('sim_'), 'MsgId starts with sim_')
-    ok(simResult.from && simResult.from.id === dmTarget.id,
-       `from.id resolves: ${simResult.from.id}`)
+    ok(simResult.from && simResult.from.name === dmTarget.name,
+       `from.name resolves: ${simResult.from.name}`)
   } else {
     ok(true, 'no DM target available — simulateMessage DM test skipped')
   }
@@ -374,24 +373,20 @@ async function main() {
     const room = rooms[0]
     const members = await page.evaluate((rid) => {
       return window.WechatyBro.getRoomMembers(rid)
-    }, room.UserName)
+    }, room.name)
 
     if (members.length > 0) {
-      // Find a member with a displayable name for @mention test
-      const namedMember = members.find(m => m.DisplayName && m.DisplayName.length > 0)
-                        || members.find(m => m.NickName && m.NickName.length > 0)
-                        || members.find(m => m.name && m.name.length > 0)
-                        || members[0]
-      const mentionName = namedMember.DisplayName || namedMember.NickName || namedMember.name
+      const namedMember = members.find(m => m.name && m.name.length > 0) || members[0]
+      const mentionName = namedMember.name
 
       const simRoom = await page.evaluate((rid, sid, mName) => {
         return window.WechatyBro.simulateMessage(
           rid, `@${mName}\u2005 hey from test`, sid, 1
         )
-      }, room.UserName, namedMember.UserName, mentionName)
+      }, room.name, namedMember.name, mentionName)
 
       ok(simRoom !== undefined, 'simulateMessage room message returns result')
-      ok(simRoom.FromUserName === room.UserName, 'FromUserName is the room')
+      ok(simRoom.from && simRoom.from.name === room.name, 'from.name is the room')
       ok(simRoom.sender !== undefined, 'sender is set for room message')
       if (mentionName && mentionName.length > 0) {
         ok(Array.isArray(simRoom.mentions),
@@ -444,29 +439,23 @@ async function main() {
   ok(hasHeartbeat, 'heartbeat event was emitted')
 
   // ──────────────────────────────────────────────────────────────────────
-  // REAL-MESSAGE TESTS (use filehelper, lalalic@ca, testneo)
+  // REAL-MESSAGE TESTS (filehelper + first room)
   // ──────────────────────────────────────────────────────────────────────
 
-  // Resolve known contacts by their stable IDs
+  // Resolve contacts by NAME (identity model — no pinyin ids / @hash externally)
   const contactInfo = await page.evaluate(() => {
     const WB = window.WechatyBro
-    const filehelperUN = WB._resolveUserName('filehelper') || 'filehelper'
-    const lalalicUN = WB._resolveUserName('lalalic@ca')
-    const testneoUN = WB._resolveUserName('testneo')
-    // Also get contact details
-    const fh = WB.getContact(filehelperUN)
-    const ll = lalalicUN ? WB.getContact(lalalicUN) : null
-    const tn = testneoUN ? WB.getContact(testneoUN) : null
+    const fh = WB.getContact('filehelper')
     return {
-      filehelper: { id: fh.id, UserName: fh.UserName, name: fh.name },
-      lalalic: ll ? { id: ll.id, UserName: ll.UserName, name: ll.name } : null,
-      testneo: tn ? { id: tn.id, UserName: tn.UserName, name: tn.name, isRoom: tn.isRoomContact } : null,
+      filehelper: { name: fh.name },
     }
   })
 
-  console.log(`    filehelper: "${contactInfo.filehelper.name}" (${contactInfo.filehelper.UserName})`)
-  if (contactInfo.lalalic) console.log(`    lalalic@ca: "${contactInfo.lalalic.name}" (${contactInfo.lalalic.UserName})`)
-  if (contactInfo.testneo) console.log(`    testneo: "${contactInfo.testneo.name}" (${contactInfo.testneo.UserName})`)
+  // Test room: reuse the first room found earlier (if any)
+  contactInfo.testneo = rooms.length > 0 ? { name: rooms[0].name, isRoom: true } : null
+
+  console.log(`    filehelper: "${contactInfo.filehelper.name}"`)
+  if (contactInfo.testneo) console.log(`    test room: "${contactInfo.testneo.name}"`)
 
   // ── 12. Markdown conversion via real send ─────────────────────────────
   suite('12. Markdown conversion (send to filehelper)')
@@ -474,7 +463,7 @@ async function main() {
   {
     // Send a message with various markdown styles to filehelper.
     // filehelper is a WeChat system contact that acts as self-notepad — safe to send anything.
-    const to = contactInfo.filehelper.UserName
+    const to = contactInfo.filehelper.name
 
     // Test bold, italic, code, strikethrough, list
     const mdMsg = 'Test from test-inject.js:\n**bold** *italic* `code` ~~strike~~\n- item1\n- item2'
@@ -657,7 +646,7 @@ async function main() {
   suite('15. Emoji codes (send to filehelper)')
 
   {
-    const to = contactInfo.filehelper.UserName
+    const to = contactInfo.filehelper.name
 
     // Send emoji codes — WeChat replaces [] codes with actual emoji images
     const emojiResult = await page.evaluate((target) => {
@@ -734,61 +723,59 @@ async function main() {
     }
   }
 
-  // ── 17. Contact ID resolution (pyId ↔ UserName) ──────────────────────
-  suite('17. Contact ID resolution')
+  // ── 17. Contact name resolution (name ↔ UserName, name-only externally) ──
+  suite('17. Contact name resolution')
 
   {
     const idTest = await page.evaluate(() => {
       const WB = window.WechatyBro
-      // Pick first personal contact from list
       const list = JSON.parse(JSON.stringify(WB.contactList()))
-      const person = list.find(c => !c.isRoomContact)
+      const person = list.find(c => !c.isRoomContact && c.name)
       if (!person) return null
 
-      // UserName → pyId
-      const resolvedId = WB._resolveId(person.UserName)
-      // pyId → UserName
-      const resolvedUN = WB._resolveUserName(person.id)
+      // Round-trip: name → UserName (strict) → name should equal the original.
+      // This proves the cleaned name we expose round-trips exactly.
+      const un = WB._requireUserName(person.name)
+      const roundTripName = WB._resolveName(un)
 
-      // Also test filehelper (special system contact)
+      // 'me' resolves to the self user
+      const selfName = WB._resolveName(WB._requireUserName('me'))
+
+      // filehelper is a system account (passes through)
       const fhUN = WB._resolveUserName('filehelper')
-      const fhId = WB._resolveId('filehelper')
 
       return {
-        userName: person.UserName,
-        pyId: person.id,
-        resolvedId,
-        resolvedUN,
-        matches: resolvedId === person.id && resolvedUN === person.UserName,
+        name: person.name,
+        roundTrip: roundTripName === person.name,
+        selfName,
         filehelperUN: fhUN,
-        filehelperId: fhId,
-        idMapSize: Object.keys(WB._idToUserName).length,
-        unMapSize: Object.keys(WB._userNameToId).length,
+        nameMapSize: Object.keys(WB._nameToUserNames).length,
+        unMapSize: Object.keys(WB._userNameToName).length,
       }
     })
 
     if (idTest) {
-      ok(idTest.idMapSize > 0, `_idToUserName map has ${idTest.idMapSize} entries`)
-      ok(idTest.unMapSize > 0, `_userNameToId map has ${idTest.unMapSize} entries`)
-      ok(idTest.matches === true,
-         `bidirectional resolution matches: ${idTest.pyId} ↔ ${idTest.userName.substring(0, 15)}...`)
+      ok(idTest.nameMapSize > 0, `_nameToUserNames map has ${idTest.nameMapSize} entries`)
+      ok(idTest.unMapSize > 0, `_userNameToName map has ${idTest.unMapSize} entries`)
+      ok(idTest.roundTrip === true,
+         `name round-trips exactly: "${idTest.name}" → UserName → "${idTest.name}"`)
+      ok(idTest.selfName === 'me',
+         `_resolveName(self) = 'me' (got: '${idTest.selfName}')`)
       ok(idTest.filehelperUN === 'filehelper',
          `_resolveUserName('filehelper') = '${idTest.filehelperUN}'`)
-      ok(idTest.filehelperId === 'wenjianchuanshuzhushou' || true,
-         `filehelper resolves to an id (got: '${idTest.filehelperId}')`)
     } else {
-      ok(true, 'no contact available — ID resolution tests skipped')
+      ok(true, 'no contact available — name resolution tests skipped')
     }
   }
 
-  // ── 18. Room contact (testneo) — self-msg loop, @parser, .at() ──────
-  suite('18. Room contact testneo')
+  // ── 18. Room contact — self-msg loop, @parser, .at() ────────────────
+  suite('18. Room contact')
 
   {
     if (contactInfo.testneo && contactInfo.testneo.isRoom) {
       const room = contactInfo.testneo
-      const roomUN = room.UserName
-      const to = contactInfo.filehelper.UserName
+      const roomName = room.name
+      const to = contactInfo.filehelper.name
 
       // 18a. No infinite loop for self-sent room messages
       // Send a real message to the room, then verify _sentMsgIds tracked it
@@ -805,9 +792,9 @@ async function main() {
           hasSentIds: sentIds.length > 0,
           lastMsgTracked: lastId ? WB._isSentByUs(lastId) : false,
         }
-      }, roomUN)
+      }, roomName)
 
-      ok(selfMsgResult.sent === true, 'send() to testneo room succeeds')
+      ok(selfMsgResult.sent === true, 'send() to room succeeds')
       ok(selfMsgResult.hasSentIds, '_sentMsgIds tracked the room message')
       ok(selfMsgResult.lastMsgTracked,
          '_isSentByUs() detects self-sent room message — no infinite loop')
@@ -825,19 +812,19 @@ async function main() {
       // 18b. @mention parser via simulateMessage
       const members = await page.evaluate((rid) => {
         return JSON.parse(JSON.stringify(window.WechatyBro.getRoomMembers(rid)))
-      }, roomUN)
+      }, roomName)
 
       if (members.length >= 2) {
         // Pick a member with a name and test @mention detection
-        const named = members.find(m => m.DisplayName) || members.find(m => m.name) || members[0]
-        const mentionName = named.DisplayName || named.name
+        const named = members.find(m => m.name) || members[0]
+        const mentionName = named.name
 
         if (mentionName && mentionName.length > 0) {
           const mentionResult = await page.evaluate((rid, sid, mName) => {
             return JSON.parse(JSON.stringify(
               window.WechatyBro.simulateMessage(rid, '@' + mName + '\u2005 check this', sid, 1)
             ))
-          }, roomUN, named.UserName, mentionName)
+          }, roomName, named.name, mentionName)
 
           ok(mentionResult.mentions !== undefined, '@mention parser produces mentions array')
           ok(Array.isArray(mentionResult.mentions), 'mentions is an array')
@@ -854,11 +841,11 @@ async function main() {
 
       // 18c. .at() function with room context
       if (members.length > 0) {
-        const target = members.find(m => m.DisplayName) || members.find(m => m.name) || members[0]
+        const target = members.find(m => m.name) || members[0]
 
         const atResult = await page.evaluate((uid, rid) => {
           return window.WechatyBro.at(uid, rid)
-        }, target.UserName, roomUN)
+        }, target.name, roomName)
 
         ok(atResult.includes('@'), '.at() result starts with @')
         ok(atResult.includes('\u2005'), '.at() contains \\u2005 thin space')
@@ -870,7 +857,7 @@ async function main() {
         ok(true, 'no room members — .at() test skipped')
       }
     } else {
-      ok(true, 'testneo room not found — room contact tests skipped')
+      ok(true, 'no room found — room contact tests skipped')
     }
   }
 
@@ -881,7 +868,7 @@ async function main() {
     // Send a real message to filehelper and capture its CreateTime from the
     // emitted event. Then verify that a message with the same CreateTime
     // would be suppressed by emitTypedMessage.
-    const to = contactInfo.filehelper.UserName
+    const to = contactInfo.filehelper.name
     const beforeSend = receivedEvents.length
 
     await page.evaluate((target) => {
@@ -1088,7 +1075,7 @@ async function main() {
       } catch (e) {
         return { error: e.message }
       }
-    }, contactInfo.filehelper.UserName)
+    }, contactInfo.filehelper.name)
 
     ok(sendAfterNav === true, 'send() works after re-injection')
   }
@@ -1115,13 +1102,13 @@ async function main() {
         0x44, 0xAE, 0x42, 0x60, 0x82,  // PNG IEND chunk
       ])
 
-      const result = await sendImage(page, contactInfo.filehelper.UserName, pngBuffer, 'test-inject.png')
+      const result = await sendImage(page, contactInfo.filehelper.name, pngBuffer, 'test-inject.png')
       ok(result === true, 'sendImage() succeeds — image uploaded and sent to filehelper')
 
       // Also test sendFile with a tiny text file
       const { sendFile } = require('../src/upload')
       const txtBuffer = Buffer.from('Hello from test-inject.js!')
-      const fileResult = await sendFile(page, contactInfo.filehelper.UserName, txtBuffer, 'test-inject.txt')
+      const fileResult = await sendFile(page, contactInfo.filehelper.name, txtBuffer, 'test-inject.txt')
       ok(fileResult === true, 'sendFile() succeeds — file uploaded and sent to filehelper')
     } catch (e) {
       // Uploads may fail if IPv6 is not available (file.wx.qq.com requires IPv6)
