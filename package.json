@@ -24,6 +24,11 @@
     "puppeteer": "^25.4.0",
     "ws": "^8.21.1"
   },
+  "pi":{
+    "skills": ["./skills/"],
+    "extensions": ["./skills/wechat-bro/.pi/extensions/"],
+    "subagents": {"agents": ["./skills/wechat-bro/.pi/agents/"], "chains": ["./skills/wechat-bro/.pi/chains/"]}
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/lalalic/wechat-bro.git"
