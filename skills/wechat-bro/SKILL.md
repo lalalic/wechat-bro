@@ -73,32 +73,6 @@ The process stays alive until it receives `{"cmd":"exit"}`.
 
 Connect to `ws://localhost:9231`.  Send/receive JSON messages.
 
-### Agent → Server (request)
-
-```json
-{"cmd":"auth","agent":"testneo"}   # optional identification
-{"cmd":"contacts","id":"req-1"}    # any command
-{"cmd":"ping"}                     # liveness check
-```
-
-| field | required | description |
-|---|---|---|
-| `cmd` | yes | Command name (see below) |
-| `id` | no | Opaque string echoed in response for correlation |
-
-### Server → Agent (response)
-
-```json
-{"ok":true,"id":"req-1","data":[...]}
-```
-
-| field | description |
-|---|---|
-| `ok` | `true` on success, `false` on error |
-| `id` | Echo of the request `id` (or null) |
-| `data` | Command result |
-| `error` | Error message (when `ok` is false) |
-
 ### Server → Agent (events — broadcast to all connected agents)
 
 ```json
@@ -124,7 +98,7 @@ Connect to `ws://localhost:9231`.  Send/receive JSON messages.
 The process also accepts JSON commands on stdin (one per line) for pipe mode:
 
 ```bash
-echo '{"cmd":"contacts"}' | npx wechat-bro
+echo npx wechat-bro
 ```
 
 ## Commands
@@ -260,9 +234,9 @@ missing).  Response includes a `files` array:
 
 ## Agent Integration
 Strongly recommended: 
-* use the `wechat-orchestrator` agent to manage multiple contacts
+* use `wechat-orchestrator` agent to manage multiple contacts
 * delegate contact conversations to `wechat-contact-maintainer` subagents.
-* use wechat-bro stdin mode to send commands and receive command result in JSONL format.
+* use wechat-bro stdin mode to send commands.
 * use wechat-bro WebSocket mode to monitor specified contacts message and send to llm then let llm follow up.
 
 ### wechat-orchestrator Agent

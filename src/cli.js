@@ -151,6 +151,26 @@ function saveUserAvatar(data) {
   const avatarUrl = data.userAvatar
   if (!avatarUrl || typeof avatarUrl !== 'string') return
 
+  // Inline base64 data URI (data:img/jpeg;base64,...) — decode synchronously,
+  // no fetch needed. WeChat sends the scanned-event avatar this way.
+  if (avatarUrl.startsWith('data:')) {
+    try {
+      const commaIdx = avatarUrl.indexOf(',')
+      if (commaIdx < 0) return
+      // Header looks like "data:img/jpeg;base64" — only base64 is supported.
+      const header = avatarUrl.slice(5, commaIdx) // "img/jpeg;base64"
+      if (!/;\s*base64\s*$/i.test(header)) return
+      const buf = Buffer.from(avatarUrl.slice(commaIdx + 1), 'base64')
+      if (buf.length === 0) return
+      fs.writeFileSync(USER_AVATAR_FILE, buf)
+      data.userAvatar = USER_AVATAR_FILE
+      log('saved user avatar (data URI):', USER_AVATAR_FILE, '(' + buf.length + ' bytes)')
+    } catch (e) {
+      log('saveUserAvatar data URI error:', e.message)
+    }
+    return
+  }
+
   // Resolve relative avatar URLs (e.g. /cgi-bin/mmwebwx-bin/webwxgeticon?...)
   let fullUrl = avatarUrl
   if (fullUrl.startsWith('/')) {
@@ -471,7 +491,21 @@ async function main() {
   })
   _wsBroadcast = ws.broadcast
   _wsServer = ws
-  log(`WebSocket server: ws://localhost:${WS_PORT}`)
+
+  // Fail fast if the port is taken (another daemon is already running),
+  // instead of launching Chrome on top of a dead WebSocket server.
+  try {
+    await ws.ready
+    log(`WebSocket server: ws://localhost:${WS_PORT}`)
+  } catch (e) {
+    const msg = (e && (e.message || String(e))) || ''
+    if ((e && e.code === 'EADDRINUSE') || /EADDRINUSE/.test(msg)) {
+      console.error(`[cli] Port ${WS_PORT} already in use — another wechat-bro daemon is likely running. Exiting.`)
+    } else {
+      console.error(`[cli] WebSocket server failed to start: ${msg}`)
+    }
+    process.exit(1)
+  }
 
   const browser = await puppeteer.launch({
     executablePath: chromePath,

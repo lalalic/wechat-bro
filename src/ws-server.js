@@ -41,6 +41,13 @@ function create(opts = {}) {
   const dispatch = opts.dispatch || (() => { throw new Error('no dispatch') })
   const onBroadcast = opts.broadcastEvent || null
 
+  // Resolves once the server is listening; rejects (e.g. EADDRINUSE) on error.
+  let _resolveReady, _rejectReady
+  const ready = new Promise((resolve, reject) => {
+    _resolveReady = resolve
+    _rejectReady = reject
+  })
+
   function wsLog(...args) {
     if (quiet) return
     console.error('[ws]', ...args)
@@ -108,11 +115,13 @@ function create(opts = {}) {
   })
 
   server.on('listening', () => {
-    wsLog(`WebSocket server listening on ws://localhost:${port}`) 
+    wsLog(`WebSocket server listening on ws://localhost:${port}`)
+    _resolveReady()
   })
 
   server.on('error', (err) => {
-    wsLog(`Server error:`, err.message) 
+    wsLog(`Server error:`, err.message)
+    _rejectReady(err)
   })
 
   /**
@@ -175,7 +184,7 @@ function create(opts = {}) {
     server.close()
   }
 
-  return { server, broadcast, sendTo, getClients, close }
+  return { server, broadcast, sendTo, getClients, close, ready }
 }
 
 module.exports = { create }
