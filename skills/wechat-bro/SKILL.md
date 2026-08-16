@@ -235,13 +235,13 @@ missing).  Response includes a `files` array:
 ## Agent Integration
 Strongly recommended: 
 * use `wechat-orchestrator` agent to manage multiple contacts
-* delegate contact conversations to `wechat-contact-maintainer` subagents.
-* use wechat-bro stdin mode to send commands.
+* delegate contact conversations to `wechat-individual-contact-maintainer` or `wechat-room-maintainer` subagents.
+* use `npx wechat-bro <cmd>`  to send commands.
 * use wechat-bro WebSocket mode to monitor specified contacts message and send to llm then let llm follow up.
 
 ### wechat-orchestrator Agent
 The `wechat-orchestrator` agent is responsible for:
-- create `wechat-contact-maintainer` subagents for specified contact to delegate conversations.
+-- create `wechat-individual-contact-maintainer` or `wechat-room-maintainer` subagents for specified contact to delegate conversations.
   - make conversation rules, including general and contact-specific rules, and pass them to subagents.
   - provide context to subagents, including contact ID, name, message content, and whether it's a group chat.
   - persistent session and context across restarts, including contact list and subagent states.
@@ -257,8 +257,8 @@ The `wechat-orchestrator` agent is responsible for:
 - save user uploaded knowledge base to `~/.wechat-bro/contacts/<contact-id>/knowledge/` folder, including text, pdf, and other documents.
 
 
-### wechat-contact-maintainer Agent
-The `wechat-contact-maintainer` agent handles individual contact conversations. It receives context from the orchestrator and uses `wechat-bro` to send replies. It is designed to maintain a natural and helpful conversation with the assigned contact, using their preferred language and style.
+### wechat-individual-contact-maintainer  and  wechat-room-maintainer Agent
+they receives context from the orchestrator and uses `wechat-bro` to send replies. It is designed to maintain a natural and helpful conversation with the assigned contact, using their preferred language and style.
 
 #### general rules
 - **don't** provide any personal information about the user or the orchestrator agent.
@@ -270,3 +270,9 @@ The `wechat-contact-maintainer` agent handles individual contact conversations. 
 - save assets to own `~/.wechat-bro/contacts/<contact-id>/` folder
   - organize assets by type (images, audio, documents, etc.)
   - `knowledge/`: user uploaded knowledge base, including text, pdf, and other documents.
+
+  ### pi implementation
+  - **`./.pi/`** implement extension to register tool, agents, and chains for orchestrator and subagents. 
+
+  ### codex/claude/copilot implementation
+  each harness figure out yourself according the suggestion, refering to the pi implementation.
