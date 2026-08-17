@@ -81,6 +81,7 @@
   // needed (e.g. "weixin" variants).
   var SYSTEM_ALIASES = {
     '文件传输助手': 'filehelper',
+    'File Transfer': 'filehelper',
   }
 
   function asContact(contact, isForList=false){
@@ -91,7 +92,7 @@
     // so a value we return here can be echoed back by the agent and matched
     // exactly against the name map. 'me' is the constant identity for self.
     const base={
-      name: isSelf ? 'me' : cleanName(contact.getDisplayName && contact.getDisplayName()),
+      name: isSelf ? 'me' : (contact.isFileHelper && contact.isFileHelper() ? 'filehelper' : cleanName(contact.getDisplayName && contact.getDisplayName())),
       isRoomContact: contact.isRoomContact?.(),
       isFileHelper: contact.isFileHelper?.(),
       isContact: contact.isContact?.(),
@@ -328,6 +329,10 @@
         Object.values(all).forEach(function (c) {
           if (!c.UserName) return
           var name = cleanName((c.getDisplayName && c.getDisplayName()) || '') || c.UserName
+          // Normalize system accounts to canonical names regardless of locale
+          if ((c.isFileHelper && c.isFileHelper()) || SYSTEM_ALIASES[name]) {
+            name = SYSTEM_ALIASES[name] || name
+          }
           WechatyBro._userNameToName[c.UserName] = name
           var arr = WechatyBro._nameToUserNames[name]
           if (!arr) {

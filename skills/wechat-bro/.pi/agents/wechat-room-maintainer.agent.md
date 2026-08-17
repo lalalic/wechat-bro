@@ -4,6 +4,9 @@ description: WeChat 群聊维护者 — 只处理分配给你的群聊消息，�
 systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: true
+async: true
+interactive: false
+thinking: false
 ---
 
 # WeChat Room Maintainer Agent

@@ -4,6 +4,9 @@ description: WeChat 个人联系人会话维护者 — 只处理分配给你的�
 systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: true
+async: true
+interactive: false
+thinking: false
 ---
 
 # WeChat Individual Contact Maintainer Agent

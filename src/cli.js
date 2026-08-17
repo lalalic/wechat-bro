@@ -108,7 +108,6 @@ function toLoginUrl(qrUrl) {
 let lastQrUrl = null
 let chromePath = null  // detected in main(), used by mermaid render
 let _wsBroadcast = null  // set by main() for event broadcasting
-let _cliMode = false  // true when running a single CLI command (suppress events on stdout)
 
 // ── Persist binary content (base64) in events to disk → file path ────────
 // Fields with binary content and their file extension. When present in an
@@ -202,12 +201,9 @@ function saveUserAvatar(data) {
 
 // ── Write JSON to stdout (with newline) + broadcast to WebSocket ──────────
 function write(obj) {
-  // In quiet/CLI mode, only write command responses, not events
-  const isResponse = obj && obj.ok !== undefined
-  const suppressEvent = (_cliMode || QUIET) && obj && obj.event
-  if (!suppressEvent && (!QUIET || isResponse)) {
-    process.stdout.write(JSON.stringify(obj) + '\n')
-  }
+  // --quiet: events only. Without it, everything (events + responses) is written.
+  if (QUIET && !(obj && obj.event)) return
+  process.stdout.write(JSON.stringify(obj) + '\n')
   // Broadcast events (not responses) to WebSocket clients
   if (_wsBroadcast && obj && obj.event) {
     _wsBroadcast(obj)
@@ -258,7 +254,7 @@ function extractPort(argv) {
  */
 function parseCliCommand() {
   const args = process.argv.slice(2)
-  const knownFlags = new Set(['--headed', '--quiet'])
+  const knownFlags = new Set(['--headed', '--quiet', '--daemon', '--pretty'])
   const positional = []
   for (let i = 0; i < args.length; i++) {
     if (knownFlags.has(args[i])) continue
@@ -420,15 +416,18 @@ function printHelp() {
   const help = `wechat-bro — AI agent interface for WeChat Web
 
 Usage:
-  wechat-bro                        Start daemon (WebSocket ws://localhost:9231)
-  wechat-bro <command> [--flags]    Run one command (starts daemon if none running)
+  wechat-bro                        Start daemon in foreground (WebSocket ws://localhost:9231)
+  wechat-bro --daemon               Start daemon explicitly (same as above)
+  wechat-bro <command> [--flags]    Run one command via the running daemon
+                                    (error if no daemon is running)
   wechat-bro --help                 Show this help
   wechat-bro --version              Show version
 
 Flags:
   --headed          Show browser window (default: headless)
   --port <port>     WebSocket port (default: 9231, env WS_PORT)
-  --quiet           Suppress non-JSON log output
+  --daemon          Run as daemon (serve WebSocket clients)
+  --quiet           Events-only output on stdout (suppress other stdout noise)
   --pretty          Pretty-print command responses (JSON with 2-space indent)
 
 Commands:
@@ -469,21 +468,50 @@ async function main() {
 
   const WS_PORT = parseInt(process.env.WS_PORT || extractPort(argv) || '9231', 10)
   const cliRequest = parseCliCommand()
+  const forceDaemon = argv.includes('--daemon')
 
-  // When we have a CLI command or piped stdin, try connecting to an existing daemon first
-  if (cliRequest || !process.stdin.isTTY) {
-    const connected = await tryConnectAsClient(WS_PORT, cliRequest || undefined)
-    if (connected) return // client mode handled everything, we're done
+  // `exit` is a shutdown command — it must NEVER spin up a new daemon.
+  // Try to reach an existing one and shut it down; if none is running,
+  // report success (nothing left to do) and exit without launching Chrome.
+  if (cliRequest && cliRequest.cmd === 'exit') {
+    const connected = await tryConnectAsClient(WS_PORT, cliRequest)
+    if (!connected) {
+      process.stdout.write(JSON.stringify({
+        ok: true,
+        id: null,
+        data: { shuttingDown: true, daemonRunning: false },
+      }) + '\n')
+    }
+    return
   }
 
-  // No existing daemon — start one (Chrome + WebSocket server)
-  if (cliRequest) _cliMode = true
+  // ── Client mode: any CLI command or piped stdin goes through an EXISTING
+  // daemon. Never auto-starts one — print an error telling the user how.
+  if (!forceDaemon && (cliRequest || !process.stdin.isTTY)) {
+    const connected = await tryConnectAsClient(WS_PORT, cliRequest || undefined)
+    if (connected) return
+    process.stdout.write(JSON.stringify({
+      ok: false,
+      id: null,
+      error: `no daemon running on port ${WS_PORT} — start one first: wechat-bro --daemon --port ${WS_PORT}`,
+    }) + '\n')
+    process.exit(1)
+  }
+
+  // ── Daemon mode (foreground `--daemon` / plain TTY run, or background
+  // spawn). Chrome + WebSocket server; serves all clients until `exit`.
   fs.mkdirSync(DATA_DIR, { recursive: true })
 
   chromePath = process.env.CHROME_PATH || await findChrome()
   log('Chrome:', chromePath, HEADED ? '(headed)' : '(headless)')
 
-  let wsDispatch = async () => { throw new Error('dispatch not ready') }
+  // Commands that arrive before the page is injected/initiated wait on this
+  // promise (see _markPageReady below), instead of failing with
+  // "dispatch not ready".
+  let _markPageReady
+  const pageReady = new Promise((resolve) => { _markPageReady = resolve })
+  let wsDispatch = async (cmd, args) => { await pageReady; throw new Error('dispatch not ready') }
+
   const ws = wsServer.create({
     port: WS_PORT,
     quiet: QUIET,
@@ -601,55 +629,24 @@ async function main() {
   // ── Wire up WebSocket dispatch (now that page is ready) ───────────────
   wsDispatch = async (cmd, args) => {
     if (cmd === 'exit') {
-      await browser.close()
-      process.exit(0)
+      // Return a result so ws-server flushes {ok:true} back to the requesting
+      // client, then tear down the browser + process on the next tick
+      // (browser.close() gives the socket enough time to flush the reply).
+      setImmediate(async () => {
+        try { await browser.close() } catch {}
+        process.exit(0)
+      })
+      return { shuttingDown: true }
     }
     return dispatch(cmd, args, page)
   }
 
-  // ── Single CLI command mode ───────────────────────────────────────────
-  if (cliRequest) {
-    try {
-      const result = await dispatch(cliRequest.cmd, cliRequest, page)
-      write({ ok: true, id: null, data: result })
-    } catch (e) {
-      write({ ok: false, id: null, error: e.message || String(e) })
-    }
-    await browser.close()
-    process.exit(0)
-  }
+  // Page is injected + logged in (or login timed out) — flush queued commands.
+  _markPageReady()
 
-  // ── Stdin reader — JSON commands ──────────────────────────────────────
-  const rl = readline.createInterface({ input: process.stdin, terminal: false })
-
-  for await (const line of rl) {
-    if (!line.trim()) continue
-
-    let req
-    try { req = JSON.parse(line) } catch {
-      write({ ok: false, error: 'invalid json', id: null })
-      continue
-    }
-
-    const { cmd, id } = req
-
-    if (cmd === 'exit') {
-      write({ ok: true, id })
-      await browser.close()
-      process.exit(0)
-    }
-
-    try {
-      const result = await dispatch(cmd, req, page)
-      write({ ok: true, id, data: result })
-    } catch (e) {
-      write({ ok: false, id, error: e.message || String(e) })
-    }
-  }
-
-  // stdin closed — clean up
-  await browser.close()
-  process.exit(0)
+  log('Daemon ready — serving WebSocket clients on ws://localhost:' + WS_PORT)
+  // Daemon stays alive until `exit` command, SIGINT or SIGTERM.
+  // (No stdin reader: background-spawned daemons have no stdin.)
 }
 
 // ── Send text with @mention conversion (shared helper) ──────────────────
