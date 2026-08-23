@@ -3,3 +3,6 @@ node_modules/
 test-room-messages.js
 *.log
 .DS_Store
+.pi-subagents/
+user-steer.md
+.vscode/
