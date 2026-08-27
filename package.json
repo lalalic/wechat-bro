@@ -1,6 +1,6 @@
 {
   "name": "wechat-bro",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "AI agent interface for WeChat Web — send/receive messages, manage contacts, upload media, transcribe voice",
   "type": "commonjs",
   "bin": {
@@ -8,7 +8,7 @@
   },
   "files": [
     "src/",
-    "SKILL.md",
+    "skills/",
     "README.md"
   ],
   "scripts": {

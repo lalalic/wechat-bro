@@ -645,6 +645,14 @@ async function main() {
   _markPageReady()
 
   log('Daemon ready — serving WebSocket clients on ws://localhost:' + WS_PORT)
+  
+  // Send notification to filehelper when daemon is ready
+  try {
+    await sendText(page, 'filehelper', '✅✅✅✅✅')
+  } catch (e) {
+    log('Failed to send notification to filehelper:', e.message)
+  }
+  
   // Daemon stays alive until `exit` command, SIGINT or SIGTERM.
   // (No stdin reader: background-spawned daemons have no stdin.)
 }

@@ -185,6 +185,11 @@
   /** Hidden AI watermark: zero-width chars invisible to humans but detectable programmatically */
   var AI_WATERMARK = '\u200B\u200C\u200B\u200C'
 
+  /** Visible bot marker for messages to filehelper/self: those chats double as
+   *  private notepads the bot writes to (logs, notes, status). A robot icon
+   *  prefix lets a human tell bot-written entries from manually typed ones. */
+  var BOT_ICON = '🤖'
+
   /** Convert markdown formatting to Unicode-styled plain text */
   function mdToUnicode(md) {
     var r = md
@@ -834,7 +839,15 @@
         // Auto-convert markdown to Unicode-styled text
         var styled = mdToUnicode(content)
         // Optionally prepend AI watermark
-        if (watermark) styled = AI_WATERMARK + styled
+        if (watermark) {
+          // filehelper/self are bot-private channels — prefix a visible icon so
+          // the entry is identifiable as bot-authored at a glance.
+          var selfUserName = getUserName()
+          if (userName === 'filehelper' || (selfUserName && userName === selfUserName)) {
+            styled = BOT_ICON + ' ' + styled
+          }
+          styled = AI_WATERMARK + styled
+        }
 
         log('send: resolved ' + to + ' -> ' + userName)
         var m = chatFactory.createMessage({
