@@ -116,6 +116,7 @@ let _wsBroadcast = null  // set by main() for event broadcasting
 const BINARY_FIELDS = {
   voiceBase64: { ext: 'amr', mime: 'audio' },
   imageBase64: { ext: 'jpg', mime: 'image' },
+  videoBase64: { ext: 'mp4', mime: 'video' },
 }
 
 function saveBinaryContent(data) {
@@ -138,6 +139,88 @@ function saveBinaryContent(data) {
       log('saveBinaryContent error for', field + ':', e.message)
     }
   }
+}
+
+// ── Simplify message events ──────────────────────────────────────────────
+// Agents don't want WeChat's raw wire-format blobs. Non-text message events
+// are distilled into a small object whose `content` is the most useful
+// representation — a local file path for media, extracted url for emoticons,
+// readable text for system-ish messages. Text messages (MsgType 1) keep their
+// raw shape. On ALL message events every empty field (null/''/[]) is stripped.
+// Returns false for suppressed types (app/system/recalled) — the caller must
+// not send those events at all.
+const EVENT_MSG_TYPE_NAMES = {
+  3: 'image', 34: 'voice', 37: 'verify', 42: 'card',
+  43: 'video', 47: 'emoticon', 48: 'location', 49: 'app',
+  51: 'status', 62: 'microvideo', 10000: 'system', 10002: 'recalled',
+}
+// Message types never emitted to agents (XML wire noise, no agent value).
+const SUPPRESSED_MSG_TYPES = new Set(['app', 'system', 'recalled'])
+
+function stripHtml(s) {
+  return String(s || '').replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '').trim()
+}
+
+/** Drop empty fields (undefined/null/''/[]) so events stay compact. */
+function stripEmptyFields(data) {
+  if (!data || typeof data !== 'object') return
+  for (const k of Object.keys(data)) {
+    const v = data[k]
+    if (v === undefined || v === null || v === '' || (Array.isArray(v) && v.length === 0)) delete data[k]
+  }
+}
+
+function simplifyMessageEvent(event, data) {
+  if (!data || typeof data !== 'object') return true
+  if (!/^message(:|$)/.test(event)) return true
+  // Text messages pass through raw, minus empty-field noise
+  if (data.MsgType === 1) {
+    stripEmptyFields(data)
+    return true
+  }
+  const type = EVENT_MSG_TYPE_NAMES[data.MsgType] || 'unknown'
+  if (SUPPRESSED_MSG_TYPES.has(type)) return false
+
+  const simplified = {
+    MsgId: data.MsgId,
+    from: data.from,
+    to: data.to,
+    sender: data.sender,
+    mentions: data.mentions,
+    mentionMe: data.mentionMe,
+    ts: data.CreateTime,
+    type,
+  }
+  switch (type) {
+    case 'image':
+      simplified.content = data.imageFile || '[image download failed]'
+      break
+    case 'voice':
+      simplified.content = data.voiceText || data.voiceFile || '[voice message]'
+      if (data.voiceFile) simplified.voiceFile = data.voiceFile
+      break
+    case 'video':
+    case 'microvideo':
+      simplified.content = data.videoFile ||
+        `[video not downloaded: ${data.FileName || type}${data.FileSize ? ' ' + data.FileSize + 'B' : ''}]`
+      break
+    case 'emoticon':
+      simplified.content = data.emojiUrl || '[emoticon]'
+      break
+    case 'location':
+      simplified.content = data.location || stripHtml(data.Content) || '[location]'
+      break
+    case 'card':
+      simplified.content = data.cardName ? `[contact card: ${data.cardName}]` : '[contact card]'
+      break
+    default: // verify/status/unknown — keep readable text
+      simplified.content = stripHtml(data.Content) || `[${type}]`
+  }
+
+  stripEmptyFields(simplified)
+  for (const k of Object.keys(data)) delete data[k]
+  Object.assign(data, simplified)
+  return true
 }
 
 // ── Save scan event's user avatar → ~/.wechat-bro/userAvatar.png ─────────
@@ -217,16 +300,54 @@ function log(...args) {
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────
 let _wsServer = null  // set by main()
+let _exitSave = null  // set by main(): flush cookies to disk before exit
 
 function shutdown() {
   log('Shutting down...')
+  if (_exitSave) { try { _exitSave() } catch {} }
   if (_wsServer) {
     try { _wsServer.close() } catch {}
   }
 }
 
-process.on('SIGINT', () => { shutdown(); process.exit(0) })
-process.on('SIGTERM', () => { shutdown(); process.exit(0) })
+// Defer exit so the async cookie flush in shutdown() can finish (~2s race).
+process.on('SIGINT', () => { shutdown(); setTimeout(() => process.exit(0), 2500) })
+process.on('SIGTERM', () => { shutdown(); setTimeout(() => process.exit(0), 2500) })
+
+// ── Cookie persistence ───────────────────────────────────────────────────
+// Cookies carry the whole session: login auth + the wx_last_msg_time replay
+// marker (the bridge updates that cookie in the browser as messages arrive).
+// A single save after contacts-ready is not enough:
+//   - shutdown before contacts-ready (up to 2 min) loses the fresh login →
+//     QR scan required on next start
+//   - messages arriving during the session never reach disk → replay marker
+//     stays 0 → duplicated events on next start
+// So: save right after login, periodically, and on every exit path.
+let _savingCookies = false
+
+async function saveCookies(page, file = COOKIE_FILE) {
+  if (_savingCookies) return
+  _savingCookies = true
+  try {
+    // Race the CDP call with a timeout so a hung browser can never leave
+    // _savingCookies stuck true (which would kill all future saves).
+    const c = await Promise.race([
+      page.cookies(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('page.cookies() timeout')), 5000)),
+    ])
+    fs.writeFileSync(file, JSON.stringify(c, null, 2))
+  } catch (e) {
+    log('saveCookies:', e.message)
+  } finally {
+    _savingCookies = false
+  }
+}
+
+/** Exit-path cookie save: race a short timeout so a hung CDP call cannot
+ *  block process.exit. */
+async function saveCookiesOnExit(page, timeoutMs = 2000) {
+  await Promise.race([saveCookies(page), new Promise(r => setTimeout(r, timeoutMs))])
+}
 
 // ── CLI command parser ────────────────────────────────────────────────────
 // ── Port resolution (--port, --port=N, backward-compat --ws-port) ───────
@@ -580,10 +701,14 @@ async function main() {
     if (data && data.voiceBase64 && (event === 'message:voice' || (event === 'message' && data.MsgType === 34))) {
       transcribeVoice(data)
     }
-    // Persist binary payloads (voice/image base64) to ~/.wechat-bro/download
-    // and replace the field with a file path — keeps events small and gives
-    // agents a path they can open directly.
+    // Persist binary payloads (voice/image/video/file base64) to
+    // ~/.wechat-bro/download and replace the field with a file path — keeps
+    // events small and gives agents a path they can open directly.
     saveBinaryContent(data)
+    // Distill non-text messages: content → file path / extracted text,
+    // drop raw wire-format noise + empty fields. Returns false for
+    // suppressed types (app/system/recalled) — don't send those at all.
+    if (!simplifyMessageEvent(event, data)) return
     // For scan events: persist the user avatar URL to disk and swap the field
     // for the file path before emitting the event.
     if (event === 'scan') saveUserAvatar(data)
@@ -620,8 +745,21 @@ async function main() {
     try { await page.waitForFunction(() => window.WechatyBro && window.WechatyBro.vars.loginState === true, { timeout: LOGIN_TIMEOUT }); log('Login detected') } catch (e) { log('Login timeout') }
   } else { log('Already logged in') }
 
+  // Persist the session immediately after login — contacts-ready can take up
+  // to 2 minutes; a shutdown before it must not lose the login (QR again).
+  await saveCookies(page)
+
   try { await page.waitForFunction(() => window.WechatyBro && window.WechatyBro.vars.contactsReady === true, { timeout: 120_000 }); log('Contacts ready') } catch {}
-  try { const c = await page.cookies(); fs.writeFileSync(COOKIE_FILE, JSON.stringify(c, null, 2)) } catch {}
+  await saveCookies(page)
+
+  // Periodic snapshot: session cookies rotate and the bridge keeps updating
+  // the wx_last_msg_time replay marker as messages arrive — persist both.
+  // 15s bounds the duplicate-replay window on a hard kill (crash / kill -9);
+  // clean exits flush immediately. (unref: don't hold the loop open for this)
+  const cookieSaver = setInterval(() => { saveCookies(page) }, 15_000)
+  if (cookieSaver.unref) cookieSaver.unref()
+  // Exit paths flush cookies first (see shutdown() + 'exit' command below)
+  _exitSave = () => saveCookiesOnExit(page)
 
   // Emit a "ready" event so the agent knows it can start sending commands
   write({ event: 'ready', data: { loggedIn: isLoggedIn, contactsReady: true } })
@@ -631,8 +769,9 @@ async function main() {
     if (cmd === 'exit') {
       // Return a result so ws-server flushes {ok:true} back to the requesting
       // client, then tear down the browser + process on the next tick
-      // (browser.close() gives the socket enough time to flush the reply).
+      // (cookie flush + browser.close() give the socket time to flush the reply).
       setImmediate(async () => {
+        await saveCookiesOnExit(page)
         try { await browser.close() } catch {}
         process.exit(0)
       })
@@ -897,4 +1036,4 @@ if (require.main === module) {
 }
 
 // Exported for unit tests
-module.exports = { parseSegments }
+module.exports = { parseSegments, saveBinaryContent, simplifyMessageEvent, saveCookies, saveCookiesOnExit }

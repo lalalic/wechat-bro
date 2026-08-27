@@ -287,14 +287,21 @@
     // Cross-login replay suppression: highest CreateTime seen so far.
     // Survives process restarts via wx_last_msg_time HTTP cookie.
     _lastMsgTime: 0,
+    // Snapshot of the previous session's last-seen time, taken at init.
+    // emitTypedMessage compares against THIS (static) value — never against
+    // _lastMsgTime, which updates on every message and would drop live
+    // messages sharing a CreateTime second with an earlier one (chat bursts).
+    _replayCutoff: 0,
 
-    /** Read wx_last_msg_time from document.cookie and update _lastMsgTime.
-     *  Called on init and after page reload (cookie is set by the bridge). */
+    /** Read wx_last_msg_time from document.cookie, set the replay-cutoff
+     *  snapshot and seed _lastMsgTime. Called on init and after page reload
+     *  (cookie is set by the bridge). */
     _loadLastMsgTime: function () {
       try {
         var m = document.cookie.match(/\bwx_last_msg_time=(\d+)/)
         if (m) {
           WechatyBro._lastMsgTime = parseInt(m[1], 10) || 0
+          WechatyBro._replayCutoff = WechatyBro._lastMsgTime
           log('Loaded lastMsgTime=' + WechatyBro._lastMsgTime + ' from cookie')
         }
       } catch (e) { /* ignore */ }
@@ -555,10 +562,11 @@
       }
     },
 
-    downloadVoice: function (msgId, callback) {
+    /** Shared XHR GET → base64 helper for media download endpoints. */
+    _xhrBinaryGet: function (url, callback) {
       try {
         var xhr = new XMLHttpRequest()
-        xhr.open('GET', '/cgi-bin/mmwebwx-bin/webwxgetvoice?msgid=' + msgId + '&skey=' + encodeURIComponent(getSkey()), true)
+        xhr.open('GET', url, true)
         xhr.responseType = 'arraybuffer'
         xhr.onload = function () {
           if (xhr.status === 200) {
@@ -569,19 +577,23 @@
             }
             callback(btoa(binary))
           } else {
-            log('downloadVoice failed: HTTP ' + xhr.status)
+            log('binary GET failed [' + xhr.status + ']:', url.split('?')[0])
             callback(null)
           }
         }
         xhr.onerror = function () {
-          log('downloadVoice error')
+          log('binary GET error:', url.split('?')[0])
           callback(null)
         }
         xhr.send()
       } catch (e) {
-        log('downloadVoice exception:', e.message)
+        log('binary GET exception:', e.message)
         callback(null)
       }
+    },
+
+    downloadVoice: function (msgId, callback) {
+      WechatyBro._xhrBinaryGet('/cgi-bin/mmwebwx-bin/webwxgetvoice?msgid=' + msgId + '&skey=' + encodeURIComponent(getSkey()), callback)
     },
 
     /** Download an image message as base64.
@@ -589,66 +601,12 @@
      *  @param {string} msgId - Message ID
      *  @param {function} callback - (base64String|null) */
     downloadImage: function (msgId, callback) {
-      try {
-        var xhr = new XMLHttpRequest()
-        xhr.open('GET', '/cgi-bin/mmwebwx-bin/webwxgetmsgimg?MsgID=' + msgId + '&skey=' + encodeURIComponent(getSkey()) + '&type=big', true)
-        xhr.responseType = 'arraybuffer'
-        xhr.onload = function () {
-          if (xhr.status === 200) {
-            var bytes = new Uint8Array(xhr.response)
-            var binary = ''
-            for (var i = 0; i < bytes.byteLength; i++) {
-              binary += String.fromCharCode(bytes[i])
-            }
-            callback(btoa(binary))
-          } else {
-            log('downloadImage failed: HTTP ' + xhr.status)
-            callback(null)
-          }
-        }
-        xhr.onerror = function () {
-          log('downloadImage error')
-          callback(null)
-        }
-        xhr.send()
-      } catch (e) {
-        log('downloadImage exception:', e.message)
-        callback(null)
-      }
+      WechatyBro._xhrBinaryGet('/cgi-bin/mmwebwx-bin/webwxgetmsgimg?MsgID=' + msgId + '&skey=' + encodeURIComponent(getSkey()) + '&type=big', callback)
     },
 
-    /** Get contact thumbnail image as base64. Accepts name or UserName. */
-    getContactImage: function (id, callback) {
-      try {
-        var userName = WechatyBro._requireUserName(id)
-        var injector = angular.element(document).injector()
-        var contactFactory = injector.get('contactFactory')
-        var contact = contactFactory.getContact(userName)
-        if (!contact || !contact.HeadImgUrl) {
-          callback(null)
-          return
-        }
-        var xhr = new XMLHttpRequest()
-        xhr.open('GET', contact.HeadImgUrl, true)
-        xhr.responseType = 'arraybuffer'
-        xhr.onload = function () {
-          if (xhr.status === 200) {
-            var bytes = new Uint8Array(xhr.response)
-            var binary = ''
-            for (var i = 0; i < bytes.byteLength; i++) {
-              binary += String.fromCharCode(bytes[i])
-            }
-            callback(btoa(binary))
-          } else {
-            callback(null)
-          }
-        }
-        xhr.onerror = function () { callback(null) }
-        xhr.send()
-      } catch (e) {
-        log('getContactImage error:', e.message)
-        callback(null)
-      }
+    /** Download a video/microvideo message as base64 (mp4). */
+    downloadVideo: function (msgId, callback) {
+      WechatyBro._xhrBinaryGet('/cgi-bin/mmwebwx-bin/webwxgetvideo?msgid=' + msgId + '&skey=' + encodeURIComponent(getSkey()), callback)
     },
 
     /** Returns list of supported QQ-style emoji codes for use in text messages.
@@ -1669,10 +1627,9 @@
   }
 
   function emitTypedMessage(data) {
-    // Cross-login replay suppression: skip messages older than last seen time.
-    // The cutoff (wx_last_msg_time cookie) is loaded from document.cookie on
-    // init and persisted by the bridge so it survives process restarts.
-    if (WechatyBro._lastMsgTime > 0 && data.CreateTime > 0 && data.CreateTime <= WechatyBro._lastMsgTime) {
+    // Cross-login replay suppression: skip messages at or before the previous
+    // session's last-seen time (snapshot taken from the cookie at init).
+    if (data.CreateTime > 0 && data.CreateTime <= WechatyBro._replayCutoff) {
       return  // replayed history message, already handled in previous session
     }
     // Track the highest CreateTime for next session and persist to cookie
@@ -1718,6 +1675,9 @@
     }
 
     var off = rootScope.$on('message:add:success', function (event, data) {
+      // Suppress app (49), system (10000) and recalled (10002) messages —
+      // XML wire noise agents never need: no download, no event.
+      if (data.MsgType === 49 || data.MsgType === 10000 || data.MsgType === 10002) return
       data.from = WechatyBro._eventContactName(data.FromUserName)
       data.to = WechatyBro._eventContactName(data.ToUserName)
 
@@ -1802,22 +1762,39 @@
           data.imageBase64 = base64Img
           emitTypedMessage(data)
         })
-      } else if (data.MsgType === 49) {
-        // Extract file/link info from app message XML
+      } else if ((data.MsgType === 43 || data.MsgType === 62) && data.MsgId) {
+        // video / microvideo → download so cli can persist to disk
+        WechatyBro.downloadVideo(data.MsgId, function (base64Video) {
+          data.videoBase64 = base64Video
+          emitTypedMessage(data)
+        })
+      } else if (data.MsgType === 47) {
+        // Emoticon: expose the emoji CDN url (gif/mp4) from the message XML
         try {
-          var xml = data.Content || ''
-          var titleMatch = xml.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/)
-          var descMatch = xml.match(/<des><!\[CDATA\[(.*?)\]\]><\/des>/)
-          var urlMatch = xml.match(/<url><!\[CDATA\[(.*?)\]\]><\/url>/)
-          var typeMatch = xml.match(/<type>(\d+)<\/type>/)
-          var fnMatch = xml.match(/<appattach>[\s\S]*?<cdnattachurl><!\[CDATA\[(.*?)\]\]><\/cdnattachurl>/)
-          data.appTitle = titleMatch ? titleMatch[1] : ''
-          data.appDesc = descMatch ? descMatch[1] : ''
-          data.appUrl = urlMatch ? urlMatch[1] : ''
-          data.appType = typeMatch ? parseInt(typeMatch[1]) : 0
-        } catch (e) {
-          log('app msg parse error:', e.message)
-        }
+          var urlMatch = unescapeContent(data.Content).match(/cdnurl="([^"]+)"/)
+          if (urlMatch) data.emojiUrl = urlMatch[1]
+        } catch (e) {}
+        emitTypedMessage(data)
+      } else if (data.MsgType === 48) {
+        // Location: distill XML attrs into a readable "label (poiname)"
+        try {
+          var locXml = unescapeContent(data.Content)
+          var poiname = '', label = ''
+          var locMatch = locXml.match(/<location[^>]*poiname="([^"]*)"[^>]*label="([^"]*)"/)
+          if (locMatch) { poiname = locMatch[1]; label = locMatch[2] }
+          else if ((locMatch = locXml.match(/<location[^>]*label="([^"]*)"[^>]*poiname="([^"]*)"/))) {
+            label = locMatch[1]; poiname = locMatch[2]
+          }
+          if (poiname || label) {
+            data.location = label && poiname && label !== poiname ? label + ' (' + poiname + ')' : (label || poiname)
+          }
+        } catch (e) {}
+        emitTypedMessage(data)
+      } else if (data.MsgType === 42) {
+        // Contact card: expose the shared contact's display name
+        try {
+          data.cardName = (data.RecommendInfo && data.RecommendInfo.NickName) || ''
+        } catch (e) {}
         emitTypedMessage(data)
       } else {
         emitTypedMessage(data)
@@ -1827,8 +1804,18 @@
     return true
   }
 
-  // ==========================================================================
-  // Heartbeat (kept for liveness detection)
+/** Unescape WeChat wire-format Content into real XML/text.
+ *  Message Content arrives HTML-escaped (&lt;msg&gt;) with <br/> line
+ *  breaks — regex parsers need the raw form. */
+function unescapeContent(s) {
+  return String(s || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&')
+}
   // ==========================================================================
   function heartBeat(firstTime) {
     var TIMEOUT = 15000

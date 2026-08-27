@@ -87,10 +87,22 @@ Connect to `ws://localhost:9231`.  Send/receive JSON messages.
 | `login` | User logged in | `{name, …}` (self; `name` is `"me"`) |
 | `logout` | User logged out | source string |
 | `contacts-ready` | Contact list loaded (count stabilized) | `{total, elapsedMs}` |
-| `message:text` | Incoming text message | Message object with `from`/`to` as **contact names** (strings; `"me"` for self; `sender` for room messages) |
-| `message:image` | Incoming image | Same + `imageFile` (path to downloaded image in `~/.wechat-bro/download/`) |
-| `message:voice` | Incoming voice memo | Same + `voiceFile` (path to audio) + `voiceText` (transcribed) |
-| `message: xxx` | Other types: 'verify','card', 'video', 'emoticon', 'location','app', 'status', 'microvideo','system', 'recalled' | Same pattern |
+| `message:text` | Incoming text message | Message object with `from`/`to` as **contact names** (strings; `"me"` for self; `sender` for room messages). Raw field `Content` holds the text |
+| `message:*` (non-text) | Incoming image/voice/video/emoticon/location/card/verify/status | **Simplified object**: `content` is the useful representation per type (see below). All raw wire-format fields (XML `Content`, `RecommendInfo`, `MMActual*`, …) and every empty field (`null`/`""`/`[]`) are stripped; kept fields: `MsgId`, `from`, `to`, `sender`, `mentions`, `mentionMe`, `ts`, `type`, `content` + type extras |
+
+**Suppressed types — no event is emitted**: `app` (49, incl. file attachments & shared articles), `system` (10000), `recalled` (10002). These are XML wire noise; agents never receive them.
+
+Non-text `content` per type:
+
+| type | `content` | extras |
+|---|---|---|
+| `image` | path to downloaded image in `~/.wechat-bro/download/` | |
+| `voice` | transcribed text (Whisper), falling back to the audio file path | `voiceFile` |
+| `video` / `microvideo` | path to downloaded video (`.mp4`) | |
+| `emoticon` | emoji CDN url | |
+| `location` | `"label (poiname)"` | |
+| `card` | `"[contact card: Name]"` | |
+| `verify` / `status` | plain readable text | |
 | `heartbeat` | Every ~30s liveness check | `"heartbeat@browser"` |
 
 ### stdin mode

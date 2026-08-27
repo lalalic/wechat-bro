@@ -481,7 +481,7 @@ async function main() {
       }
     }, to, mdMsg)
 
-    ok(sendResult === true, `send() with markdown returns true`)
+    ok(sendResult && sendResult.ok === true, `send() with markdown returns ok`)
 
     // Verify the sent message has markdown converted (no raw ** markup)
     const sentContent = await page.evaluate(() => {
@@ -502,7 +502,7 @@ async function main() {
       }
     }, to)
 
-    ok(sendWmResult === true, 'send() with watermark=true succeeds')
+    ok(sendWmResult && sendWmResult.ok === true, 'send() with watermark=true succeeds')
   }
 
   // ── 13. Watermark / infinite-loop prevention ──────────────────────────
@@ -662,7 +662,7 @@ async function main() {
       }
     }, to)
 
-    ok(emojiResult === true, 'send() with emoji codes succeeds')
+    ok(emojiResult && emojiResult.ok === true, 'send() with emoji codes succeeds')
 
     // Verify getSupportedEmojis includes all expected codes
     const emojiCheck = await page.evaluate(() => {
@@ -1087,7 +1087,7 @@ async function main() {
       }
     }, contactInfo.filehelper.name)
 
-    ok(sendAfterNav === true, 'send() works after re-injection')
+    ok(sendAfterNav && sendAfterNav.ok === true, 'send() works after re-injection')
   }
 
   // ── 22. Media upload (sendImage) ─────────────────────────────────────

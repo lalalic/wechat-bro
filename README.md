@@ -57,10 +57,20 @@ Events stream as JSON lines to stdout:
 {"event":"login","data":{"name":"me","NickName":"李诚"}}
 {"event":"contacts-ready","data":{"total":248,"elapsedMs":25001}}
 {"event":"message","data":{"MsgType":1,"Content":"hello","from":"Alice","to":"me"}}
-{"event":"message","data":{"MsgType":1,"Content":"hey all","from":"Dev Team","sender":"Alice","mentions":[],"mentionMe":false}}
+{"event":"message","data":{"MsgType":1,"Content":"hey all","from":"Dev Team","sender":"Alice","mentionMe":false}}
 {"event":"message:text","data":{"MsgType":1,"Content":"hello"}}
+{"event":"message:image","data":{"MsgType":3,"content":"/Users/<you>/.wechat-bro/download/459159189914210930.jpg","type":"image","from":"Alice","to":"me"}}
 {"event":"logout","data":"..."}
 ```
+
+Message events are **simplified**: `content` is a local file path for media
+(image/voice/video — binaries are downloaded to `~/.wechat-bro/download/`)
+or extracted text/url otherwise. All raw wire-format noise (XML `Content`,
+`RecommendInfo`, `MMActual*`, …) and every empty field (`null`/`""`/`[]`)
+is stripped. Text messages keep the raw `Content` field.
+
+**Never emitted**: `app` (49, incl. file attachments & shared articles),
+`system` (10000), `recalled` (10002) — XML wire noise agents don't need.
 
 > **Login QR**: the QR code is **not** drawn in the terminal. On a `scan`
 > event, when running headless the QR URL is opened in your default browser
