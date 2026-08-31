@@ -50,13 +50,14 @@ const { transcribeVoice, transcribeFile } = require('./transcribe')
 const { sendImage, sendFile } = require('./upload')
 const wsServer = require('./ws-server')
 
-const DATA_DIR = path.join(os.homedir(), '.wechat-bro')
+// Overridable for tests so unit suites never touch the real ~/.wechat-bro
+const DATA_DIR = process.env.WECHAT_BRO_DATA_DIR || path.join(os.homedir(), '.wechat-bro')
 // Tell puppeteer where to find/store Chromium
 process.env.PUPPETEER_CACHE_DIR = path.join(DATA_DIR, 'chromium')
 
 const COOKIE_FILE = path.join(DATA_DIR, 'cookies.json')
 const MESSAGES_FILE = path.join(DATA_DIR, 'messages.jsonl')
-const DOWNLOAD_DIR = path.join(DATA_DIR, 'download')
+const CONTACTS_DIR = path.join(DATA_DIR, 'contacts')
 
 const WX_URL = 'https://wx.qq.com'
 const INJECT_SCRIPT = fs.readFileSync(path.join(__dirname, 'wechat-bro.js'), 'utf-8')
@@ -111,26 +112,59 @@ let _wsBroadcast = null  // set by main() for event broadcasting
 
 // ── Persist binary content (base64) in events to disk → file path ────────
 // Fields with binary content and their file extension. When present in an
-// event's data, the base64 is decoded, written to DOWNLOAD_DIR, and the field
-// is replaced with the file path so events stay small & agent-friendly.
+// event's data, the base64 is decoded and written to the owning contact's
+// own download folder, and the field is replaced with the file path so
+// events stay small & agent-friendly.
 const BINARY_FIELDS = {
   voiceBase64: { ext: 'amr', mime: 'audio' },
   imageBase64: { ext: 'jpg', mime: 'image' },
   videoBase64: { ext: 'mp4', mime: 'video' },
 }
 
+/** Make an arbitrary contact name / filename safe as a single path segment.
+ *  Strips separators + control chars (blocks path traversal); CJK is kept. */
+function sanitizeFsName(name) {
+  const s = String(name || '')
+    .replace(/[/\\:*?"<>|]/g, '_')
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .trim()
+  return (s || 'unknown').slice(0, 120)
+}
+
+/** Per-contact download folder: <DATA_DIR>/contacts/<contact name>/download/ */
+function contactDownloadDir(contactName) {
+  return path.join(CONTACTS_DIR, sanitizeFsName(contactName), 'download')
+}
+
+/** The chat-side contact that owns a message's media. For room messages this
+ *  is the room (from is the room name); for self-sent (from=me) it's the peer. */
+function messageContact(data) {
+  if (data && typeof data.from === 'string' && data.from && data.from !== 'me') return data.from
+  if (data && typeof data.to === 'string' && data.to && data.to !== 'me') return data.to
+  return 'unknown'
+}
+
 function saveBinaryContent(data) {
   if (!data || typeof data !== 'object') return
-  fs.mkdirSync(DOWNLOAD_DIR, { recursive: true })
   for (const [field, { ext }] of Object.entries(BINARY_FIELDS)) {
     const b64 = data[field]
     if (!b64 || typeof b64 !== 'string') continue
     try {
       const buf = Buffer.from(b64, 'base64')
       if (buf.length === 0) continue
-      // Use MsgId for stable, dedup-friendly filenames
-      const base = data.MsgId || (field + '_' + Date.now())
-      const file = path.join(DOWNLOAD_DIR, base + '.' + ext)
+      const dir = contactDownloadDir(messageContact(data))
+      fs.mkdirSync(dir, { recursive: true })
+      // <filename>_<MsgId>.<ext> — MsgId keeps filenames stable & dedup-friendly
+      const id = data.MsgId || String(Date.now())
+      let stem = sanitizeFsName(field.replace('Base64', '')) // voice/image/video
+      let fileExt = ext
+      const orig = typeof data.FileName === 'string' ? data.FileName.trim() : ''
+      if (orig) {
+        stem = sanitizeFsName(orig.replace(/\.[^.]*$/, '')) // original name, ext re-derived below
+        const origExt = path.extname(orig).replace('.', '').toLowerCase()
+        if (origExt) fileExt = origExt
+      }
+      const file = path.join(dir, stem + '_' + id + '.' + fileExt)
       fs.writeFileSync(file, buf)
       delete data[field]
       data[field.replace('Base64', 'File')] = file
@@ -551,6 +585,17 @@ Flags:
   --quiet           Events-only output on stdout (suppress other stdout noise)
   --pretty          Pretty-print command responses (JSON with 2-space indent)
 
+Modes:
+  orchestrator [--agents-dir <dir>] [--harness <cmd-template>]
+                               Start the orchestrator (own long-lived process):
+                               watch contacts declared in ~/.wechat-bro/agents/
+                               *.agent.md frontmatter and dispatch each message
+                               to a resumable harness task (pi by default)
+                               rooted in the contact's own folder. User guidance
+                               arrives via filehelper. Falls back to package
+                               defaults for missing agent mds; edits apply on
+                               the next message.
+
 Commands:
   contacts                     List individual contacts (names only)
   rooms                        List group chats (names only)
@@ -568,7 +613,8 @@ Commands:
   exit                         Shut down the daemon
 
 Events stream to stdout as JSON lines; messages also appended to
-~/.wechat-bro/messages.jsonl. Binary media is saved to ~/.wechat-bro/download/.
+~/.wechat-bro/messages.jsonl. Binary media is saved per contact:
+~/.wechat-bro/contacts/<contact name>/download/<filename>_<id>.<ext>.
 `
   process.stdout.write(help)
 }
@@ -590,6 +636,16 @@ async function main() {
   const WS_PORT = parseInt(process.env.WS_PORT || extractPort(argv) || '9231', 10)
   const cliRequest = parseCliCommand()
   const forceDaemon = argv.includes('--daemon')
+
+  // `orchestrator` is a LOCAL mode (its own long-lived process): connect to
+  // the daemon as a WS client and dispatch watched-contact messages to
+  // harness tasks configured via *.agent.md frontmatter.
+  const firstPosArg = argv.find(a => !a.startsWith('--'))
+  if (firstPosArg === 'orchestrator') {
+    const { runOrchestrator } = require('./orchestrator')
+    await runOrchestrator({ port: WS_PORT })
+    return
+  }
 
   // `exit` is a shutdown command — it must NEVER spin up a new daemon.
   // Try to reach an existing one and shut it down; if none is running,
@@ -701,9 +757,10 @@ async function main() {
     if (data && data.voiceBase64 && (event === 'message:voice' || (event === 'message' && data.MsgType === 34))) {
       transcribeVoice(data)
     }
-    // Persist binary payloads (voice/image/video/file base64) to
-    // ~/.wechat-bro/download and replace the field with a file path — keeps
-    // events small and gives agents a path they can open directly.
+    // Persist binary payloads (voice/image/video/file base64) to the owning
+    // contact's download folder (~/.wechat-bro/contacts/<name>/download/) and
+    // replace the field with a file path — keeps events small and gives
+    // agents a path they can open directly.
     saveBinaryContent(data)
     // Distill non-text messages: content → file path / extracted text,
     // drop raw wire-format noise + empty fields. Returns false for

@@ -59,12 +59,13 @@ Events stream as JSON lines to stdout:
 {"event":"message","data":{"MsgType":1,"Content":"hello","from":"Alice","to":"me"}}
 {"event":"message","data":{"MsgType":1,"Content":"hey all","from":"Dev Team","sender":"Alice","mentionMe":false}}
 {"event":"message:text","data":{"MsgType":1,"Content":"hello"}}
-{"event":"message:image","data":{"MsgType":3,"content":"/Users/<you>/.wechat-bro/download/459159189914210930.jpg","type":"image","from":"Alice","to":"me"}}
+{"event":"message:image","data":{"MsgType":3,"content":"/Users/<you>/.wechat-bro/contacts/Alice/download/photo_459159189914210930.jpg","type":"image","from":"Alice","to":"me"}}
 {"event":"logout","data":"..."}
 ```
 
 Message events are **simplified**: `content` is a local file path for media
-(image/voice/video — binaries are downloaded to `~/.wechat-bro/download/`)
+(image/voice/video — binaries are downloaded to the chat contact's own
+folder: `~/.wechat-bro/contacts/<contact name>/download/<filename>_<MsgId>.<ext>`)
 or extracted text/url otherwise. All raw wire-format noise (XML `Content`,
 `RecommendInfo`, `MMActual*`, …) and every empty field (`null`/`""`/`[]`)
 is stripped. Text messages keep the raw `Content` field.
@@ -462,8 +463,8 @@ node test-inject.js
 | `contacts-ready` | `{total, elapsedMs}` | Contact list fully loaded (count stabilized across batches) |
 | `message` | Full message object with `from`/`to` as **contact names** | Any message received |
 | `message:text` | Same | Text message (MsgType 1) |
-| `message:image` | Same + `imageFile` (file path) | Image (MsgType 3) — saved to `~/.wechat-bro/download/` |
-| `message:voice` | Same + `voiceFile` (file path) + `voiceText` | Voice memo (MsgType 34) — audio saved to `~/.wechat-bro/download/`, transcribed |
+| `message:image` | Same + `imageFile` (file path) | Image (MsgType 3) — saved to the contact's `download/` folder |
+| `message:voice` | Same + `voiceFile` (file path) + `voiceText` | Voice memo (MsgType 34) — audio saved to the contact's `download/` folder, transcribed |
 | `message:video` | Same | Video (MsgType 43) |
 | `message:emoticon` | Same | Custom sticker (MsgType 47) |
 | `message:location` | Same | Location share (MsgType 48) |

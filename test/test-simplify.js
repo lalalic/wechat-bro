@@ -14,9 +14,11 @@ const os = require('os')
 const path = require('path')
 const fs = require('fs')
 
-// Redirect DATA_DIR-dependent paths before requiring cli.js
+// Redirect DATA_DIR-dependent paths before requiring cli.js — cli.js honors
+// WECHAT_BRO_DATA_DIR so tests never touch the real ~/.wechat-bro.
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-bro-test-'))
-const DOWNLOAD_DIR = path.join(tmpDir, 'download')
+process.env.WECHAT_BRO_DATA_DIR = tmpDir
+const CONTACTS_DIR = path.join(tmpDir, 'contacts')
 
 const mod = require('../src/cli.js')
 // cli.js computes DOWNLOAD_DIR at require-time from ~/.wechat-bro — patch the
@@ -164,13 +166,30 @@ console.log('simplifyMessageEvent — room fields preserved')
   ok(data.sender === 'Alice' && data.mentions[0] === 'Bob' && data.mentionMe === true, 'room identity kept', data)
 }
 
-console.log('saveBinaryContent — writes file, swaps field')
+console.log('saveBinaryContent — per-contact folder, <filename>_<id>.<ext>')
 {
-  const data = { MsgType: 43, videoBase64: PNG_B64, MsgId: '777' }
+  const data = { MsgType: 43, videoBase64: PNG_B64, MsgId: '777', FileName: 'clip.mp4', from: 'Alice' }
   saveBinaryContent(data)
-  ok(typeof data.videoFile === 'string' && data.videoFile.endsWith('777.mp4'), 'videoFile with .mp4 ext', data)
+  const expected = path.join(CONTACTS_DIR, 'Alice', 'download', 'clip_777.mp4')
+  ok(data.videoFile === expected, 'original filename + MsgId in contact folder', data.videoFile)
   ok(data.videoBase64 === undefined, 'base64 field removed', data)
   ok(fs.existsSync(data.videoFile), 'file actually written', data.videoFile)
+}
+
+console.log('saveBinaryContent — no FileName → default stem, room msg → room folder')
+{
+  const data = { MsgType: 34, voiceBase64: PNG_B64, MsgId: '888', from: 'Dev Team', sender: 'Bob' }
+  saveBinaryContent(data)
+  const expected = path.join(CONTACTS_DIR, 'Dev Team', 'download', 'voice_888.amr')
+  ok(data.voiceFile === expected, 'room message lands in room folder', data.voiceFile)
+}
+
+console.log('saveBinaryContent — self-sent (from=me) → peer folder')
+{
+  const data = { MsgType: 3, imageBase64: PNG_B64, MsgId: '999', from: 'me', to: 'Alice' }
+  saveBinaryContent(data)
+  const expected = path.join(CONTACTS_DIR, 'Alice', 'download', 'image_999.jpg')
+  ok(data.imageFile === expected, 'self-sent media in peer folder', data.imageFile)
 }
 
 console.log('saveBinaryContent — null/empty base64 skipped')
