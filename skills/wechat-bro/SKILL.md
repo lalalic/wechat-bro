@@ -345,7 +345,8 @@ session-id: wechat-alice      # default: wechat-<sanitized contact>
 session-dir: ~/.wechat-bro/contacts/Alice/session
 cwd: ~/.wechat-bro/contacts/Alice
 timeout: 900                  # seconds
-notify: true                  # completion summary → filehelper
+notify: true                  # concise receipt note → filehelper at dispatch
+                              # time (not on completion)
 ---
 Alice-specific instructions…
 ```

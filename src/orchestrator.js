@@ -20,7 +20,8 @@
  *   session-dir: ~/.wechat-bro/contacts/Alice/session
  *   cwd: ~/.wechat-bro/contacts/Alice
  *   timeout: 900              # seconds, default 900
- *   notify: true              # send completion summary to filehelper
+ *   notify: true              # concise receipt note → filehelper when the
+ *                             # message is dispatched (not on completion)
  *   ---
  *   <body> = agent system prompt; symlinked as AGENTS.md into the task cwd.
  *
@@ -345,6 +346,13 @@ function makeDispatcher({ wsSend, onEscalation }) {
     log('dispatch', label, d.sessionId)
     const startedAt = Date.now()
 
+    // notify:true → a very concise receipt note fires NOW, when the message
+    // is received and dispatched — not after the task completes.
+    if (d.notify) {
+      const snippet = String(msg.Content || msg.content || '').split('\n')[0].trim().slice(0, 100)
+      wsSend({ cmd: 'send-text', to: 'filehelper', content: `📨 ${name}: ${snippet}` })
+    }
+
     const spawnTask = () => new Promise((resolve) => {
       let stdout = ''
       const child = spawn('/bin/sh', ['-c', cmdline], { cwd: base, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] })
@@ -369,8 +377,6 @@ function makeDispatcher({ wsSend, onEscalation }) {
           log('result', label, JSON.stringify(result || { status: 'addressed (no JSON)' }))
           if (result && result.status === 'escalated' && !isOrch) {
             onEscalation(name, String(result.question || '(no question given)'))
-          } else if (d.notify) {
-            await wsSend({ cmd: 'send-text', to: 'filehelper', content: `✅ ${d.name} finished for ${name}:\n${tail.slice(0, 800)}` })
           }
         }
         return { code, stdout }
