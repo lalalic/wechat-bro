@@ -14,9 +14,8 @@
  *   contacts: [Alice]         # dedicated routing — exact contact names
  *   contacts-assistant: [Bob] # dedicated routing in ASSISTANT mode
  *   type: contact             # contact | room | orchestrator (fallback class)
- *   harness: pi               # pi (built-in) or a shell template with {task}
- *   provider: anthropic       # optional → pi --provider
- *   model: sonnet             # optional → pi --model
+ *   harness: pi               # pi (default) or a shell command template
+ *                             # with {var} placeholders — see below
  *   session-id: wechat-alice  # default: wechat-<sanitized contact>
  *   session-dir: ~/.wechat-bro/contacts/Alice/session
  *   cwd: ~/.wechat-bro/contacts/Alice
@@ -28,6 +27,23 @@
  * Dispatch avoids long argv (EDR kills >1KB command lines): the message is
  * written to a task file referenced as `@<file>` (pi) / `{task}` (template),
  * and the agent body is a symlink, never an argument.
+ *
+ * Harness templates: `harness:` (and the --harness CLI flag) is a shell
+ * command run via /bin/sh -c. `{var}` placeholders are substituted with
+ * shell-quoted values, so each harness declares its own session-history and
+ * task-input conventions instead of the orchestrator hardcoding them:
+ *   {task}         task file name relative to the task cwd (pi: `@{task}`)
+ *   {task-path}    absolute path of the task file
+ *   {session-dir}  session history directory (absolute)
+ *   {session-id}   session id (harness resumes <session-dir>/<session-id>)
+ *   {cwd}          task working directory (absolute)
+ *   {contact}      contact/chat this dispatch serves
+ *   {name}         agent name
+ *   {timeout}      dispatch timeout in seconds (frontmatter `timeout:`)
+ * `harness: pi` (or unset) picks the built-in pi command line (thinking off,
+ * no skills). There are no provider/model/thinking/skills frontmatter keys —
+ * a harness wanting different flags writes its own template. `${VAR}` shell
+ * forms are NOT substituted; unknown placeholders are left verbatim.
  */
 
 'use strict'
@@ -39,8 +55,8 @@ const { spawn } = require('child_process')
 const WebSocket = require('ws')
 
 const DATA_DIR = process.env.WECHAT_BRO_DATA_DIR || path.join(os.homedir(), '.wechat-bro')
-// Package-bundled agent mds live next to the pi subagents (single source).
-const PKG_AGENTS_DIR = path.join(__dirname, '..', 'skills', 'wechat-bro', '.pi', 'agents')
+// Package-bundled agent mds live in the skill's own agents/ dir.
+const PKG_AGENTS_DIR = path.join(__dirname, '..', 'skills', 'wechat-bro', 'agents')
 
 function log(...args) {
   process.stderr.write(`[orchestrator] ${args.join(' ')}\n`)
@@ -85,19 +101,25 @@ function parseFrontmatter(text) {
 
 function loadAgentFile(p) {
   const { data, body } = parseFrontmatter(fs.readFileSync(p, 'utf8'))
-  if (!data.name) data.name = path.basename(p).replace(/\.agent\.md$/, '')
+  if (!data.name) data.name = path.basename(p).replace(/\.agent\.md$|\.md$/, '')
   return { path: p, data, body }
 }
 
 function listAgentMds(dir) {
-  try { return fs.readdirSync(dir).filter(f => f.endsWith('.agent.md')).map(f => path.join(dir, f)) } catch { return [] }
+  try {
+    return fs.readdirSync(dir)
+      .filter(f => f.endsWith('.md') && !/^(README|\.)/i.test(f))
+      .map(f => path.join(dir, f))
+  } catch { return [] }
 }
 
 /**
- * Load agent mds. The skill's own dir (PKG_AGENTS_DIR — shipped inside the
- * installed package) is the PRIMARY source; `~/.wechat-bro/agents/` is an
- * OPTIONAL user overlay (wins by `name`). No seeding: in a user env the
- * skill is installed, so defaults always exist without touching ~/.wechat-bro.
+ * Load agent mds. The skill's own agents/ dir (PKG_AGENTS_DIR — shipped
+ * inside the installed package) is the PRIMARY source; `~/.wechat-bro/agents/`
+ * is an OPTIONAL user overlay (wins by `name`). Plain `.md` files (legacy
+ * `.agent.md` still accepted); README/hidden files ignored. No seeding: in a
+ * user env the skill is installed, so defaults always exist without touching
+ * ~/.wechat-bro.
  */
 function loadAgents(userDir = path.join(DATA_DIR, 'agents')) {
   const agents = new Map()
@@ -182,12 +204,15 @@ function renderTask(msg, extra, opts = {}) {
   ]
   if (assistant && !recordOnly) {
     lines.push('',
-      '**ASSISTANT MODE** — the sender is explicitly talking to the AI assistant. Drop the maintainer persona: answer directly, honestly and helpfully as a capable AI assistant (you MAY say you are an assistant bot). **Your reply MUST start with the bot emoji 🤖**.',
+      `**ASSISTANT MODE** — this message is addressed to the AI assistant${msg.from === 'me' ? ' by the account owner' : ''}. Drop the maintainer persona: answer directly, honestly and helpfully as a capable AI assistant (you MAY say you are an assistant bot). **Your reply MUST start with the bot emoji 🤖**.`,
       '')
   }
   if (recordOnly) {
+    const why = msg.from === 'me'
+      ? 'this message was sent by the account owner (`me`) in a chat handled by the maintainer persona'
+      : 'this contact is assistant-managed, but this message did NOT ping the assistant (no `?!`)'
     lines.push('',
-      '**CONTEXT-ONLY MESSAGE** — this contact is assistant-managed, but this message did NOT ping the assistant (no `?!`). Do NOT reply to it. Silently absorb it as context (update memory.md if it carries something durable) and end with `{"status":"ignored"}`.',
+      `**CONTEXT-ONLY MESSAGE** — ${why}. Do NOT reply to it. Silently absorb it as context (update memory.md if it carries something durable) and end with \`{"status":"ignored"}\`.`,
       '')
   }
   if (assistant && !recordOnly && msg.from !== 'me') {
@@ -214,18 +239,35 @@ function ensureAgentsMd(cwd, agentPath) {
   try { fs.symlinkSync(agentPath, dst) } catch { fs.copyFileSync(agentPath, dst) }
 }
 
-/** Build argv for the built-in `pi` harness. Tasks are self-contained (the
- *  agent md inlines the only wechat-bro command they need), so skill
- *  discovery is OFF by default — set `skills: true` in frontmatter to opt in.
- *  Thinking also defaults to OFF (`thinking:` overrides). */
-function piArgs(d, taskRef) {
-  const args = ['-p', '--session-dir', d.sessionDir, '--session-id', d.sessionId]
-  if (d.provider) args.push('--provider', d.provider)
-  if (d.model) args.push('--model', d.model)
-  args.push('--thinking', d.thinking || 'off')
-  if (d.skills !== 'true' && d.skills !== true) args.push('--no-skills')
-  args.push('@' + taskRef)
-  return args
+/** POSIX-quote a value for safe interpolation into a shell command line. */
+function shellQuote(s) {
+  s = String(s)
+  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(s) ? s : `'` + s.replace(/'/g, `'\\''`) + `'`
+}
+
+/** The built-in `pi` command line, expressed as a template: pi's own flags
+ *  (thinking off, no skills) are baked in — provider/model/thinking/skills
+ *  are NOT frontmatter keys; a harness wanting different flags writes its own
+ *  template. Everything the dispatch fills per message stays a placeholder. */
+function defaultHarness() {
+  return 'pi -p --session-dir {session-dir} --session-id {session-id} --thinking off --no-skills @{task}'
+}
+
+/** Values for the `{var}` placeholders of a harness template. */
+function harnessVars(d, { task, taskPath, contact, timeoutS }) {
+  return {
+    task, 'task-path': taskPath,
+    'session-dir': d.sessionDir, 'session-id': d.sessionId,
+    cwd: d.cwd, contact, name: d.name,
+    timeout: String(timeoutS),
+  }
+}
+
+/** Substitute `{var}` placeholders with shell-quoted values. Unknown keys and
+ *  `${VAR}` shell forms are left untouched. */
+function renderHarness(template, vars) {
+  return String(template).replace(/(?<!\$)\{([\w-]+)\}/g, (whole, key) =>
+    Object.prototype.hasOwnProperty.call(vars, key) ? shellQuote(vars[key]) : whole)
 }
 
 /**
@@ -281,6 +323,7 @@ function makeDispatcher({ wsSend, onEscalation }) {
     d.sessionId = isOrch
       ? 'wechat-orchestrator'
       : (d['session-id'] || `wechat-${sanitizeFsName(name)}`)
+    d.cwd = base
     fs.mkdirSync(base, { recursive: true })
     fs.mkdirSync(d.sessionDir, { recursive: true })
     ensureAgentsMd(base, agent.path)
@@ -288,9 +331,15 @@ function makeDispatcher({ wsSend, onEscalation }) {
     const taskFile = path.join(base, `.task-${Date.now()}.md`)
     fs.writeFileSync(taskFile, renderTask(msg, extra, opts))
 
-    const harness = d.harness || 'pi'
-    const timeoutMs = (parseInt(d.timeout, 10) || 900) * 1000
+    // `pi` (or unset) → built-in template; anything else is the user's own
+    // command template. All templates run via /bin/sh with {var} substitution.
+    const tpl = !d.harness || d.harness === 'pi' ? defaultHarness() : d.harness
+    const timeoutS = parseInt(d.timeout, 10) || 900
+    const timeoutMs = timeoutS * 1000
     const taskRef = path.basename(taskFile)
+    const cmdline = renderHarness(tpl, harnessVars(d, {
+      task: taskRef, taskPath: taskFile, contact: name, timeoutS,
+    }))
 
     const label = `${d.name} ← ${name}`
     log('dispatch', label, d.sessionId)
@@ -298,10 +347,7 @@ function makeDispatcher({ wsSend, onEscalation }) {
 
     const spawnTask = () => new Promise((resolve) => {
       let stdout = ''
-      const opts = { cwd: base, env: process.env }
-      const child = harness === 'pi'
-        ? spawn('pi', piArgs(d, taskRef), { ...opts, stdio: ['ignore', 'pipe', 'pipe'] })
-        : spawn('/bin/sh', ['-c', harness.replace(/\{task\}/g, JSON.stringify(taskRef))], { ...opts, stdio: ['ignore', 'pipe', 'pipe'] })
+      const child = spawn('/bin/sh', ['-c', cmdline], { cwd: base, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] })
       const timer = setTimeout(() => { log('timeout', label); child.kill('SIGKILL') }, timeoutMs)
       child.stdout.on('data', c => { stdout += c })
       child.stderr.on('data', c => { stdout += c })
@@ -456,28 +502,42 @@ async function runOrchestrator({ port = 9231, agentsDir, harness } = {}) {
     const msgTs = data.ts ? (data.ts < 1e12 ? data.ts * 1000 : data.ts) : msg.ts
     if (msgTs && msgTs < startedAt) return log('  dropped: replayed (older than startup)')
 
-    // Account owner → filehelper: ALWAYS answered, in assistant mode.
-    // A pending escalation routes the reply into that contact's session
-    // (recorded as history); anything else is general guidance for the
-    // orchestrator agent.
+    // Account owner's messages: → filehelper is ALWAYS answered in assistant
+    // mode (a pending escalation routes the reply into that contact's
+    // session). → any other watched chat: assistant-managed contacts get an
+    // open assistant reply (assistant mode answers ANYONE, `me` included);
+    // maintainer-managed contacts only RECORD the owner's message in their
+    // session for context — never replied, `{"status":"ignored"}`.
     if (data.from === 'me') {
-      if (data.to !== 'filehelper') return
+      if (data.to !== 'filehelper' && !watch.has(data.to)) return
       agents = loadAgents(agentsDir)
       if (cliHarness) for (const a of agents) a.data.harness = cliHarness
-      if (pendingEscalations.size > 0) {
-        const [contact, question] = pendingEscalations.entries().next().value
-        pendingEscalations.delete(contact)
-        const routed = routeAgent(agents, contact, await isRoomContact(ws, roomCache, contact))
-        if (routed) {
-          log('escalation reply →', contact)
-          const extra = `The account owner is replying to your earlier escalation about: "${question}"\nThe owner's answer: "${String(data.Content || data.content || '')}"\nDeliver the answer to the contact via wechat-bro (their words, natural tone, no bot emoji), and update memory.md/rules.md if the answer settles a standing question. End with the JSON result line as usual.`
-          dispatch(routed.agent, data, extra, { assistant: false, recordOnly: false }, contact)
-          return
+      if (data.to === 'filehelper') {
+        if (pendingEscalations.size > 0) {
+          const [contact, question] = pendingEscalations.entries().next().value
+          pendingEscalations.delete(contact)
+          const routed = routeAgent(agents, contact, await isRoomContact(ws, roomCache, contact))
+          if (routed) {
+            log('escalation reply →', contact)
+            const extra = `The account owner is replying to your earlier escalation about: "${question}"\nThe owner's answer: "${String(data.Content || data.content || '')}"\nDeliver the answer to the contact via wechat-bro (their words, natural tone, no bot emoji), and update memory.md/rules.md if the answer settles a standing question. End with the JSON result line as usual.`
+            dispatch(routed.agent, data, extra, { assistant: false, recordOnly: false }, contact)
+            return
+          }
+          log('no agent for escalation contact', contact, '— falling back to orchestrator')
         }
-        log('no agent for escalation contact', contact, '— falling back to orchestrator')
+        if (orchestratorAgent(agents)) dispatch(orchestratorAgent(agents), data, null, { assistant: true })
+        else log('no orchestrator agent — cannot handle filehelper message')
+        return
       }
-      if (orchestratorAgent(agents)) dispatch(orchestratorAgent(agents), data, null, { assistant: true })
-      else log('no orchestrator agent — cannot handle filehelper message')
+      const routed = routeAgent(agents, data.to, await isRoomContact(ws, roomCache, data.to))
+      if (!routed) { log('no agent for', data.to, '— skipping own message'); return }
+      const extra = data.type && data.type !== 'text'
+        ? 'Non-text message: `content` holds the useful representation (file path for media, URL for emoji, text otherwise).'
+        : null
+      log(routed.assistant ? 'own message → assistant reply in' : 'own message → context-only into', data.to)
+      dispatch(routed.agent, data, extra, routed.assistant
+        ? { assistant: true, recordOnly: false }
+        : { assistant: false, recordOnly: true }, data.to)
       return
     }
     if (!watch.has(data.from)) return
@@ -532,5 +592,6 @@ async function runOrchestrator({ port = 9231, agentsDir, harness } = {}) {
 module.exports = {
   parseFrontmatter, loadAgents, loadAgentFile, watchList, routeAgent,
   orchestratorAgent, renderTask, ensureAgentsMd, sanitizeFsName, contactList,
-  parseTaskResult, piArgs, runOrchestrator, flagValue, DATA_DIR,
+  parseTaskResult, shellQuote, defaultHarness, harnessVars, renderHarness,
+  runOrchestrator, flagValue, DATA_DIR,
 }

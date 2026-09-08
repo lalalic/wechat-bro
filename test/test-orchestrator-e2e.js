@@ -8,10 +8,12 @@
  *
  *   1. watched-contact message  → routed to the dedicated agent, task file
  *      rendered, AGENTS.md symlinked into the contact root, harness template
- *      executed with {task}
+ *      executed with {task} + {session-id}/{contact} variables expanded
  *   2. me → filehelper guidance → routed to the orchestrator agent in the
  *      data-dir root
  *   3. unwatched contact        → no dispatch
+ *   8. me → maintainer-managed contact → context-only record into that session
+ *   9. me → assistant-managed contact → assistant mode reply
  *
  * The harness is a `cat {task} > <out>` shell template, so the rendered task
  * file survives the orchestrator's post-dispatch cleanup and can be asserted.
@@ -72,12 +74,13 @@ const agentsDir = path.join(tmpDir, 'agents')
 fs.mkdirSync(agentsDir, { recursive: true })
 const out1 = path.join(tmpDir, 'task-alice.md')
 const out2 = path.join(tmpDir, 'task-orchestrator.md')
+const meta1 = path.join(tmpDir, 'meta-alice.txt')
 fs.writeFileSync(path.join(agentsDir, 'wechat-alice.agent.md'), `---
 name: wechat-alice
 description: e2e dedicated agent
 contacts: [Alice]
 type: contact
-harness: cat {task} > ${JSON.stringify(out1)}
+harness: cat {task} > ${JSON.stringify(out1)} && echo {session-id} {contact} > ${JSON.stringify(meta1)}
 cwd: ${path.join(tmpDir, 'contacts', 'Alice')}
 ---
 Alice-specific body.
@@ -144,6 +147,8 @@ async function main() {
   ok(fs.existsSync(ag) && fs.readlinkSync(ag).endsWith('wechat-alice.agent.md'), 'e2e: AGENTS.md symlinked into contact root')
   ok(fs.existsSync(path.join(tmpDir, 'contacts', 'Alice', 'session')), 'e2e: session dir created in contact root')
   ok(!fs.existsSync(path.join(tmpDir, 'contacts', 'Alice', '.task-')), 'e2e: task file cleaned up after dispatch')
+  const meta = fs.existsSync(meta1) ? fs.readFileSync(meta1, 'utf8') : ''
+  ok(meta.includes('wechat-Alice') && meta.includes('Alice'), 'e2e: harness template {session-id} and {contact} variables expanded')
 
   // 1b. `?!` in a contact message = explicit assistant ping → assistant mode
 broadcast('message', { from: 'Alice', to: 'me', type: 'text', Content: '你能帮我写周报吗?!', ts: Date.now() })
@@ -209,6 +214,31 @@ broadcast('message', { from: 'Alice', to: 'me', type: 'text', Content: '你能�
     ok(t.includes('ASSISTANT MODE') && !t.includes('CONTEXT-ONLY MESSAGE'), 'e2e: assistant-managed contact, ?! ping → assistant mode')
   } else {
     ok(false, 'e2e: assistant-managed ping dispatched')
+  }
+
+  // 8. me → maintainer-managed contact: recorded context-only in the
+  // contact's session (request: maintain mode records the owner's messages)
+  broadcast('message', { from: 'me', to: 'Alice', type: 'text', Content: '帮我留意下她的项目进度', ts: Date.now() })
+  await sleep(1500)
+  if (fs.existsSync(out1)) {
+    const t = fs.readFileSync(out1, 'utf8')
+    ok(t.includes('CONTEXT-ONLY MESSAGE') && t.includes('account owner'), 'e2e: me → maintainer chat recorded context-only (owner wording)')
+    ok(!t.includes('ASSISTANT MODE'), 'e2e: me → maintainer chat does NOT trigger assistant mode')
+    ok(fs.existsSync(meta1), 'e2e: own message dispatched into contact session (template re-ran)')
+  } else {
+    ok(false, 'e2e: own message to maintainer contact dispatched')
+  }
+
+  // 9. me → assistant-managed contact: the assistant answers the owner too
+  // (request: assistant mode responds to anyone's message, including me)
+  broadcast('message', { from: 'me', to: 'Carol', type: 'text', Content: '提醒我下午三点开会', ts: Date.now() })
+  await sleep(1500)
+  if (fs.existsSync(out4)) {
+    const t = fs.readFileSync(out4, 'utf8')
+    ok(t.includes('ASSISTANT MODE') && t.includes('account owner'), 'e2e: me → assistant-managed chat gets ASSISTANT MODE reply')
+    ok(!t.includes('CONTEXT-ONLY MESSAGE'), 'e2e: me → assistant-managed chat is not record-only')
+  } else {
+    ok(false, 'e2e: own message to assistant-managed contact dispatched')
   }
 
   child.kill('SIGTERM')

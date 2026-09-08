@@ -254,8 +254,8 @@ missing).  Response includes a `files` array:
 One **`wechat-orchestrator`** manages the whole WeChat account. It talks to the
 account user via **`filehelper`**, listens to message events for a configured
 **watch list** of contacts, and dispatches each conversation to that contact's
-own agent task. The spec below is harness-agnostic — pi, codex, claude code,
-copilot … each implement it with their own primitives (see Harness Mapping).
+own agent task. The spec below is harness-agnostic — codex, claude code,
+copilot … each implement it with their own primitives (see Harness).
 
 ```
 contact msg ──ws──▶ orchestrator ──watched?──▶ contact agent task ──send-text──▶ contact
@@ -302,8 +302,8 @@ An agent md takes effect **only when the orchestrator injects it at dispatch** �
 no harness auto-loads it. Selection per contact: `wechat-<contact>.md` if it
 exists, else the room/individual default by `isRoomContact`. Injection options:
 
-- pass its contents as the system prompt of the dispatched task (pi: `--append-system-prompt "$(cat ~/.wechat-bro/agents/<chosen>.md)"`)
-- or symlink/copy it to `AGENTS.md` inside the contact's root folder — harnesses with cwd context-file discovery (pi, claude code) then load it automatically because dispatch sets cwd to the contact root.
+- pass its contents as the system prompt of the dispatched task (`$(cat <agent-md>)` in your harness template)
+- or let the orchestrator symlink it to `AGENTS.md` inside the contact's root folder — done automatically at dispatch, so harnesses with cwd context-file discovery (claude code, codex …) load it without any flag.
 
 Rules for both:
 
@@ -321,13 +321,13 @@ The orchestrator ships as a command — no glue code needed:
 npx wechat-bro orchestrator   # daemon must be running (wechat-bro --daemon)
 ```
 
-It connects to the daemon as a WebSocket client and loads `*.agent.md` files
-from the **skill's own `agents/` dir** (shipped inside the installed package —
-works with zero setup). `~/.wechat-bro/agents/` is an optional user overlay
-(wins by `name`); nothing is seeded there. Agent mds are reloaded on every
-incoming message, so edits apply immediately. Flags: `--agents-dir <dir>`
-(additional overlay), `--harness <cmd-template>` (override every agent's
-harness), `--port <port>`.
+It connects to the daemon as a WebSocket client and loads `*.md` agent files
+(legacy `.agent.md` still accepted) from the **skill's own `agents/` dir**
+(shipped inside the installed package — works with zero setup).
+`~/.wechat-bro/agents/` is an optional user overlay (wins by `name`); nothing
+is seeded there. Agent files are reloaded on every incoming message, so edits
+apply immediately. Flags: `--agents-dir <dir>` (additional overlay),
+`--harness <cmd-template>` (override every agent's harness), `--port <port>`.
 
 Agent md frontmatter configures each task (body = agent system prompt):
 
@@ -338,11 +338,9 @@ description: ...
 contacts: [Alice]             # dedicated routing — exact contact names (maintainer mode, default)
 contacts-assistant: [Bob]     # dedicated routing in ASSISTANT mode — AI answers ping-style
 type: contact                 # contact | room | orchestrator (fallback class)
-harness: pi                   # pi (built-in) or shell template with {task}
-provider: anthropic           # optional → pi --provider
-model: sonnet                 # optional → pi --model
-thinking: off                 # default off; off|minimal|low|…|max
-skills: false                 # default off → pi --no-skills; true = allow skill discovery
+harness: <cli> … {task}       # shell command template with {task} {session-id}
+                              # {session-dir} {cwd} {contact} {name} {timeout} —
+                              # every harness flag lives IN the template
 session-id: wechat-alice      # default: wechat-<sanitized contact>
 session-dir: ~/.wechat-bro/contacts/Alice/session
 cwd: ~/.wechat-bro/contacts/Alice
@@ -360,10 +358,14 @@ Routing: `me → filehelper` messages go to the `type: orchestrator` agent in
 **assistant mode** (always answered, replies prefixed 🤖); contact messages
 match a dedicated `contacts-assistant:` agent first, then a dedicated
 `contacts:` agent, then the unrestricted `type: contact` / `type: room`
-default. Watch list = union of all `contacts:` + `contacts-assistant:`. Per contact, dispatch writes the message to a task file, symlinks
+default. Watch list = union of all `contacts:` + `contacts-assistant:`. The
+owner's own messages to a watched contact dispatch too: assistant-managed
+contacts **answer the owner** (assistant mode responds to anyone, `me`
+included), maintainer-managed contacts silently **record** the message in
+that contact's session as context — never replied. Per contact, dispatch writes the message to a task file, symlinks
 the chosen agent md as `AGENTS.md` in the contact's root (the harness cwd),
-and runs the harness headless with a resumable session
-(`pi -p --session-dir <dir> --session-id <id> --thinking off @task.md`). A
+and runs the rendered harness template headless — one invocation per message,
+the session resumed via the template's own session flags. A
 task is never run concurrently with itself; failures are reported to
 `filehelper`.
 
@@ -388,9 +390,13 @@ contact:
 - `contacts-assistant: [Bob]` → assistant-managed: every message dispatches
   as assistant, but **only `?!` pings get replies** (open, 🤖); ordinary
   messages are **context-only** — recorded in the session, never answered
-  (`{"status":"ignored"}`).
+  (`{"status":"ignored"}`). Exception: the **owner's own** messages in Bob's
+  chat are always answered (assistant mode responds to anyone, `me` included).
 - `filehelper` → always assistant (never record-only). The orchestrator
   agent declares it via `contacts-assistant: [filehelper]`.
+- **Owner's messages in maintainer-managed chats** → recorded context-only
+  into that contact's session (`{"status":"ignored"}`) so the maintainer
+  persona keeps the full picture without ever answering as an AI.
 
 A contact declared in both lists resolves to assistant. To monitor a contact
 with no dedicated agent md, just list it under `contacts:` in any agent md —
@@ -400,8 +406,7 @@ the type default (individual/room maintainer) handles it in maintainer mode.
 
 Tasks are **self-contained**: the agent md (symlinked `AGENTS.md`) inlines the
 only wechat-bro command a task needs (`send-text` via stdin pipe) — tasks do
-**not** load the full wechat-bro skill protocol. pi dispatches run with
-`--no-skills` unless an agent opts in with `skills: true`.
+**not** load the full wechat-bro skill protocol.
 
 ### Task result contract
 
@@ -421,18 +426,35 @@ the orchestrator reports to the owner via `filehelper` in a fixed format
 into that contact's session — recorded in the contact's history, delivered to
 the contact, and settleable into `rules.md`/`memory.md`.
 
-### Harness mapping
+### Harness
 
 Per-contact tasks run through **each harness's own CLI in headless mode** — one
 invocation per message batch, session resumed each time, working directory set
-to the contact's root folder so all relative reads/writes stay inside it:
-
-| concept | pi | other harnesses |
-|---|---|---|
-| message listener | extension holding the WS client (reference: `@lalalic/channel`) | hook / small script on `ws://localhost:9231` |
-| per-contact task | `pi -p --append-system-prompt "$(cat <agent-md>)" --session-dir <contact>/session --session <contact-id> "<msg + ctx>"` (or `<agent-md>` symlinked as `AGENTS.md` in contact root) | own CLI one-shot, e.g. `claude -p --agents`/`--resume <id>`, `codex exec resume` |
-| dedicated session | `--session <contact-id>` + `--session-dir <contact>/session` | harness-native `--resume` / session id, one per contact |
-| rules & memory | plain files under `~/.wechat-bro/` injected into the prompt | same files, same contract |
+to the contact's root folder so all relative reads/writes stay inside it.
 
 Dispatch contract (any harness): non-interactive one-shot mode, resumable
-session stored under the contact's `session/`, cwd = contact root.
+session stored under the contact's `session/`, cwd = contact root. There are
+no provider/model/thinking/skills frontmatter keys — every such flag lives
+straight in your template.
+
+`harness:` (frontmatter, or the `--harness` flag to override every agent) is a
+shell command template run via `/bin/sh -c`; `{var}` placeholders are
+substituted with shell-quoted values:
+
+| placeholder | value |
+|---|---|
+| `{task}` | task file name relative to the task cwd |
+| `{task-path}` | absolute task file path |
+| `{session-dir}` / `{session-id}` | where the harness stores/resumes that contact's history |
+| `{cwd}` | task working directory (the contact root) |
+| `{contact}` / `{name}` | chat being served / agent name |
+| `{timeout}` | dispatch timeout in seconds (frontmatter `timeout:`) |
+
+Example templates:
+
+```markdown
+harness: claude -p --session-id {session-id} --append-system-prompt "$(cat AGENTS.md)" < {task}
+harness: codex exec resume {session-id} < {task-path}
+```
+
+`${VAR}` shell forms and unknown placeholders are left untouched.

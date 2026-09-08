@@ -1,6 +1,6 @@
 {
   "name": "wechat-bro",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "AI agent interface for WeChat Web — send/receive messages, manage contacts, upload media, transcribe voice",
   "type": "commonjs",
   "bin": {
@@ -23,11 +23,6 @@
   "dependencies": {
     "puppeteer": "^25.4.0",
     "ws": "^8.21.1"
-  },
-  "pi":{
-    "skills": ["./skills/"],
-    "extensions": ["./skills/wechat-bro/.pi/extensions/"],
-    "subagents": {"agents": ["./skills/wechat-bro/.pi/agents/"], "chains": ["./skills/wechat-bro/.pi/chains/"]}
   },
   "repository": {
     "type": "git",

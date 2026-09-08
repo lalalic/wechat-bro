@@ -115,6 +115,15 @@ ok(task.includes('**Alice**') && task.includes('"Content": "hi"'), 'renderTask: 
 const task2 = m.renderTask({ from: 'Dev Team', sender: 'Alice', type: 'image' }, 'media note')
 ok(task2.includes('sender: Alice') && task2.includes('media note'), 'renderTask: room sender + extra note')
 
+// me-sender modes: assistant chat answers the owner, maintainer chat records
+const taskMeAssistant = m.renderTask({ from: 'me', to: 'Carol', type: 'text', Content: 'hi' }, null, { assistant: true, recordOnly: false })
+ok(taskMeAssistant.includes('ASSISTANT MODE') && taskMeAssistant.includes('account owner'), 'renderTask: me → assistant chat gets ASSISTANT MODE (owner addressed)')
+ok(!taskMeAssistant.includes('Assistant-ping protocol'), 'renderTask: me → assistant chat has no ping-only restriction')
+const taskMeRecord = m.renderTask({ from: 'me', to: 'Bob', type: 'text', Content: 'note' }, null, { assistant: false, recordOnly: true })
+ok(taskMeRecord.includes('CONTEXT-ONLY MESSAGE') && taskMeRecord.includes('account owner'), 'renderTask: me → maintainer chat recorded context-only')
+const taskContactRecord = m.renderTask({ from: 'Carol', to: 'me', type: 'text', Content: 'hi' }, null, { assistant: true, recordOnly: true })
+ok(taskContactRecord.includes('CONTEXT-ONLY MESSAGE') && taskContactRecord.includes('?!'), 'renderTask: non-ping contact message keeps assistant-managed wording')
+
 // ── ensureAgentsMd ────────────────────────────────────────────────────────
 console.log('# ensureAgentsMd')
 const cwd = path.join(tmpDir, 'contacts', 'Alice')
@@ -143,13 +152,21 @@ ok(m.parseTaskResult('{"status":"bogus"}') === null, 'result: unknown status →
 ok(m.parseTaskResult('') === null, 'result: empty stdout → null')
 ok(m.parseTaskResult('done\n{bad json}\n{"status":"ignored"}').status === 'ignored', 'result: skips malformed line')
 
-// ── piArgs (skills off by default, opt-in) ────────────────────────────────
-console.log('# piArgs')
-const d0 = { sessionDir: '/s', sessionId: 'wechat-x' }
-ok(m.piArgs(d0, 't.md').includes('--no-skills'), 'piArgs: --no-skills by default')
-ok(m.piArgs({ ...d0, skills: 'true' }, 't.md').includes('--no-skills') === false, 'piArgs: skills:true opts in')
-ok(m.piArgs(d0, 't.md').includes('--thinking') && m.piArgs({ ...d0, thinking: 'low' }, 't.md').includes('low'), 'piArgs: thinking default off, overridable')
-ok(m.piArgs(d0, 't.md').slice(-1)[0] === '@t.md', 'piArgs: task file referenced via @ (no inline content)')
+// ── harness templates (defaultHarness / harnessVars / renderHarness) ─────
+console.log('# harness templates')
+const d0 = { sessionDir: '/s', sessionId: 'wechat-x', cwd: '/c', name: 'wechat-x' }
+ok(m.defaultHarness().includes('--session-dir {session-dir}') && m.defaultHarness().includes('--session-id {session-id}'), 'defaultHarness: session vars wired via placeholders')
+ok(m.defaultHarness().includes('--thinking off') && m.defaultHarness().includes('--no-skills'), 'defaultHarness: thinking/skills flags baked into template (no frontmatter keys)')
+ok(m.defaultHarness().trimEnd().endsWith('@{task}'), 'defaultHarness: task referenced via @{task} (no inline content)')
+
+const vars0 = m.harnessVars(d0, { task: 't.md', taskPath: '/c/t.md', contact: 'Alice', timeoutS: 900 })
+ok(m.renderHarness(m.defaultHarness(), vars0).includes('@t.md') && m.renderHarness(m.defaultHarness(), vars0).includes('--session-id wechat-x'), 'renderHarness: substitutes task + session-id')
+ok(m.renderHarness('{contact}|{timeout}', vars0) === 'Alice|900', 'renderHarness: contact + timeout vars')
+ok(m.shellQuote('my task.md') === "'my task.md'", 'shellQuote: quotes values with spaces')
+ok(m.renderHarness('run {task}', { task: 'a b.md' }) === "run 'a b.md'", 'renderHarness: shell-quotes unsafe values')
+ok(m.renderHarness('echo ${HOME} {task}', { task: 't.md' }).includes('${HOME}'), 'renderHarness: ${VAR} shell form left untouched')
+ok(m.renderHarness('x {unknown} y', {}) === 'x {unknown} y', 'renderHarness: unknown placeholder left verbatim')
+ok(m.shellQuote("it's") === "'it'\\''s'", 'shellQuote: escapes single quotes')
 
 // ── runOrchestrator arg plumbing (no daemon → should fail fast) ──────────
 console.log('# runOrchestrator (no daemon)')
