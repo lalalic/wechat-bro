@@ -20,8 +20,8 @@
  *   session-dir: ~/.wechat-bro/contacts/Alice/session
  *   cwd: ~/.wechat-bro/contacts/Alice
  *   timeout: 900              # seconds, default 900
- *   notify: true              # concise receipt note → filehelper when the
- *                             # message is dispatched (not on completion)
+ *   notify: true              # concise note → filehelper at dispatch, but
+ *                             # ONLY when the message needs a response
  *   ---
  *   <body> = agent system prompt; symlinked as AGENTS.md into the task cwd.
  *
@@ -41,8 +41,8 @@
  *   {contact}      contact/chat this dispatch serves
  *   {name}         agent name
  *   {timeout}      dispatch timeout in seconds (frontmatter `timeout:`)
- * `harness: pi` (or unset) picks the built-in pi command line (thinking off,
- * no skills). There are no provider/model/thinking/skills frontmatter keys —
+ * `harness: pi` (or unset) picks the built-in `npx pi` command line (thinking
+ * off, no skills). There are no provider/model/thinking/skills frontmatter keys —
  * a harness wanting different flags writes its own template. `${VAR}` shell
  * forms are NOT substituted; unknown placeholders are left verbatim.
  */
@@ -246,12 +246,13 @@ function shellQuote(s) {
   return /^[A-Za-z0-9_@%+=:,./-]+$/.test(s) ? s : `'` + s.replace(/'/g, `'\\''`) + `'`
 }
 
-/** The built-in `pi` command line, expressed as a template: pi's own flags
+/** The built-in `npx pi` command line, expressed as a template: pi's own flags
  *  (thinking off, no skills) are baked in — provider/model/thinking/skills
  *  are NOT frontmatter keys; a harness wanting different flags writes its own
- *  template. Everything the dispatch fills per message stays a placeholder. */
+ *  template. Everything the dispatch fills per message stays a placeholder.
+ *  `npx` (not bare `pi`) so a global pi install is never required. */
 function defaultHarness() {
-  return 'pi -p --session-dir {session-dir} --session-id {session-id} --thinking off --no-skills @{task}'
+  return 'npx pi -p --session-dir {session-dir} --session-id {session-id} --thinking off --no-skills @{task}'
 }
 
 /** Values for the `{var}` placeholders of a harness template. */
@@ -346,9 +347,11 @@ function makeDispatcher({ wsSend, onEscalation }) {
     log('dispatch', label, d.sessionId)
     const startedAt = Date.now()
 
-    // notify:true → a very concise receipt note fires NOW, when the message
-    // is received and dispatched — not after the task completes.
-    if (d.notify) {
+    // notify:true → a concise note fires NOW, when the message is received —
+    // but only when it NEEDS A RESPONSE: a real incoming message the persona
+    // handles or an assistant ping. Never for context-only recordings (no
+    // reply will happen) nor for the owner's own messages (they sent them).
+    if (d.notify && !isOrch && msg.from !== 'me' && !opts.recordOnly) {
       const snippet = String(msg.Content || msg.content || '').split('\n')[0].trim().slice(0, 100)
       wsSend({ cmd: 'send-text', to: 'filehelper', content: `📨 ${name}: ${snippet}` })
     }

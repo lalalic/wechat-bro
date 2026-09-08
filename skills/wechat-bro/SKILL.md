@@ -345,8 +345,9 @@ session-id: wechat-alice      # default: wechat-<sanitized contact>
 session-dir: ~/.wechat-bro/contacts/Alice/session
 cwd: ~/.wechat-bro/contacts/Alice
 timeout: 900                  # seconds
-notify: true                  # concise receipt note → filehelper at dispatch
-                              # time (not on completion)
+notify: true                  # concise note → filehelper at dispatch time,
+                              # only when the message needs a response (never
+                              # for context-only or the owner's own messages)
 ---
 Alice-specific instructions…
 ```
@@ -434,7 +435,9 @@ invocation per message batch, session resumed each time, working directory set
 to the contact's root folder so all relative reads/writes stay inside it.
 
 Dispatch contract (any harness): non-interactive one-shot mode, resumable
-session stored under the contact's `session/`, cwd = contact root. There are
+session stored under the contact's `session/`, cwd = contact root. An unset
+`harness:` falls back to the built-in `npx pi -p --session-dir {session-dir}
+--session-id {session-id} --thinking off --no-skills @{task}`. There are
 no provider/model/thinking/skills frontmatter keys — every such flag lives
 straight in your template.
 

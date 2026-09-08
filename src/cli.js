@@ -590,12 +590,12 @@ Modes:
                                Start the orchestrator (own long-lived process):
                                watch contacts declared in ~/.wechat-bro/agents/
                                *.md frontmatter and dispatch each message
-                               to a resumable harness CLI task (harness command
-                               template; built-in default when unset)
-                               rooted in the contact's own folder. User guidance
-                               arrives via filehelper. Falls back to package
-                               defaults for missing agent mds; edits apply on
-                               the next message.
+                               to a resumable harness CLI task (built-in
+                               default: npx pi -p ...; override every agent
+                               with --harness) rooted in the contact's own
+                               folder. User guidance arrives via filehelper.
+                               Falls back to package defaults for missing
+                               agent mds; edits apply on the next message.
 
 Commands:
   contacts                     List individual contacts (names only)

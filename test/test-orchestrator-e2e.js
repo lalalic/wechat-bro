@@ -80,6 +80,7 @@ name: wechat-alice
 description: e2e dedicated agent
 contacts: [Alice]
 type: contact
+notify: true
 harness: cat {task} > ${JSON.stringify(out1)} && echo {session-id} {contact} > ${JSON.stringify(meta1)}
 cwd: ${path.join(tmpDir, 'contacts', 'Alice')}
 ---
@@ -118,6 +119,7 @@ name: wechat-carol
 description: e2e assistant-managed contact
 contacts-assistant: [Carol]
 type: contact
+notify: true
 harness: cat {task} > ${JSON.stringify(out4)}
 cwd: ${path.join(tmpDir, 'contacts', 'Carol')}
 ---
@@ -138,6 +140,7 @@ async function main() {
   broadcast('message', { from: 'Alice', to: 'me', type: 'text', Content: 'hello there', ts: Date.now() })
   await sleep(1500)
   ok(fs.existsSync(out1), 'e2e: harness ran for watched contact (task captured)')
+  ok(sent.some(s => s.to === 'filehelper' && String(s.content).startsWith('📨 Alice:')), 'e2e: notify → receipt note at dispatch for response-needed message')
   if (fs.existsSync(out1)) {
     const t = fs.readFileSync(out1, 'utf8')
     ok(t.includes('"from": "Alice"') && t.includes('hello there'), 'e2e: task file contains message JSON')
@@ -174,7 +177,7 @@ broadcast('message', { from: 'Alice', to: 'me', type: 'text', Content: '你能�
   // 3. unwatched contact → no dispatch, no failure
   broadcast('message', { from: 'Stranger', to: 'me', type: 'text', Content: 'spam', ts: Date.now() })
   await sleep(800)
-  ok(sent.length === 0 && !fs.existsSync(path.join(tmpDir, 'contacts', 'Stranger')), 'e2e: unwatched contact ignored')
+  ok(!fs.existsSync(path.join(tmpDir, 'contacts', 'Stranger')) && !sent.some(s => String(s.content).includes('Stranger')), 'e2e: unwatched contact ignored')
 
   // 4. old replayed message ignored
   broadcast('message', { from: 'Alice', to: 'me', type: 'text', Content: 'old', ts: 1 })
@@ -206,6 +209,8 @@ broadcast('message', { from: 'Alice', to: 'me', type: 'text', Content: '你能�
   } else {
     ok(false, 'e2e: assistant-managed contact dispatched')
   }
+  const recordNotifies = sent.filter(s => s.to === 'filehelper' && String(s.content).startsWith('📨 Carol:')).length
+  ok(recordNotifies === 0, 'e2e: notify NOT sent for context-only (no response needed)')
   // 7b. ?! ping → ASSISTANT MODE
   broadcast('message', { from: 'Carol', to: 'me', type: 'text', Content: '?!帮我查下明天天气', ts: Date.now() })
   await sleep(1500)
@@ -215,6 +220,7 @@ broadcast('message', { from: 'Alice', to: 'me', type: 'text', Content: '你能�
   } else {
     ok(false, 'e2e: assistant-managed ping dispatched')
   }
+  ok(sent.filter(s => s.to === 'filehelper' && String(s.content).startsWith('📨 Carol:')).length === 1, 'e2e: notify sent for ?! ping (response needed)')
 
   // 8. me → maintainer-managed contact: recorded context-only in the
   // contact's session (request: maintain mode records the owner's messages)
@@ -240,6 +246,7 @@ broadcast('message', { from: 'Alice', to: 'me', type: 'text', Content: '你能�
   } else {
     ok(false, 'e2e: own message to assistant-managed contact dispatched')
   }
+  ok(sent.filter(s => s.to === 'filehelper' && String(s.content).startsWith('📨 Carol:')).length === 1, 'e2e: notify NOT sent for owner-originated message (still 1 from the ping)')
 
   child.kill('SIGTERM')
   wss.close()
