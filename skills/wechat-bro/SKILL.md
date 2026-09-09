@@ -321,6 +321,11 @@ The orchestrator ships as a command — no glue code needed:
 npx wechat-bro orchestrator   # daemon must be running (wechat-bro --daemon)
 ```
 
+`wechat-bro up` starts daemon + orchestrator detached, idempotently — the
+one command every start path uses. How it should start *in the future*
+(service, session hook, manual) is a decision, not an accident — see
+**Lifecycle & Startup Contract** at the end of this skill.
+
 It connects to the daemon as a WebSocket client and loads `*.md` agent files
 (legacy `.agent.md` still accepted) from the **skill's own `agents/` dir**
 (shipped inside the installed package — works with zero setup).
@@ -462,3 +467,148 @@ harness: codex exec resume {session-id} < {task-path}
 ```
 
 `${VAR}` shell forms and unknown placeholders are left untouched.
+## Lifecycle & Startup Contract
+
+Two long-lived processes make up a running system — both must **outlive any
+agent session**, because messages arrive 24/7 whether or not an agent is
+running:
+
+| process | command | holds |
+|---|---|---|
+| **daemon** | `wechat-bro --daemon` | headless Chrome + WeChat login, serves `ws://localhost:9231` |
+| **orchestrator** | `wechat-bro orchestrator` | watch list + dispatch loop (connects to the daemon, reconnects forever) |
+
+Never start them as ordinary foreground children of an agent session — they
+die with the session and the account goes deaf.
+
+### The idempotent anchor: `wechat-bro up` / `down`
+
+Every start path — agent, session hook, service manager, human — runs the
+same command. It probes, starts only what is missing, waits for the daemon's
+WebSocket, and reports one JSON line:
+
+```bash
+wechat-bro up                    # spawn daemon + orchestrator detached (skip ones already running)
+wechat-bro up --harness '<tpl>'  # same flags as `orchestrator` (--harness, --agents-dir, --port, --timeout)
+wechat-bro down                  # stop orchestrator, then daemon (graceful cookie flush)
+wechat-bro status                # login/contacts state — exit 0 = daemon alive
+```
+
+- Detached, with logs in `~/.wechat-bro/daemon.log` and `orchestrator.log`.
+- Both processes register `~/.wechat-bro/{daemon,orchestrator}.pid`, so
+  `down`/`up` find them even when a service manager started them.
+- `up` does not log in for anyone: on a first (or expired) session it
+  reports `loggedIn:false` and the daemon broadcasts a `scan` event — open
+  the QR URL (auto-popped in a browser) and scan with the phone. Later
+  restarts reuse saved cookies until WeChat expires them.
+- `up` is safe to run unconditionally at any time — already-running parts
+  are left untouched (a concurrent hook + manual start cannot double-spawn).
+
+### Choosing how it starts — the decision table
+
+When the user asks to "start the orchestrator", pick a start mode
+(deliberately, with the user — don't silently default to a foreground
+process that dies with your session):
+
+| mode | outlives your session | survives reboot | crash auto-restart | choose when |
+|---|---|---|---|---|
+| **detached** — `wechat-bro up` | ✅ | ❌ | ❌ | first run / trial (default) |
+| **background service** — launchd / systemd user units running `wechat-bro --daemon` + `wechat-bro orchestrator` | ✅ | ✅ | ✅ | always-on coverage — promote once the user confirms it works |
+| **agent session hook** — hook runs `wechat-bro up` at session start | starts on demand | ❌ | ❌ | wanted only while agents are active |
+| **manual** — user runs `wechat-bro up` themselves | ✅ | ❌ | ❌ | user prefers full control |
+
+Hook composes with everything: `wechat-bro up` is a fast no-op when
+nothing is missing, so an unconditional session-start hook costs ~0.1s.
+
+### Mode setup
+
+**Detached** — run `wechat-bro up`, verify `wechat-bro status` reports
+`loggedIn` / `contactsReady`, done.
+
+**Background service** — one service definition per process (start order
+doesn't matter: the orchestrator retries its connect). Resolve absolute
+paths first — service managers run with a minimal PATH:
+
+```bash
+WB=$(command -v wechat-bro)                 # e.g. /opt/homebrew/bin/wechat-bro
+CLI=$(dirname $(realpath "$WB"))/cli.js     # the real cli.js
+NODE=$(command -v node)
+```
+
+macOS launchd — `~/Library/LaunchAgents/com.wechat-bro.daemon.plist`
+(copy with `orchestrator` in ProgramArguments for the second one):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.wechat-bro.daemon</string>
+  <key>ProgramArguments</key><array>
+    <string>NODE</string><string>CLI</string><string>--daemon</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/USER/.wechat-bro/daemon.log</string>
+  <key>StandardErrorPath</key><string>/Users/USER/.wechat-bro/daemon.log</string>
+</dict></plist>
+```
+
+Load: `launchctl bootstrap gui/$(id -u) <plist>` (bootout to unload).
+
+Linux systemd — `~/.config/systemd/user/wechat-bro-daemon.service` (and
+`wechat-bro-orchestrator.service` with `ExecStart=… orchestrator`):
+
+```ini
+[Unit]
+Description=wechat-bro daemon
+[Service]
+ExecStart=NODE CLI --daemon
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=default.target
+```
+
+Enable: `systemctl --user enable --now wechat-bro-daemon
+wechat-bro-orchestrator` and `sudo loginctl enable-linger $USER` (without
+linger, user units die at logout).
+
+**Agent session hook** — wire `wechat-bro up` into the harness's
+session-start primitive. Claude Code example (`~/.claude/settings.json`):
+
+```json
+{ "hooks": { "SessionStart": [ { "hooks": [
+  { "type": "command", "command": "wechat-bro up" }
+] } ] } }
+```
+
+Any other harness implements the same contract with whatever session-start
+hook / startup instruction it has: shell out to `wechat-bro up`, ignore the
+JSON line on stdout.
+
+### Configure before starting (harness contract)
+
+The orchestrator dispatches contact tasks through a **harness template** —
+configure it for the agent CLI that will serve contacts BEFORE `up` (or at
+least before the first real message):
+
+1. Write `~/.wechat-bro/agents/wechat-orchestrator.md` (overlay wins over
+   the bundled defaults), declaring `contacts-assistant: [filehelper]` and
+   the current harness's template, e.g.
+   `harness: claude -p --session-id {session-id} … < {task}` — see Harness
+   above. Agent mds reload per incoming message, so edits apply live.
+2. Alternatively pass `wechat-bro up --harness '<template>'` to override
+   every agent's harness — this needs a restart (`down` + `up`) to change.
+
+### First-start runbook (what the agent does when asked to "start it")
+
+1. **Probe**: `wechat-bro status` — exit 0 means the daemon is alive.
+   Running `up` unconditionally is fine (idempotent).
+2. **Configure** the harness for the current agent (above) if not done.
+3. **Choose the start mode** with the user per the decision table — default
+   detached `up`; offer service promotion once the user confirms it works.
+4. **Start & verify**: `wechat-bro up` → `wechat-bro status` shows
+   `loggedIn`, `contactsReady`.
+5. **If `loggedIn:false`**: point the user at the QR URL the daemon popped
+   open; when login completes the daemon announces `✅✅✅✅✅` to
+   filehelper. Nothing is monitored until that scan happens.

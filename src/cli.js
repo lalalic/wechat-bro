@@ -328,7 +328,9 @@ function write(obj) {
 }
 
 function log(...args) {
-  if (QUIET) return
+  // WECHAT_BRO_LOG=1: detached (non-TTY) children spawned by `wechat-bro up`
+  // keep writing [cli] lines into their log file for debugging.
+  if (QUIET && !process.env.WECHAT_BRO_LOG) return
   process.stderr.write(`[cli] ${args.join(' ')}\n`)
 }
 
@@ -597,6 +599,13 @@ Modes:
                                Falls back to package defaults for missing
                                agent mds; edits apply on the next message.
 
+  up [--harness <tpl>] [--agents-dir <dir>] [--timeout <s>]
+                               Idempotent start: spawn daemon + orchestrator
+                               detached (logs in ~/.wechat-bro/*.log) unless
+                               already running, then wait for the WebSocket.
+                               The anchor for session hooks & services.
+  down                         Stop orchestrator, then daemon (graceful).
+
 Commands:
   contacts                     List individual contacts (names only)
   rooms                        List group chats (names only)
@@ -646,6 +655,25 @@ async function main() {
     const { runOrchestrator } = require('./orchestrator')
     await runOrchestrator({ port: WS_PORT })
     return
+  }
+
+  // `up` / `down` are LOCAL lifecycle verbs (like `orchestrator` and `exit`):
+  // idempotent start/stop of daemon + orchestrator. THE anchor for agent
+  // session hooks, launchd/systemd services and manual starts alike —
+  // see the Lifecycle & Startup Contract in skills/wechat-bro/SKILL.md.
+  if (firstPosArg === 'up' || firstPosArg === 'down') {
+    const { flagValue } = require('./orchestrator')
+    const { ensureUp, shutDown } = require('./lifecycle')
+    const res = firstPosArg === 'up'
+      ? await ensureUp({
+          port: WS_PORT,
+          harness: flagValue(argv, '--harness'),
+          agentsDir: flagValue(argv, '--agents-dir'),
+          timeoutMs: (parseInt(flagValue(argv, '--timeout') || '30', 10)) * 1000,
+        })
+      : await shutDown({ port: WS_PORT })
+    process.stdout.write(JSON.stringify({ ok: res.ok !== false, id: null, data: res }) + '\n')
+    process.exit(res.ok === false ? 1 : 0)
   }
 
   // `exit` is a shutdown command — it must NEVER spin up a new daemon.
@@ -703,6 +731,11 @@ async function main() {
   try {
     await ws.ready
     log(`WebSocket server: ws://localhost:${WS_PORT}`)
+    // Track the daemon in a pidfile so `wechat-bro down` finds it even when
+    // it was started by a launchd/systemd service instead of `up`.
+    const { writePid, clearPid } = require('./lifecycle')
+    writePid('daemon')
+    process.on('exit', () => clearPid('daemon'))
   } catch (e) {
     const msg = (e && (e.message || String(e))) || ''
     if ((e && e.code === 'EADDRINUSE') || /EADDRINUSE/.test(msg)) {

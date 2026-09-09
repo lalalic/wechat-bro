@@ -168,15 +168,26 @@ ok(m.renderHarness('echo ${HOME} {task}', { task: 't.md' }).includes('${HOME}'),
 ok(m.renderHarness('x {unknown} y', {}) === 'x {unknown} y', 'renderHarness: unknown placeholder left verbatim')
 ok(m.shellQuote("it's") === "'it'\\''s'", 'shellQuote: escapes single quotes')
 
-// ── runOrchestrator arg plumbing (no daemon → should fail fast) ──────────
+// ── runOrchestrator startup (no daemon → retries, never crashes) ─────────
+// The orchestrator keeps retrying its initial connect every 5s — service
+// managers (launchd/systemd) and `wechat-bro up` may legitimately start it
+// before the daemon is reachable. It must stay alive until SIGTERM.
 console.log('# runOrchestrator (no daemon)')
-m.runOrchestrator({ port: 59987 }).then(() => {
-  ok(false, 'runOrchestrator: should reject without a daemon')
-  finish()
-}).catch(() => {
-  ok(true, 'runOrchestrator: rejects fast when no daemon on port')
-  finish()
-})
+{
+  const { spawn: spawnProc } = require('child_process')
+  const child = spawnProc(process.execPath, [path.join(__dirname, '..', 'src', 'cli.js'), 'orchestrator', '--port', '59987'], {
+    env: { ...process.env, WECHAT_BRO_DATA_DIR: tmpDir },
+  })
+  let sawRetry = false, exited = null
+  child.stderr.on('data', (d) => { if (/retrying every 5s/.test(String(d))) sawRetry = true })
+  child.on('exit', (code) => { exited = code })
+  setTimeout(() => {
+    ok(sawRetry, 'runOrchestrator: logs retry when no daemon (instead of crashing)')
+    ok(exited === null, 'runOrchestrator: stays alive retrying without a daemon')
+    child.kill('SIGTERM')
+    child.on('exit', finish)
+  }, 7000)
+}
 
 function finish() {
   console.log(`\n${pass} passed, ${fail} failed`)

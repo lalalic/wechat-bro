@@ -54,6 +54,7 @@ const path = require('path')
 const os = require('os')
 const { spawn } = require('child_process')
 const WebSocket = require('ws')
+const { writePid, clearPid } = require('./lifecycle')
 
 const DATA_DIR = process.env.WECHAT_BRO_DATA_DIR || path.join(os.homedir(), '.wechat-bro')
 // Package-bundled agent mds live in the skill's own agents/ dir.
@@ -587,13 +588,24 @@ async function runOrchestrator({ port = 9231, agentsDir, harness } = {}) {
 
   const shutdown = () => {
     closed = true
+    clearPid('orchestrator')
     try { ws && ws.close() } catch {}
     process.exit(0)
   }
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
 
-  await start()
+  // Tracked from the very start so `wechat-bro down`/`up` find this process
+  // even when it was started by a service manager instead of `wechat-bro up`.
+  writePid('orchestrator')
+  // Initial connect retries like the reconnect path below — the daemon may
+  // still be booting (fresh `up`, service start order, Chromium download).
+  for (let attempt = 0; ; attempt++) {
+    try { await start(); break } catch (e) {
+      if (attempt === 0) log('daemon not reachable yet — retrying every 5s')
+      await new Promise(r => setTimeout(r, 5000))
+    }
+  }
   log('running — Ctrl-C to stop')
   setInterval(() => {}, 1 << 30) // keep the event loop alive
 }
