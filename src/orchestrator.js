@@ -63,7 +63,6 @@ const path = require('path')
 const os = require('os')
 const { spawn } = require('child_process')
 const WebSocket = require('ws')
-const { writePid, clearPid, probeDaemon } = require('./lifecycle')
 
 const DATA_DIR = process.env.WECHAT_BRO_DATA_DIR || path.join(os.homedir(), '.wechat-bro')
 // The ONE user agents dir. The skill's bundled agents/ (inside the installed
@@ -74,6 +73,22 @@ const CLI = path.join(__dirname, 'cli.js')
 
 function log(...args) {
   process.stderr.write(`[orchestrator] ${args.join(' ')}\n`)
+}
+
+/** Probe whether a wechat-bro daemon answers on this port: the ws-server
+ *  broadcasts a `connected` event to every new client as soon as it listens. */
+function probeDaemon(port, timeout = 2000) {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = (ok) => { if (!settled) { settled = true; clearTimeout(timer); try { ws.close() } catch {}; resolve(ok) } }
+    const ws = new WebSocket(`ws://127.0.0.1:${port}`)
+    const timer = setTimeout(() => done(false), timeout)
+    ws.on('message', (raw) => {
+      try { if (JSON.parse(raw.toString()).event === 'connected') done(true) } catch {}
+    })
+    ws.on('error', () => done(false))
+    ws.on('close', () => done(false))
+  })
 }
 
 function expand(p) {
@@ -660,7 +675,6 @@ async function runOrchestrator({ port = 9231 } = {}) {
 
   const shutdown = () => {
     closed = true
-    clearPid('orchestrator')
     try { ws && ws.close() } catch {}
     if (daemonChild) { try { daemonChild.kill('SIGTERM') } catch {} }
     process.exit(0)
@@ -668,9 +682,6 @@ async function runOrchestrator({ port = 9231 } = {}) {
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
 
-  // Tracked from the very start so `wechat-bro down`/`up` find this process
-  // even when it was started by a service manager instead of `wechat-bro up`.
-  writePid('orchestrator')
   if (daemonFlag) spawnDaemonChild()
   await connectLoop()
   log('running — Ctrl-C to stop')

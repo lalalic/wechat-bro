@@ -178,8 +178,8 @@ ok(m.shellQuote("it's") === "'it'\\''s'", 'shellQuote: escapes single quotes')
 
 // ── runOrchestrator startup (no daemon → retries, never crashes) ─────────
 // The orchestrator keeps retrying its initial connect every 5s — service
-// managers (launchd/systemd) and `wechat-bro up` may legitimately start it
-// before the daemon is reachable. It must stay alive until SIGTERM.
+// managers (launchd/systemd) may legitimately start it before the daemon is
+// reachable. It must stay alive until SIGTERM.
 // (WECHAT_BRO_NO_DAEMON_SPAWN=1 keeps the test from launching a real daemon
 // child / Chrome; plain users get the auto-spawn instead of bare retries.)
 console.log('# runOrchestrator (no daemon)')
