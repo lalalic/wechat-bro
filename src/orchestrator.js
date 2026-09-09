@@ -2,10 +2,11 @@
  * orchestrator.js — `wechat-bro orchestrator`
  *
  * A file-driven agent dispatcher. Connects to the wechat-bro daemon as a
- * plain WebSocket client, watches message events for the contacts declared in
- * `*.agent.md` frontmatter, and dispatches each conversation to a harness CLI
- * (pi by default) as a resumable headless task rooted in the contact's own
- * folder. The account user talks to the orchestrator via `filehelper`.
+ * plain WebSocket client (auto-starting one as a child process when none is
+ * running), watches message events for the contacts declared in `*.md`
+ * frontmatter, and dispatches each conversation to a harness CLI (pi by
+ * default) as a resumable headless task rooted in the contact's own folder.
+ * The account user talks to the orchestrator via `filehelper`.
  *
  * Agent md frontmatter (YAML-lite) configures each task:
  *   ---
@@ -14,8 +15,9 @@
  *   contacts: [Alice]         # dedicated routing — exact contact names
  *   contacts-assistant: [Bob] # dedicated routing in ASSISTANT mode
  *   type: contact             # contact | room | orchestrator (fallback class)
- *   harness: pi               # pi (default) or a shell command template
- *                             # with {var} placeholders — see below
+ *   harness: pi               # named harness (pi default; claude/codex/copilot
+ *                             # built in) or a shell command template with
+ *                             # {var} placeholders — see below
  *   session-id: wechat-alice  # default: wechat-<sanitized contact>
  *   session-dir: ~/.wechat-bro/contacts/Alice/session
  *   cwd: ~/.wechat-bro/contacts/Alice
@@ -29,7 +31,9 @@
  * written to a task file referenced as `@<file>` (pi) / `{task}` (template),
  * and the agent body is a symlink, never an argument.
  *
- * Harness templates: `harness:` (and the --harness CLI flag) is a shell
+ * Harness templates: `harness:` (and the --harness CLI flag) is either the
+ * bare NAME of a built-in template (`pi` `claude` `codex` `copilot` — each
+ * encodes that CLI's own headless/resume/approval flags) or a custom shell
  * command run via /bin/sh -c. `{var}` placeholders are substituted with
  * shell-quoted values, so each harness declares its own session-history and
  * task-input conventions instead of the orchestrator hardcoding them:
@@ -45,6 +49,11 @@
  * off, no skills). There are no provider/model/thinking/skills frontmatter keys —
  * a harness wanting different flags writes its own template. `${VAR}` shell
  * forms are NOT substituted; unknown placeholders are left verbatim.
+ *
+ * Agent mds load from ONE user dir, `~/.wechat-bro/agents/` (plain `.md`,
+ * legacy `.agent.md` accepted; README/hidden ignored), with the skill's own
+ * bundled `agents/` as fallback defaults. They reload per incoming message,
+ * so edits apply immediately.
  */
 
 'use strict'
@@ -54,11 +63,14 @@ const path = require('path')
 const os = require('os')
 const { spawn } = require('child_process')
 const WebSocket = require('ws')
-const { writePid, clearPid } = require('./lifecycle')
+const { writePid, clearPid, probeDaemon } = require('./lifecycle')
 
 const DATA_DIR = process.env.WECHAT_BRO_DATA_DIR || path.join(os.homedir(), '.wechat-bro')
-// Package-bundled agent mds live in the skill's own agents/ dir.
+// The ONE user agents dir. The skill's bundled agents/ (inside the installed
+// package) provides fallback defaults for anything not overridden here.
+const AGENTS_DIR = path.join(DATA_DIR, 'agents')
 const PKG_AGENTS_DIR = path.join(__dirname, '..', 'skills', 'wechat-bro', 'agents')
+const CLI = path.join(__dirname, 'cli.js')
 
 function log(...args) {
   process.stderr.write(`[orchestrator] ${args.join(' ')}\n`)
@@ -116,16 +128,14 @@ function listAgentMds(dir) {
 }
 
 /**
- * Load agent mds. The skill's own agents/ dir (PKG_AGENTS_DIR — shipped
- * inside the installed package) is the PRIMARY source; `~/.wechat-bro/agents/`
- * is an OPTIONAL user overlay (wins by `name`). Plain `.md` files (legacy
- * `.agent.md` still accepted); README/hidden files ignored. No seeding: in a
- * user env the skill is installed, so defaults always exist without touching
+ * Load agent mds: `~/.wechat-bro/agents/` (the only user dir) wins by `name`;
+ * the skill's bundled agents/ provides the defaults. No seeding: in a user
+ * env the skill is installed, so defaults always exist without touching
  * ~/.wechat-bro.
  */
-function loadAgents(userDir = path.join(DATA_DIR, 'agents')) {
+function loadAgents() {
   const agents = new Map()
-  for (const dir of [PKG_AGENTS_DIR, userDir]) {
+  for (const dir of [PKG_AGENTS_DIR, AGENTS_DIR]) {
     if (!fs.existsSync(dir)) continue
     for (const p of listAgentMds(dir)) {
       const a = loadAgentFile(p)
@@ -247,13 +257,33 @@ function shellQuote(s) {
   return /^[A-Za-z0-9_@%+=:,./-]+$/.test(s) ? s : `'` + s.replace(/'/g, `'\\''`) + `'`
 }
 
-/** The built-in `npx pi` command line, expressed as a template: pi's own flags
- *  (thinking off, no skills) are baked in — provider/model/thinking/skills
- *  are NOT frontmatter keys; a harness wanting different flags writes its own
- *  template. Everything the dispatch fills per message stays a placeholder.
- *  `npx` (not bare `pi`) so a global pi install is never required. */
-function defaultHarness() {
-  return 'npx pi -p --session-dir {session-dir} --session-id {session-id} --thinking off --no-skills @{task}'
+/** Built-in harness templates, one per supported CLI, expressed as shell
+ *  command lines: each CLI's own headless/approval/session flags are baked
+ *  in — provider/model/thinking are NOT frontmatter keys; a harness wanting
+ *  different flags writes its own template. Everything dispatch fills per
+ *  message stays a {var} placeholder. The `||` fallbacks cover a harness's
+ *  "no session yet" error on resume (first message of a contact).
+ *  - pi:      --session-id creates the session if missing; task via @file.
+ *             `npx` so a global pi install is never required.
+ *  - claude:  sessions are per-cwd (contact root), so --continue resumes this
+ *             contact's last conversation; prompt via stdin.
+ *  - codex:   resume --last is scoped to the cwd; `exec -` reads the prompt
+ *             from stdin; --skip-git-repo-check because contact roots are not
+ *             repos; full access so the agent can run wechat-bro send commands.
+ *  - copilot: --continue resumes the last local session (per cwd); "$(cat …)"
+ *             passes the prompt (copilot -p takes no stdin); -s keeps stdout
+ *             to the agent's reply so the JSON result line parses cleanly. */
+const HARNESS_TEMPLATES = {
+  pi: 'npx pi -p --session-dir {session-dir} --session-id {session-id} --thinking off --no-skills @{task}',
+  claude: 'claude -p --dangerously-skip-permissions --continue < {task} 2>/dev/null || claude -p --dangerously-skip-permissions < {task}',
+  codex: 'codex exec resume --last --skip-git-repo-check --sandbox danger-full-access "$(cat {task-path})" 2>/dev/null || codex exec --skip-git-repo-check --sandbox danger-full-access - < {task-path}',
+  copilot: 'copilot --continue -p "$(cat {task})" --allow-all -s 2>/dev/null || copilot -p "$(cat {task})" --allow-all -s',
+}
+
+/** A bare harness NAME picks its built-in template; anything else (a custom
+ *  template, or unset → pi) passes through. */
+function defaultHarness(name = 'pi') {
+  return HARNESS_TEMPLATES[name] || name
 }
 
 /** Values for the `{var}` placeholders of a harness template. */
@@ -334,9 +364,9 @@ function makeDispatcher({ wsSend, onEscalation }) {
     const taskFile = path.join(base, `.task-${Date.now()}.md`)
     fs.writeFileSync(taskFile, renderTask(msg, extra, opts))
 
-    // `pi` (or unset) → built-in template; anything else is the user's own
-    // command template. All templates run via /bin/sh with {var} substitution.
-    const tpl = !d.harness || d.harness === 'pi' ? defaultHarness() : d.harness
+    // Bare harness name → its built-in template; custom template or unset
+    // (→ pi) passes through. All templates run via /bin/sh with {var} subs.
+    const tpl = defaultHarness(d.harness)
     const timeoutS = parseInt(d.timeout, 10) || 900
     const timeoutMs = timeoutS * 1000
     const taskRef = path.basename(taskFile)
@@ -455,12 +485,12 @@ function flagValue(argv, flag) {
   return i !== -1 && i + 1 < argv.length ? argv[i + 1] : null
 }
 
-async function runOrchestrator({ port = 9231, agentsDir, harness } = {}) {
+async function runOrchestrator({ port = 9231 } = {}) {
   const argv = process.argv.slice(2)
-  agentsDir = expand(agentsDir || flagValue(argv, '--agents-dir') || path.join(DATA_DIR, 'agents'))
   const cliHarness = flagValue(argv, '--harness')
+  const daemonFlag = argv.includes('--daemon')
 
-  let agents = loadAgents(agentsDir)
+  let agents = loadAgents()
   for (const a of agents) { if (cliHarness) a.data.harness = cliHarness }
 
   const orchestrator = orchestratorAgent(agents)
@@ -469,7 +499,7 @@ async function runOrchestrator({ port = 9231, agentsDir, harness } = {}) {
   }
   const watch = watchList(agents)
   watch.delete('filehelper')
-  log(`loaded ${agents.length} agent md(s) (skill defaults: ${PKG_AGENTS_DIR}; overlay: ${agentsDir})`)
+  log(`loaded ${agents.length} agent md(s) (user: ${AGENTS_DIR}; skill defaults: ${PKG_AGENTS_DIR})`)
   for (const a of agents) log('  -', a.data.name, a.data.type || '', JSON.stringify({ contacts: contactList(a.data), assistant: contactList(a.data, 'contacts-assistant') }))
   log(`watch list: [${[...watch].join(', ') || 'none'}]`)
 
@@ -520,7 +550,7 @@ async function runOrchestrator({ port = 9231, agentsDir, harness } = {}) {
     // session for context — never replied, `{"status":"ignored"}`.
     if (data.from === 'me') {
       if (data.to !== 'filehelper' && !watch.has(data.to)) return
-      agents = loadAgents(agentsDir)
+      agents = loadAgents()
       if (cliHarness) for (const a of agents) a.data.harness = cliHarness
       if (data.to === 'filehelper') {
         if (pendingEscalations.size > 0) {
@@ -553,7 +583,7 @@ async function runOrchestrator({ port = 9231, agentsDir, harness } = {}) {
     if (!watch.has(data.from)) return
 
     // Reload agent mds per message so edits apply immediately.
-    agents = loadAgents(agentsDir)
+    agents = loadAgents()
     if (cliHarness) for (const a of agents) a.data.harness = cliHarness
     const routed = routeAgent(agents, data.from, await isRoomContact(ws, roomCache, data.from))
     if (!routed) { log('no agent for', data.from, '— skipping'); return }
@@ -577,7 +607,7 @@ async function runOrchestrator({ port = 9231, agentsDir, harness } = {}) {
       onClose: () => {
         if (closed) return
         log(`daemon disconnected — reconnecting in 3s`)
-        setTimeout(() => start().catch(e => { log('reconnect failed:', e.message, '— retry in 5s'); setTimeout(start, 5000) }), 3000)
+        setTimeout(() => connectLoop(), 3000)
       },
     })
     startedAt = Date.now()
@@ -586,10 +616,53 @@ async function runOrchestrator({ port = 9231, agentsDir, harness } = {}) {
     log(`connected to ws://localhost:${port} — watching`)
   }
 
+  // Daemon lifecycle: adopt a running daemon, or spawn one as OUR child —
+  // it then lives and dies with this orchestrator (shutdown kills it), and
+  // is (re)spawned automatically whenever nothing answers on the port.
+  // `--daemon` forces a fresh child even when the port already answers.
+  // WECHAT_BRO_NO_DAEMON_SPAWN=1 disables spawning (unit tests: no Chrome).
+  let daemonChild = null
+  const noSpawn = process.env.WECHAT_BRO_NO_DAEMON_SPAWN === '1'
+  const spawnDaemonChild = () => {
+    fs.mkdirSync(DATA_DIR, { recursive: true })
+    const fd = fs.openSync(path.join(DATA_DIR, 'daemon.log'), 'a')
+    const child = spawn(process.execPath, [CLI, '--daemon', '--port', String(port)],
+      { stdio: ['ignore', fd, fd], env: process.env })
+    fs.closeSync(fd)
+    child.on('exit', () => { if (daemonChild === child) daemonChild = null })
+    daemonChild = child
+    log(`spawned daemon child pid ${child.pid} — logs: ${path.join(DATA_DIR, 'daemon.log')}`)
+    return child
+  }
+  const ensureDaemon = async () => {
+    if (daemonChild) return true
+    if (await probeDaemon(port)) return true
+    if (noSpawn) return false
+    spawnDaemonChild()
+    for (let i = 0; i < 60; i++) { // wait for its WebSocket (Chrome boot takes a while)
+      if (await probeDaemon(port, 1500)) return true
+      await new Promise(r => setTimeout(r, 500))
+    }
+    log(`daemon child not reachable on port ${port} — see ${path.join(DATA_DIR, 'daemon.log')}`)
+    return false
+  }
+  // Connect once, then keep retrying forever — (re)spawning our daemon child
+  // whenever nothing is listening.
+  const connectLoop = async () => {
+    for (let attempt = 0; ; attempt++) {
+      try { await start(); return } catch (e) {
+        if (attempt === 0) log(`daemon not reachable on port ${port} —`, noSpawn ? 'retrying every 5s' : 'spawning one as our child')
+        await ensureDaemon()
+        await new Promise(r => setTimeout(r, 5000))
+      }
+    }
+  }
+
   const shutdown = () => {
     closed = true
     clearPid('orchestrator')
     try { ws && ws.close() } catch {}
+    if (daemonChild) { try { daemonChild.kill('SIGTERM') } catch {} }
     process.exit(0)
   }
   process.on('SIGINT', shutdown)
@@ -598,14 +671,8 @@ async function runOrchestrator({ port = 9231, agentsDir, harness } = {}) {
   // Tracked from the very start so `wechat-bro down`/`up` find this process
   // even when it was started by a service manager instead of `wechat-bro up`.
   writePid('orchestrator')
-  // Initial connect retries like the reconnect path below — the daemon may
-  // still be booting (fresh `up`, service start order, Chromium download).
-  for (let attempt = 0; ; attempt++) {
-    try { await start(); break } catch (e) {
-      if (attempt === 0) log('daemon not reachable yet — retrying every 5s')
-      await new Promise(r => setTimeout(r, 5000))
-    }
-  }
+  if (daemonFlag) spawnDaemonChild()
+  await connectLoop()
   log('running — Ctrl-C to stop')
   setInterval(() => {}, 1 << 30) // keep the event loop alive
 }
@@ -613,6 +680,6 @@ async function runOrchestrator({ port = 9231, agentsDir, harness } = {}) {
 module.exports = {
   parseFrontmatter, loadAgents, loadAgentFile, watchList, routeAgent,
   orchestratorAgent, renderTask, ensureAgentsMd, sanitizeFsName, contactList,
-  parseTaskResult, shellQuote, defaultHarness, harnessVars, renderHarness,
-  runOrchestrator, flagValue, DATA_DIR,
+  parseTaskResult, shellQuote, defaultHarness, HARNESS_TEMPLATES,
+  harnessVars, renderHarness, runOrchestrator, flagValue, DATA_DIR, AGENTS_DIR,
 }

@@ -318,7 +318,7 @@ Rules for both:
 The orchestrator ships as a command — no glue code needed:
 
 ```bash
-npx wechat-bro orchestrator   # daemon must be running (wechat-bro --daemon)
+npx wechat-bro orchestrator   # connects to the daemon, spawning one as a child if none runs
 ```
 
 `wechat-bro up` starts daemon + orchestrator detached, idempotently — the
@@ -327,12 +327,14 @@ one command every start path uses. How it should start *in the future*
 **Lifecycle & Startup Contract** at the end of this skill.
 
 It connects to the daemon as a WebSocket client and loads `*.md` agent files
-(legacy `.agent.md` still accepted) from the **skill's own `agents/` dir**
-(shipped inside the installed package — works with zero setup).
-`~/.wechat-bro/agents/` is an optional user overlay (wins by `name`); nothing
-is seeded there. Agent files are reloaded on every incoming message, so edits
-apply immediately. Flags: `--agents-dir <dir>` (additional overlay),
-`--harness <cmd-template>` (override every agent's harness), `--port <port>`.
+(legacy `.agent.md` still accepted) from **`~/.wechat-bro/agents/`** (the
+only user dir), falling back to the skill's own bundled `agents/` for
+anything not overridden — works with zero setup; nothing is seeded. Agent
+files are reloaded on every incoming message, so edits apply immediately.
+Flags: `--harness <tpl|name>` (override every agent's harness), `--port <port>`;
+if no daemon is running the orchestrator spawns one as a **child process**
+(it then lives and dies with the orchestrator), and `--daemon` forces that
+even when a daemon already answers.
 
 Agent md frontmatter configures each task (body = agent system prompt):
 
@@ -343,9 +345,11 @@ description: ...
 contacts: [Alice]             # dedicated routing — exact contact names (maintainer mode, default)
 contacts-assistant: [Bob]     # dedicated routing in ASSISTANT mode — AI answers ping-style
 type: contact                 # contact | room | orchestrator (fallback class)
-harness: <cli> … {task}       # shell command template with {task} {session-id}
-                              # {session-dir} {cwd} {contact} {name} {timeout} —
-                              # every harness flag lives IN the template
+harness: pi                   # named harness (pi | claude | codex | copilot —
+                              # default pi) or a custom shell template with
+                              # {task} {session-id} {session-dir} {cwd}
+                              # {contact} {name} {timeout} — every harness
+                              # flag lives IN the template
 session-id: wechat-alice      # default: wechat-<sanitized contact>
 session-dir: ~/.wechat-bro/contacts/Alice/session
 cwd: ~/.wechat-bro/contacts/Alice
@@ -440,15 +444,17 @@ invocation per message batch, session resumed each time, working directory set
 to the contact's root folder so all relative reads/writes stay inside it.
 
 Dispatch contract (any harness): non-interactive one-shot mode, resumable
-session stored under the contact's `session/`, cwd = contact root. An unset
-`harness:` falls back to the built-in `npx pi -p --session-dir {session-dir}
---session-id {session-id} --thinking off --no-skills @{task}`. There are
-no provider/model/thinking/skills frontmatter keys — every such flag lives
-straight in your template.
+session stored under the contact's `session/`, cwd = contact root. A `harness:`
+set to a **bare name** picks that CLI's built-in template; `pi` is the default
+when unset. Built-in names: `pi`, `claude`, `codex`, `copilot` — each bakes in
+that CLI's headless/resume/approval flags (e.g. resume-or-first-run fallback,
+`--allow-all`/skip-permissions so the agent can actually send). There are no
+provider/model/thinking frontmatter keys — every such flag lives straight in
+your template.
 
-`harness:` (frontmatter, or the `--harness` flag to override every agent) is a
-shell command template run via `/bin/sh -c`; `{var}` placeholders are
-substituted with shell-quoted values:
+`harness:` (frontmatter, or the `--harness` flag to override every agent) is
+either a built-in name or a custom shell command template run via
+`/bin/sh -c`; `{var}` placeholders are substituted with shell-quoted values:
 
 | placeholder | value |
 |---|---|
@@ -459,7 +465,7 @@ substituted with shell-quoted values:
 | `{contact}` / `{name}` | chat being served / agent name |
 | `{timeout}` | dispatch timeout in seconds (frontmatter `timeout:`) |
 
-Example templates:
+Example custom templates (when the built-ins don't fit):
 
 ```markdown
 harness: claude -p --session-id {session-id} --append-system-prompt "$(cat AGENTS.md)" < {task}
@@ -476,7 +482,7 @@ running:
 | process | command | holds |
 |---|---|---|
 | **daemon** | `wechat-bro --daemon` | headless Chrome + WeChat login, serves `ws://localhost:9231` |
-| **orchestrator** | `wechat-bro orchestrator` | watch list + dispatch loop (connects to the daemon, reconnects forever) |
+| **orchestrator** | `wechat-bro orchestrator` | watch list + dispatch loop (connects to the daemon — spawning one as a child if none runs — reconnects forever) |
 
 Never start them as ordinary foreground children of an agent session — they
 die with the session and the account goes deaf.
@@ -489,7 +495,7 @@ WebSocket, and reports one JSON line:
 
 ```bash
 wechat-bro up                    # spawn daemon + orchestrator detached (skip ones already running)
-wechat-bro up --harness '<tpl>'  # same flags as `orchestrator` (--harness, --agents-dir, --port, --timeout)
+wechat-bro up --harness '<tpl>'  # same flags as `orchestrator` (--harness, --port, --timeout)
 wechat-bro down                  # stop orchestrator, then daemon (graceful cookie flush)
 wechat-bro status                # login/contacts state — exit 0 = daemon alive
 ```
@@ -592,12 +598,11 @@ The orchestrator dispatches contact tasks through a **harness template** —
 configure it for the agent CLI that will serve contacts BEFORE `up` (or at
 least before the first real message):
 
-1. Write `~/.wechat-bro/agents/wechat-orchestrator.md` (overlay wins over
-   the bundled defaults), declaring `contacts-assistant: [filehelper]` and
-   the current harness's template, e.g.
-   `harness: claude -p --session-id {session-id} … < {task}` — see Harness
-   above. Agent mds reload per incoming message, so edits apply live.
-2. Alternatively pass `wechat-bro up --harness '<template>'` to override
+1. Write `~/.wechat-bro/agents/wechat-orchestrator.md` (overrides the bundled
+   default), declaring `contacts-assistant: [filehelper]` and the harness to
+   serve with — a bare name (`harness: claude`) or a custom template, see
+   Harness above. Agent mds reload per incoming message, so edits apply live.
+2. Alternatively pass `wechat-bro up --harness '<tpl|name>'` to override
    every agent's harness — this needs a restart (`down` + `up`) to change.
 
 ### First-start runbook (what the agent does when asked to "start it")

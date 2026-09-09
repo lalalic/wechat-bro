@@ -115,7 +115,7 @@ function spawnDetached(args, logFile, extraEnv = {}) {
 
 // ── up ────────────────────────────────────────────────────────────────────
 
-async function ensureUp({ port, harness, agentsDir, timeoutMs = 30_000 } = {}) {
+async function ensureUp({ port, harness, timeoutMs = 30_000 } = {}) {
   const result = { port, daemon: {}, orchestrator: {} }
 
   // 1. Daemon
@@ -132,13 +132,13 @@ async function ensureUp({ port, harness, agentsDir, timeoutMs = 30_000 } = {}) {
     result.daemon = { running: true, started: true, hint: 'first start may need a QR scan — check: wechat-bro status' }
   }
 
-  // 2. Orchestrator (connects with retry, so start order never matters)
+  // 2. Orchestrator (connects with retry, and spawns a daemon child itself
+  // if the daemon later dies — so start order never matters)
   let opid = readAlivePid('orchestrator') || pgrepPid('cli.js orchestrator')
   if (opid) {
     result.orchestrator = { running: true, pid: opid }
   } else {
     const args = ['orchestrator', '--port', String(port)]
-    if (agentsDir) args.push('--agents-dir', agentsDir)
     if (harness) args.push('--harness', harness)
     const child = spawnDetached(args, path.join(DATA_DIR, 'orchestrator.log'))
     result.orchestrator = { running: true, started: true, pid: child.pid }

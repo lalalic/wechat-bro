@@ -59,11 +59,11 @@ ok(m.sanitizeFsName('../etc/passwd') === '_etc_passwd', 'sanitize: traversal blo
 ok(m.sanitizeFsName('..') === '_', 'sanitize: dot-dot → _')
 ok(m.sanitizeFsName('李三/小A') === '李三_小A', 'sanitize: CJK kept, slash replaced')
 
-// ── loadAgents (skill dir primary + optional user overlay) ────────────────
+// ── loadAgents (user dir ~/.wechat-bro/agents + skill defaults) ───────────
 console.log('# loadAgents')
-const userAgentsDir = path.join(tmpDir, 'agents')
-const agents = m.loadAgents(userAgentsDir)
-ok(!fs.existsSync(userAgentsDir), 'loadAgents: does NOT seed the user dir')
+const userAgentsDir = path.join(tmpDir, 'agents') // = AGENTS_DIR (WECHAT_BRO_DATA_DIR is tmpDir)
+const agents = m.loadAgents()
+ok(m.AGENTS_DIR === userAgentsDir, 'loadAgents: user dir is <DATA_DIR>/agents')
 ok(agents.length >= 3, 'loadAgents: skill defaults loaded without any user dir')
 const names = agents.map(a => a.data.name)
 ok(names.includes('wechat-orchestrator') && names.includes('wechat-individual-maintainer') && names.includes('wechat-room-maintainer'), 'loadAgents: all defaults loaded')
@@ -72,7 +72,7 @@ ok(agents.find(a => a.data.name === 'wechat-orchestrator').data.type === 'orches
 fs.mkdirSync(userAgentsDir, { recursive: true })
 fs.writeFileSync(path.join(userAgentsDir, 'wechat-individual-maintainer.agent.md'),
   '---\nname: wechat-individual-maintainer\ntype: contact\ncustom: yes\n---\noverridden body')
-const agents2 = m.loadAgents(userAgentsDir)
+const agents2 = m.loadAgents()
 const indiv = agents2.find(a => a.data.name === 'wechat-individual-maintainer')
 ok(indiv.path.startsWith(userAgentsDir) && indiv.data.custom === 'yes' && indiv.body.trim() === 'overridden body', 'loadAgents: user dir overrides package default by name')
 
@@ -82,7 +82,7 @@ fs.writeFileSync(path.join(userAgentsDir, 'wechat-alice.agent.md'),
   '---\nname: wechat-alice\ncontacts: [Alice]\n---\nx')
 fs.writeFileSync(path.join(userAgentsDir, 'wechat-bob.agent.md'),
   '---\nname: wechat-bob\ncontacts: [Bob]\n---\nx')
-const agents3 = m.loadAgents(userAgentsDir)
+const agents3 = m.loadAgents()
 const wl = m.watchList(agents3)
 ok(wl.has('Alice') && wl.has('Bob') && wl.has('filehelper'), 'watchList: union of contacts + contacts-assistant across agents')
 
@@ -103,7 +103,7 @@ ok(m.orchestratorAgent(agents3).data.name === 'wechat-orchestrator', 'route: orc
 console.log('# routeAgent contacts-assistant')
 fs.writeFileSync(path.join(userAgentsDir, 'wechat-carol.agent.md'),
   '---\nname: wechat-carol\ncontacts-assistant: [Carol]\n---\nx')
-const agents4 = m.loadAgents(userAgentsDir)
+const agents4 = m.loadAgents()
 const r6 = m.routeAgent(agents4, 'Carol', false)
 ok(r6 && r6.agent.data.name === 'wechat-carol' && r6.assistant === true, 'route: contacts-assistant match → assistant-managed')
 ok(m.watchList(agents4).has('Carol'), 'watchList: includes contacts-assistant')
@@ -140,8 +140,8 @@ ok(fs.readlinkSync(path.join(cwd, 'AGENTS.md')) === other, 'ensureAgentsMd: refr
 
 // ── flagValue ─────────────────────────────────────────────────────────────
 console.log('# flagValue')
-ok(m.flagValue(['orchestrator', '--agents-dir', '/x'], '--agents-dir') === '/x', 'flagValue: finds value')
-ok(m.flagValue(['orchestrator'], '--agents-dir') === null, 'flagValue: missing → null')
+ok(m.flagValue(['orchestrator', '--port', '9500'], '--port') === '9500', 'flagValue: finds value')
+ok(m.flagValue(['orchestrator'], '--port') === null, 'flagValue: missing → null')
 
 // ── parseTaskResult (task JSON contract) ──────────────────────────────────
 console.log('# parseTaskResult')
@@ -155,12 +155,20 @@ ok(m.parseTaskResult('done\n{bad json}\n{"status":"ignored"}').status === 'ignor
 // ── harness templates (defaultHarness / harnessVars / renderHarness) ─────
 console.log('# harness templates')
 const d0 = { sessionDir: '/s', sessionId: 'wechat-x', cwd: '/c', name: 'wechat-x' }
-ok(m.defaultHarness().includes('--session-dir {session-dir}') && m.defaultHarness().includes('--session-id {session-id}'), 'defaultHarness: session vars wired via placeholders')
-ok(m.defaultHarness().includes('--thinking off') && m.defaultHarness().includes('--no-skills'), 'defaultHarness: thinking/skills flags baked into template (no frontmatter keys)')
-ok(m.defaultHarness().trimEnd().endsWith('@{task}'), 'defaultHarness: task referenced via @{task} (no inline content)')
+ok(m.defaultHarness() === m.defaultHarness('pi'), 'defaultHarness: unset → pi')
+ok(m.defaultHarness('pi').includes('--session-dir {session-dir}') && m.defaultHarness('pi').includes('--session-id {session-id}'), 'defaultHarness(pi): session vars wired via placeholders')
+ok(m.defaultHarness('pi').includes('--thinking off') && m.defaultHarness('pi').includes('--no-skills'), 'defaultHarness(pi): thinking/skills flags baked into template (no frontmatter keys)')
+ok(m.defaultHarness('pi').trimEnd().endsWith('@{task}'), 'defaultHarness(pi): task referenced via @{task} (no inline content)')
+for (const h of ['claude', 'codex', 'copilot']) {
+  const t = m.defaultHarness(h)
+  ok(t !== h && t.includes(h), `defaultHarness(${h}): bare name → its built-in template`)
+  ok(t.includes('||'), `defaultHarness(${h}): resume-or-first-run fallback baked in`)
+  ok(/\{task(-path)?\}/.test(t), `defaultHarness(${h}): task placeholder present`)
+}
+ok(m.defaultHarness('my-cmd {task}') === 'my-cmd {task}', 'defaultHarness: custom template passes through')
 
 const vars0 = m.harnessVars(d0, { task: 't.md', taskPath: '/c/t.md', contact: 'Alice', timeoutS: 900 })
-ok(m.renderHarness(m.defaultHarness(), vars0).includes('@t.md') && m.renderHarness(m.defaultHarness(), vars0).includes('--session-id wechat-x'), 'renderHarness: substitutes task + session-id')
+ok(m.renderHarness(m.defaultHarness('pi'), vars0).includes('@t.md') && m.renderHarness(m.defaultHarness('pi'), vars0).includes('--session-id wechat-x'), 'renderHarness: substitutes task + session-id')
 ok(m.renderHarness('{contact}|{timeout}', vars0) === 'Alice|900', 'renderHarness: contact + timeout vars')
 ok(m.shellQuote('my task.md') === "'my task.md'", 'shellQuote: quotes values with spaces')
 ok(m.renderHarness('run {task}', { task: 'a b.md' }) === "run 'a b.md'", 'renderHarness: shell-quotes unsafe values')
@@ -172,11 +180,13 @@ ok(m.shellQuote("it's") === "'it'\\''s'", 'shellQuote: escapes single quotes')
 // The orchestrator keeps retrying its initial connect every 5s — service
 // managers (launchd/systemd) and `wechat-bro up` may legitimately start it
 // before the daemon is reachable. It must stay alive until SIGTERM.
+// (WECHAT_BRO_NO_DAEMON_SPAWN=1 keeps the test from launching a real daemon
+// child / Chrome; plain users get the auto-spawn instead of bare retries.)
 console.log('# runOrchestrator (no daemon)')
 {
   const { spawn: spawnProc } = require('child_process')
   const child = spawnProc(process.execPath, [path.join(__dirname, '..', 'src', 'cli.js'), 'orchestrator', '--port', '59987'], {
-    env: { ...process.env, WECHAT_BRO_DATA_DIR: tmpDir },
+    env: { ...process.env, WECHAT_BRO_DATA_DIR: tmpDir, WECHAT_BRO_NO_DAEMON_SPAWN: '1' },
   })
   let sawRetry = false, exited = null
   child.stderr.on('data', (d) => { if (/retrying every 5s/.test(String(d))) sawRetry = true })

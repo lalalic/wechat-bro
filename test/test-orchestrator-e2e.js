@@ -130,8 +130,9 @@ const sent = []
 const sleep = (ms) => new Promise(r => setTimeout(r, ms))
 
 async function main() {
-  // Start the orchestrator as a real subprocess of src/cli.js.
-  const child = spawn('node', [ORCH, 'orchestrator', '--port', String(PORT), '--agents-dir', agentsDir], {
+  // Start the orchestrator as a real subprocess of src/cli.js. Agents come
+  // from <WECHAT_BRO_DATA_DIR>/agents (the fixture dir above).
+  const child = spawn('node', [ORCH, 'orchestrator', '--port', String(PORT)], {
     stdio: ['ignore', 'inherit', 'inherit'],
   })
   await sleep(1200) // let it connect

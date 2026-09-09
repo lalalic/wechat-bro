@@ -588,18 +588,23 @@ Flags:
   --pretty          Pretty-print command responses (JSON with 2-space indent)
 
 Modes:
-  orchestrator [--agents-dir <dir>] [--harness <cmd-template>]
+  orchestrator [--port <port>] [--harness <tpl|name>] [--daemon]
                                Start the orchestrator (own long-lived process):
                                watch contacts declared in ~/.wechat-bro/agents/
                                *.md frontmatter and dispatch each message
-                               to a resumable harness CLI task (built-in
-                               default: npx pi -p ...; override every agent
+                               to a resumable harness CLI task (harness names:
+                               pi | claude | codex | copilot — default pi;
+                               or a custom template; override every agent
                                with --harness) rooted in the contact's own
-                               folder. User guidance arrives via filehelper.
-                               Falls back to package defaults for missing
-                               agent mds; edits apply on the next message.
+                               folder. If no daemon is running, one is
+                               spawned as a child process (dies with the
+                               orchestrator); --daemon forces that even when
+                               one is already running. User guidance arrives
+                               via filehelper. Falls back to package defaults
+                               for missing agent mds; edits apply on the next
+                               message.
 
-  up [--harness <tpl>] [--agents-dir <dir>] [--timeout <s>]
+  up [--harness <tpl|name>] [--timeout <s>]
                                Idempotent start: spawn daemon + orchestrator
                                detached (logs in ~/.wechat-bro/*.log) unless
                                already running, then wait for the WebSocket.
@@ -668,7 +673,6 @@ async function main() {
       ? await ensureUp({
           port: WS_PORT,
           harness: flagValue(argv, '--harness'),
-          agentsDir: flagValue(argv, '--agents-dir'),
           timeoutMs: (parseInt(flagValue(argv, '--timeout') || '30', 10)) * 1000,
         })
       : await shutDown({ port: WS_PORT })
