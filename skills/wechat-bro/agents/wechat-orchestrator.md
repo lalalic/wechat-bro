@@ -2,7 +2,6 @@
 name: wechat-orchestrator
 description: WeChat account-owner assistant — manages watched contacts/modes, shared and per-contact behavior, and escalation through filehelper
 type: orchestrator
-contacts-assistant: [filehelper]
 ---
 
 # WeChat Orchestrator

@@ -161,10 +161,14 @@ function loadAgents() {
 }
 
 /** Watch list = union of `contacts` + `contacts-assistant` across all agent
- *  mds. */
+ *  mds, EXCLUDING `type: orchestrator` agents: their contact lists are
+ *  declarative only (filehelper → orchestrator is caller-handled), so a
+ *  stray name there can neither widen the watch list nor hijack routing into
+ *  the orchestrator's fixed session. */
 function watchList(agents) {
   const set = new Set()
   for (const a of agents) {
+    if (a.data.type === 'orchestrator') continue
     for (const key of ['contacts', 'contacts-assistant']) {
       const v = a.data[key]
       for (const c of Array.isArray(v) ? v : (v ? [v] : [])) set.add(c)
@@ -182,12 +186,15 @@ function contactList(d, key = 'contacts') {
  *  `contacts-assistant` matches win (assistant-managed contact), then
  *  dedicated `contacts` (maintainer default), then the unrestricted agent of
  *  the matching `type` (maintainer default). Returns {agent, assistant} or
- *  null. filehelper → orchestrator is handled by the caller. */
+ *  null. `type: orchestrator` agents never match — their contact lists are
+ *  declarative only; filehelper → orchestrator is handled by the caller. */
 function routeAgent(agents, name, isRoom) {
   for (const a of agents) {
+    if (a.data.type === 'orchestrator') continue
     if (contactList(a.data, 'contacts-assistant').includes(name)) return { agent: a, assistant: true }
   }
   for (const a of agents) {
+    if (a.data.type === 'orchestrator') continue
     if (contactList(a.data).includes(name)) return { agent: a, assistant: false }
   }
   const type = isRoom ? 'room' : 'contact'

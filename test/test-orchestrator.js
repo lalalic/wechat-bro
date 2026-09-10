@@ -84,7 +84,8 @@ fs.writeFileSync(path.join(userAgentsDir, 'wechat-bob.agent.md'),
   '---\nname: wechat-bob\ncontacts: [Bob]\n---\nx')
 const agents3 = m.loadAgents()
 const wl = m.watchList(agents3)
-ok(wl.has('Alice') && wl.has('Bob') && wl.has('filehelper'), 'watchList: union of contacts + contacts-assistant across agents')
+ok(wl.has('Alice') && wl.has('Bob'), 'watchList: union of contacts + contacts-assistant across agents')
+ok(!wl.has('filehelper'), 'watchList: type:orchestrator lists excluded (filehelper is caller-handled)')
 
 // ── routeAgent (returns {agent, assistant}) ───────────────────────────────
 console.log('# routeAgent')
@@ -107,6 +108,21 @@ const agents4 = m.loadAgents()
 const r6 = m.routeAgent(agents4, 'Carol', false)
 ok(r6 && r6.agent.data.name === 'wechat-carol' && r6.assistant === true, 'route: contacts-assistant match → assistant-managed')
 ok(m.watchList(agents4).has('Carol'), 'watchList: includes contacts-assistant')
+
+// type:orchestrator contact lists never hijack the watch list or routing
+console.log('# orchestrator contact lists are ignored')
+fs.writeFileSync(path.join(userAgentsDir, 'wechat-orchestrator.agent.md'),
+  '---\nname: wechat-orchestrator\ntype: orchestrator\ncontacts: [Mallory]\ncontacts-assistant: [filehelper, Nora]\n---\norch body')
+const agents5 = m.loadAgents()
+const wl5 = m.watchList(agents5)
+ok(!wl5.has('Mallory') && !wl5.has('Nora') && !wl5.has('filehelper'), 'watchList: contacts/contacts-assistant on type:orchestrator ignored')
+const r7 = m.routeAgent(agents5, 'Mallory', false)
+ok(r7 && r7.agent.data.type === 'contact' && r7.assistant === false, 'route: orchestrator-declared contact falls to type default, never the orchestrator')
+const r8 = m.routeAgent(agents5, 'Nora', false)
+ok(r8 && r8.agent.data.name === 'wechat-individual-maintainer' && r8.assistant === false, 'route: contacts-assistant on type:orchestrator ignored')
+ok(m.orchestratorAgent(agents5) && m.orchestratorAgent(agents5).data.type === 'orchestrator', 'route: orchestrator agent still found by type (filehelper caller path)')
+const r9 = m.routeAgent(agents5, 'Alice', false)
+ok(r9 && r9.agent.data.name === 'wechat-alice' && r9.assistant === false, 'route: dedicated contact agents still win after override')
 
 // ── renderTask ────────────────────────────────────────────────────────────
 console.log('# renderTask')
