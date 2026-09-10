@@ -1,470 +1,397 @@
 ---
 name: wechat-bro
-description: Interact with WeChat from an AI agent — send/receive messages, manage contacts, upload media, transcribe voice, and more.
+description: Operate and customize WeChat from an AI harness: start the bundled orchestrator, manage watched contacts and behavior, follow escalation, use WeChat commands, or build a custom listener/orchestrator.
 ---
 
 # wechat-bro — WeChat Agent Skill
 
-## Overview
+## What this skill enables
 
-**wechat-bro** is a WebSocket + stdin JSON‑line process that lets AI agents
-interact with WeChat Web.  It launches a headless Chrome, logs into
-[wx.qq.com](https://wx.qq.com), and keeps a persistent session.  Multiple
-agents can connect simultaneously via WebSocket.
+Use this skill when an AI harness needs to work with WeChat. The important capabilities are:
 
-```asciiart
-                    ┌──────────────────┐
- Agent A ──ws──────→│                  │
- Agent B ──ws──────→│  wechat-bro-cli  │──→ wx.qq.com
- Agent C ──ws──────→│  (long‑lived)    │──→ Chrome
-                    └──────────────────┘
-                           │
-                           ▼ stdout (events + backward compat stdin)
-```
+1. Start and operate the bundled `wechat-bro orchestrator` from a harness.
+2. Let the account owner manage watched contacts, watch mode, contact/global rules, and persistent memory through `filehelper`; changes should affect subsequent dispatches without restarting.
+3. Follow the contact-agent → orchestrator → account-owner → same-contact-session escalation path.
+4. Choose the correct `wechat-bro` command for a concrete purpose.
+5. Build a custom listener/orchestrator directly on the WebSocket + JSON command interface when the bundled orchestrator is not enough.
 
-## Identity Model
+The bundled orchestrator is the default managed workflow. The WebSocket/command protocol is the lower-level primitive for custom automation.
 
-Identify every contact by its **`name`** — the name you'd use to address them
-(e.g. `李三`, `Alice`, `Dev Team`). The account owner is always `"me"`.
+## 1. Start the bundled orchestrator
 
-The exact `name` string returned by any command can be reused as-is in the next
-command's `to` field — no transformation needed.
-
-**System accounts**: `filehelper` (File Transfer Helper) is available by its
-canonical name `filehelper` **or** its localized name `文件传输助手` — both
-resolve to the same chat.
-
-**Ambiguity is an error.** If a name matches more than one contact (or none),
-`send-text` / `send-image` / `send-file` / `room-members` / `get-contact` return an
-error instead of guessing — surface it to the user to disambiguate:
-
-```json
-→ {"cmd":"send-text","to":"李三","content":"hi"}
-← {"ok":false,"error":"name \"李三\" matches 2 contacts; please disambiguate (e.g. set a unique remark name with setRemark)"}
-```
-
-### @mentions in rooms
-
-Use the **`@"<name>"`** format (double-quoted) anywhere in `send-text` content to
-mention someone. The quoted name must match a member of the target room.
-
-```json
-→ {"cmd":"send-text","to":"Dev Team","content":"@\"Alice Chen\" check this"}
-```
-
-Incoming room messages arrive with the same `@"<name>"` form in `Content`, and
-the resolved names are also listed in the message's `mentions` array. Unquoted
-`@name` is treated as literal text, not a mention.
-
-A stranger in a room (not your contact) can be @mentioned but not DM'd.
-
-## Quick Start
+For normal agent-managed WeChat use:
 
 ```bash
-npx wechat-bro --help
-
-# Connect from an agent (WebSocket):
-ws://localhost:9231
+npx wechat-bro orchestrator
 ```
 
-The process stays alive until it receives `{"cmd":"exit"}`.
+The orchestrator:
 
-## WebSocket Protocol
+- connects to an existing `wechat-bro` daemon, or starts one as a child when needed;
+- talks to the account owner through `filehelper`;
+- reloads agent markdown files for every incoming message;
+- derives the watch list from agent frontmatter;
+- dispatches watched chats into resumable per-contact sessions;
+- reports failures and escalations back to the owner through `filehelper`.
 
-Connect to `ws://localhost:9231`.  Send/receive JSON messages.
-
-### Server → Agent (events — broadcast to all connected agents)
-
-```json
-{"event":"message","data":{...},"ts":<unix_ms>}
-```
-
-| event | when | data |
-|---|---|---|
-| `connected` | On connect | `{clientId, serverId}` |
-| `ready` | After login + contacts loaded | `{loggedIn, contactsReady}` |
-| `scan` | QR code displayed/updated | `{code, url, loginUrl, userAvatar?}`. `userAvatar` (when present, code 201) is a **file path** to the downloaded avatar at `~/.wechat-bro/userAvatar.png` |
-| `login` | User logged in | `{name, …}` (self; `name` is `"me"`) |
-| `logout` | User logged out | source string |
-| `contacts-ready` | Contact list loaded (count stabilized) | `{total, elapsedMs}` |
-| `message:text` | Incoming text message | Message object with `from`/`to` as **contact names** (strings; `"me"` for self; `sender` for room messages). Raw field `Content` holds the text |
-| `message:*` (non-text) | Incoming image/voice/video/emoticon/location/card/verify/status | **Simplified object**: `content` is the useful representation per type (see below). All raw wire-format fields (XML `Content`, `RecommendInfo`, `MMActual*`, …) and every empty field (`null`/`""`/`[]`) are stripped; kept fields: `MsgId`, `from`, `to`, `sender`, `mentions`, `mentionMe`, `ts`, `type`, `content` + type extras |
-
-**Suppressed types — no event is emitted**: `app` (49, incl. file attachments & shared articles), `system` (10000), `recalled` (10002). These are XML wire noise; agents never receive them.
-
-Non-text `content` per type:
-
-Downloaded media lands in the chat contact's own folder:
-`~/.wechat-bro/contacts/<contact name>/download/<filename>_<MsgId>.<ext>`
-(the contact is the chat the message belongs to — for room messages that's
-the room's folder).
-
-| type | `content` | extras |
-|---|---|---|
-| `image` | path to downloaded image | |
-| `voice` | transcribed text (Whisper), falling back to the audio file path | `voiceFile` |
-| `video` / `microvideo` | path to downloaded video (`.mp4`) | |
-| `emoticon` | emoji CDN url | |
-| `location` | `"label (poiname)"` | |
-| `card` | `"[contact card: Name]"` | |
-| `verify` / `status` | plain readable text | |
-| `heartbeat` | Every ~30s liveness check | `"heartbeat@browser"` |
-
-### stdin mode
-
-The process also accepts JSON commands on stdin (one per line) for pipe mode:
+Useful options:
 
 ```bash
-echo npx wechat-bro
+npx wechat-bro orchestrator --harness codex
+npx wechat-bro orchestrator --harness claude
+npx wechat-bro orchestrator --harness copilot
+npx wechat-bro orchestrator --harness pi
+npx wechat-bro orchestrator --port 9231
 ```
 
-## Commands
+`pi` is the default harness. A custom shell template may also be used as `harness:` frontmatter or with `--harness`.
 
-### `contacts`
-List individual contacts (people, not group chats). Returns a **name list only** — use `get-contact` for details.
-```json
-→ {"cmd":"contacts"}
-← {"ok":true,"data":["Alice","Bob","小A"]}
-```
+### Harness dispatch contract
 
-### `rooms`
-List group chats (rooms). Returns a **name list only** — use `get-contact` or `room-members` for details.
-```json
-→ {"cmd":"rooms"}
-← {"ok":true,"data":["Dev Team","Family","项目组"]}
-```
+Each contact task runs headlessly with:
 
-### `room-members`
-Get members of a room. Returns a **name list only**.
-Arg: `id` (the room **name**) over WebSocket, or `--name` on the CLI.
-```json
-→ {"cmd":"room-members","id":"Dev Team"}
-← {"ok":true,"data":["Alice","小A"]}
-```
-```bash
-npx wechat-bro room-members --name "Dev Team"
-```
+- cwd = `~/.wechat-bro/contacts/<contact>`;
+- one resumable session per contact;
+- the chosen agent markdown exposed as `AGENTS.md` in the contact cwd;
+- a task file containing the incoming WeChat event and explicit mode/context instructions.
 
-### `get-contact`
-Get details for a single **contact or room** (resolved by name).  Arg: `id` (the **name**) over WebSocket, or `--name` on the CLI.
-Does NOT include the member list — use `room-members` for that.
-```json
-→ {"cmd":"get-contact","id":"Alice"}
-← {"ok":true,"data":{"name":"Alice","isRoomContact":false,…}}
-```
-```bash
-npx wechat-bro get-contact --name "Dev Team"
-```
+Never mix two contacts into one session.
 
-### `send-text`
-Send a text message.  Args: `to` (name), `content`.
-- `to` must match exactly one contact.
-- `@"name"` mentions supported (see @mentions above).
-- markdown formatting is auto‑converted (see Markdown Styling below).
-- `````marpit``` blocks are rendered to **PDF** (`slides.pdf`) and `````mermaid`
-  blocks to **PNG** (`diagram.png`) — WeChat can't display HTML.
-```json
-→ {"cmd":"send-text","to":"Dev Team","content":"@\"Alice\" check the **PR**"}
-← {"ok":true,"data":{"sent":true,"to":"Dev Team"}}
+## 2. Manage watched contacts, modes, rules, and memory
 
-→ {"cmd":"send-text","to":"filehelper","content":"Flow:\\n```mermaid\\ngraph TD\\n  A-->B\\n```"}
-← {"ok":true,"data":{"sent":true,"to":"filehelper","files":[{"file":"diagram.png","type":"mermaid"}],"caption":"Flow:"}}
-```
+The account owner manages the system by messaging `filehelper`. The `type: orchestrator` agent is the owner's assistant and should interpret requests such as:
 
-### `send-image`
-Send an image.  Uploads from local disk to WeChat CDN, then sends.
-Args: `to`, `path` (local file), `filename?` (defaults to basename of path).
-```json
-→ {"cmd":"send-image","to":"filehelper","path":"/tmp/photo.jpg"}
-← {"ok":true,"data":{"sent":true,"to":"filehelper","file":"photo.jpg"}}
-```
+- `关注 Alice` — watch Alice in maintainer mode.
+- `以 assistant 模式关注 Bob` — watch Bob in assistant mode.
+- `取消关注 Alice` — remove Alice from the watch configuration.
+- `把 Alice 改成 assistant` / `改回 maintainer` — change the watch mode.
+- `以后跟 Alice 用正式一点的语气` — add/update Alice-specific rules.
+- `以后所有联系人都不要透露我的住址` — add/update a global rule.
+- `Alice 喜欢英文简短回复` — persist a contact-specific durable fact when useful.
 
-### `send-file`
-Send an arbitrary file (PDF, ZIP, etc.).  Args: `to`, `path`, `filename`.
-```json
-→ {"cmd":"send-file","to":"filehelper","path":"/tmp/report.pdf","filename":"report.pdf"}
-← {"ok":true,"data":{"sent":true,"to":"filehelper","file":"report.pdf"}}
-```
+Agent files under `~/.wechat-bro/agents/` are reloaded for every incoming message, so watch/mode/agent-definition edits take effect on the next dispatch without restarting the orchestrator.
 
-### `send-voice`
-Transcribe a local audio file via Whisper STT and send the text as a message.
-Args: `to`, `path`.
-```json
-→ {"cmd":"send-voice","to":"filehelper","path":"/tmp/voice.mp3"}
-← {"ok":true,"data":{"sent":true,"to":"filehelper","transcription":"你好，这是一条语音消息"}}
-```
+### Watch-list model
 
-### `status`
-Get current login/contacts state.
-```json
-→ {"cmd":"status"}
-← {"ok":true,"data":{"loggedIn":true,"contactsReady":true,"lastMsgTime":1785200000,"initState":true}}
-```
-
-### `emojis`
-List all supported emoji codes (~210).
-```json
-→ {"cmd":"emojis"}
-← {"ok":true,"data":["[微笑]","[撇嘴]",…,"[Smile]","[Rose]",…]}
-```
-
-### `exit`
-Shut down gracefully.
-```json
-→ {"cmd":"exit"}
-← {"ok":true}
-```
-
-## Auto-Render: Marpit & Mermaid
-
-When `send-text` content contains ````marpit` or `````mermaid` code blocks, the
-CLI auto-renders each one and sends the results as files — `````marpit` →
-**PDF** (`slides.pdf`), `````mermaid` → **PNG** (`diagram.png`).  Any text
-before, between, or after blocks is also sent as a normal message (with
-`@mention`).
-
-**Multiple blocks** are supported — all ````marpit` and ````mermaid` blocks in
-content are processed in order.  Tools run via `npx` (auto-downloaded if
-missing).  Response includes a `files` array:
-
-```json
-← {"ok":true,"data":{"sent":true,"to":"filehelper","files":[
-    {"file":"diagram.png","type":"mermaid"},
-    {"file":"slides.pdf","type":"marpit"}
-  ],"caption":"See attached."}}
-```
-
-## Markdown Styling
-
-`send-text` content supports markdown:
-
-| Markdown | Rendered |
-|---|---|
-| `**bold**` | **𝗯𝗼𝗹𝗱** (mathematical bold) |
-| `*italic*` | *𝘪𝘵𝘢𝘭𝘪𝘤* (mathematical italic) |
-| `` `code` `` | `𝚌𝚘𝚍𝚎` (mathematical monospace) |
-| `~~strike~~` | s̶t̶r̶i̶k̶e̶ (combining strikethrough) |
-| `- item` | • item (bullet) |
-| `1. item` | ① item (circled number) |
-| `# Heading` | **Heading** + separator |
-| `> quote` | ❙ quote (blockquote) |
-
-## Agent Integration
-
-One **`wechat-orchestrator`** manages the whole WeChat account. It talks to the
-account user via **`filehelper`**, listens to message events for a configured
-**watch list** of contacts, and dispatches each conversation to that contact's
-own agent task. The spec below is harness-agnostic — codex, claude code,
-copilot … each implement it with their own primitives (see Harness).
-
-```
-contact msg ──ws──▶ orchestrator ──watched?──▶ contact agent task ──send-text──▶ contact
-                      ▲                            │ can't answer?
-                      └──── filehelper ◀── escalate / report ──────────────────────┘
-user msg ──filehelper──▶ orchestrator: guidance → update rules & memories
-```
-
-### On-disk layout
-
-```
-~/.wechat-bro/
-├── contacts.json            # orchestrator state: watch list, per-contact agent choice
-├── memory.md                # shared memory — read by every agent, updated by orchestrator
-├── rules.md                 # general conversation rules (shared)
-└── contacts/<contact>/      # per-contact root (a person or a room name)
-    ├── session/             # dedicated session — all conversation history for this contact
-    ├── memory.md            # dedicated memory (contact's preferences & learnings)
-    ├── rules.md             # contact-specific rules
-    ├── knowledge/           # user-uploaded knowledge base (text, pdf, …)
-    └── download/            # incoming media (written automatically by wechat-bro)
-```
-
-### wechat-orchestrator
-
-- **User channel**: talk to the account user only via `filehelper` — reports, questions, escalations.
-- **Inbound**: hold one WebSocket on `ws://localhost:9231`; drop `message:text` / `message:*` events whose `from` is not on the watch list; persist the watch list in `contacts.json` so restarts recover.
-- **Dispatch**: for each incoming message, wake the contact's agent with contact name, message content, room `sender`/`mentions` when it's a room, and the paths to its `session/`, `memory.md`, `rules.md`, `knowledge/` plus the shared `memory.md` / `rules.md`.
-- **Sessions**: one dedicated session per contact — resume it instead of starting over; never mix two contacts into one session.
-- **Feedback loop**: guidance arriving via `filehelper` updates shared or contact rules/memories; when a contact agent escalates, relay it to the user.
-
-### contact agents — common or customized
-
-Agent definitions are plain **markdown files in `~/.wechat-bro/agents/`**:
-
-```
-~/.wechat-bro/agents/
-├── wechat-individual-maintainer.md   # common: person DMs — DM etiquette, no noise, private-context answers
-├── wechat-room-maintainer.md         # common: group chats — reply only when relevant or mentionMe, address via @"name"
-└── wechat-<contact>.md               # customized: overrides the matching default for that one contact
-```
-
-An agent md takes effect **only when the orchestrator injects it at dispatch** —
-no harness auto-loads it. Selection per contact: `wechat-<contact>.md` if it
-exists, else the room/individual default by `isRoomContact`. Injection options:
-
-- pass its contents as the system prompt of the dispatched task (`$(cat <agent-md>)` in your harness template)
-- or let the orchestrator symlink it to `AGENTS.md` inside the contact's root folder — done automatically at dispatch, so harnesses with cwd context-file discovery (claude code, codex …) load it without any flag.
-
-Rules for both:
-
-- **don't** reveal personal information about the user or the orchestrator.
-- reply natural & friendly, grounded in the contact's message, session history and memories; use the contact's language (default: 中文).
-- **can't answer or sensitive** → escalate to the orchestrator instead of guessing.
-- persist learnings into the contact's dedicated `memory.md`; the shared `memory.md` carries account-wide facts (user preferences, style).
-- save assets into the contact's own root folder, organized by type; knowledge base into `knowledge/`.
-
-### Bootstrap: `wechat-bro orchestrator`
-
-The orchestrator ships as a command — no glue code needed:
-
-```bash
-npx wechat-bro orchestrator   # connects to the daemon, spawning one as a child if none runs
-```
-
-It connects to the daemon as a WebSocket client and loads `*.md` agent files
-(legacy `.agent.md` still accepted) from **`~/.wechat-bro/agents/`** (the
-only user dir), falling back to the skill's own bundled `agents/` for
-anything not overridden — works with zero setup; nothing is seeded. Agent
-files are reloaded on every incoming message, so edits apply immediately.
-Flags: `--harness <tpl|name>` (override every agent's harness), `--port <port>`;
-if no daemon is running the orchestrator spawns one as a **child process**
-(it then lives and dies with the orchestrator), and `--daemon` forces that
-even when a daemon already answers.
-
-Agent md frontmatter configures each task (body = agent system prompt):
+The effective watch list is the union of all exact contact names declared in agent frontmatter:
 
 ```markdown
----
-name: wechat-alice            # required, unique
-description: ...
-contacts: [Alice]             # dedicated routing — exact contact names (maintainer mode, default)
-contacts-assistant: [Bob]     # dedicated routing in ASSISTANT mode — AI answers ping-style
-type: contact                 # contact | room | orchestrator (fallback class)
-harness: pi                   # named harness (pi | claude | codex | copilot —
-                              # default pi) or a custom shell template with
-                              # {task} {session-id} {session-dir} {cwd}
-                              # {contact} {name} {timeout} — every harness
-                              # flag lives IN the template
-session-id: wechat-alice      # default: wechat-<sanitized contact>
-session-dir: ~/.wechat-bro/contacts/Alice/session
-cwd: ~/.wechat-bro/contacts/Alice
-timeout: 900                  # seconds
-notify: true                  # concise note → filehelper at dispatch time,
-                              # only when the message needs a response (never
-                              # for context-only or the owner's own messages)
----
-Alice-specific instructions…
+contacts: [Alice]             # maintainer mode by default
+contacts-assistant: [Bob]     # assistant-managed mode
 ```
 
-The `type: orchestrator` agent has FIXED paths — `cwd` = `~/.wechat-bro`,
-`session-id` = `wechat-orchestrator`, `session-dir` = `~/.wechat-bro/session`
-(not configurable via frontmatter).
+Routing priority for a contact is:
 
-Routing: `me → filehelper` messages go to the `type: orchestrator` agent in
-**assistant mode** (always answered, replies prefixed 🤖); contact messages
-match a dedicated `contacts-assistant:` agent first, then a dedicated
-`contacts:` agent, then the unrestricted `type: contact` / `type: room`
-default. Watch list = union of all `contacts:` + `contacts-assistant:`. The
-owner's own messages to a watched contact dispatch too: assistant-managed
-contacts **answer the owner** (assistant mode responds to anyone, `me`
-included), maintainer-managed contacts silently **record** the message in
-that contact's session as context — never replied. Per contact, dispatch writes the message to a task file, symlinks
-the chosen agent md as `AGENTS.md` in the contact's root (the harness cwd),
-and runs the rendered harness template headless — one invocation per message,
-the session resumed via the template's own session flags. A
-task is never run concurrently with itself; failures are reported to
-`filehelper`.
+1. exact `contacts-assistant:` match;
+2. exact `contacts:` match;
+3. unrestricted default `type: contact` or `type: room` agent.
+
+A name present in both lists resolves to assistant mode.
+
+`filehelper` is reserved for the account owner and is always handled by the orchestrator in assistant mode.
 
 ### Modes
 
-Two modes, **mutually exclusive per task** (one dispatch = one mode), with
-deliberately opposite business goals:
+**Maintainer mode** is the default for `contacts:`. The contact agent participates naturally on the account owner's behalf, does not volunteer AI/orchestrator internals, and escalates decisions that require the owner.
 
-- **Maintainer** (default for all contacts): **hide AI from the counterpart**
-  — converse as the account owner, never admit to being an assistant; deflect
-  if asked, never confirm, never lie. Escalation replies from the owner are
-  delivered in this mode too.
-- **Assistant**: the sender explicitly talks to the AI (via `?!xxx` ping or a
-  `contacts-assistant` configuration) or IS the owner (filehelper) — answer
-  directly, admitting to be an AI is expected, replies prefixed 🤖.
+A `?!` or `？！` assistant ping promotes that individual message to assistant mode.
 
-**Per-contact mode configuration** — frontmatter decides the default per
-contact:
+**Assistant-managed mode** is selected through `contacts-assistant:`. Ordinary contact messages are context-only unless they explicitly ping the AI with `?!` / `？！`; owner messages in that chat may still be answered as assistant tasks.
 
-- `contacts: [Alice]` → maintainer mode; a `?!` ping promotes just that
-  message to assistant.
-- `contacts-assistant: [Bob]` → assistant-managed: every message dispatches
-  as assistant, but **only `?!` pings get replies** (open, 🤖); ordinary
-  messages are **context-only** — recorded in the session, never answered
-  (`{"status":"ignored"}`). Exception: the **owner's own** messages in Bob's
-  chat are always answered (assistant mode responds to anyone, `me` included).
-- `filehelper` → always assistant (never record-only). The orchestrator
-  agent declares it via `contacts-assistant: [filehelper]`.
-- **Owner's messages in maintainer-managed chats** → recorded context-only
-  into that contact's session (`{"status":"ignored"}`) so the maintainer
-  persona keeps the full picture without ever answering as an AI.
+The task payload generated by the orchestrator is authoritative for whether a dispatch is assistant, maintainer, or context-only. Contact agents should execute that mode rather than reconstruct routing rules themselves.
 
-A contact declared in both lists resolves to assistant. To monitor a contact
-with no dedicated agent md, just list it under `contacts:` in any agent md —
-the type default (individual/room maintainer) handles it in maintainer mode.
+### Rules and memory
 
-### Task payload & skill loading
+Persistence lives under `WECHAT_BRO_DATA_DIR` (default `~/.wechat-bro`):
 
-Tasks are **self-contained**: the agent md (symlinked `AGENTS.md`) inlines the
-only wechat-bro command a task needs (`send-text` via stdin pipe) — tasks do
-**not** load the full wechat-bro skill protocol.
+```text
+~/.wechat-bro/
+├── rules.md
+├── memory.md
+├── agents/
+└── contacts/<contact>/
+    ├── rules.md
+    ├── memory.md
+    ├── knowledge/
+    ├── download/
+    └── session/
+```
+
+Use:
+
+- `rules.md` for instructions that control future behavior;
+- `memory.md` for durable facts/context worth remembering;
+- global files for account-wide behavior/facts;
+- contact files for information that applies only to one person or room.
+
+Contact rules take precedence over global rules when they intentionally specialize behavior for that contact. Agent safety/role instructions still outrank user-authored rule files.
+
+Examples:
+
+```text
+# ~/.wechat-bro/rules.md
+Do not disclose the account owner's home address to contacts.
+```
+
+```text
+# ~/.wechat-bro/contacts/Alice/rules.md
+Use concise, professional English with Alice.
+```
+
+```text
+# ~/.wechat-bro/contacts/Alice/memory.md
+Alice works on Project Atlas and usually prefers short replies.
+```
+
+## 3. Escalation
+
+Escalate when the agent cannot safely or truthfully act without an account-owner decision, especially when a reply would create/change a commitment, authorize money, expose private information, or make another consequential decision on the owner's behalf.
+
+Do not escalate merely because a topic mentions schedules, money, or private matters if an already-authorized, safe factual answer is clearly available in rules/context.
+
+### Path
+
+```text
+contact message
+    ↓
+contact agent
+    ↓  {"status":"escalated","question":"..."}
+orchestrator
+    ↓  🤖❓ request through filehelper
+account owner
+    ↓  answer through filehelper
+orchestrator
+    ↓  same contact's existing session
+contact agent
+    ↓  natural relay to contact
+contact
+```
+
+Before returning `escalated`, a contact agent may send a short holding response when appropriate, for example `我确认一下，稍后回复你。`.
+
+When the owner's answer is routed back to the contact session, relay the decision naturally in maintainer mode and persist a durable decision to `rules.md` or `memory.md` only when it will matter later.
 
 ### Task result contract
 
-Every dispatched task must send its WeChat reply (if any) **before** it ends,
-then terminate with exactly one JSON result line as the last line of its
-output — the orchestrator parses it:
+The last output line of every dispatched contact task must be exactly one JSON result:
 
-| result | meaning |
+```json
+{"status":"addressed"}
+{"status":"ignored"}
+{"status":"escalated","question":"<what the owner must decide, with context>"}
+```
+
+Use the states consistently:
+
+- `addressed` — the task performed an outbound reply/action that handled the message;
+- `ignored` — no outbound reply/action was needed, including context-only tasks;
+- `escalated` — owner input is required before the conversation can be completed.
+
+The WeChat reply/action, if any, must happen before the final result line.
+
+## 4. Choose the command by purpose
+
+Contacts are identified by their exact `name`. The account owner is `me`. `filehelper` and `文件传输助手` resolve to the same system chat.
+
+| Purpose | Command |
 |---|---|
-| `{"status":"addressed"}` | handled (replied, or deliberately silent per rules) |
-| `{"status":"ignored"}` | no reply was needed |
-| `{"status":"escalated","question":"…"}` | needs the account owner's decision |
+| list individual contacts | `contacts` |
+| list rooms | `rooms` |
+| inspect one contact/room | `get-contact` |
+| list room members | `room-members` |
+| send text | `send-text` |
+| send image from local disk | `send-image` |
+| send arbitrary file | `send-file` |
+| transcribe local audio and send transcription | `send-voice` |
+| inspect login/contact readiness | `status` |
+| list supported emoji codes | `emojis` |
+| graceful shutdown | `exit` |
 
-Missing/malformed output degrades gracefully to `addressed`. On `escalated`,
-the orchestrator reports to the owner via `filehelper` in a fixed format
-(`🤖❓ 请示 — <contact> …`); the owner's next filehelper reply is routed back
-into that contact's session — recorded in the contact's history, delivered to
-the contact, and settleable into `rules.md`/`memory.md`.
+### Command examples
 
-### Harness
+```bash
+npx wechat-bro contacts
+npx wechat-bro rooms
+npx wechat-bro get-contact --name "Alice"
+npx wechat-bro room-members --name "Dev Team"
+```
 
-Per-contact tasks run through **each harness's own CLI in headless mode** — one
-invocation per message batch, session resumed each time, working directory set
-to the contact's root folder so all relative reads/writes stay inside it.
+For agent actions, stdin JSON is convenient:
 
-Dispatch contract (any harness): non-interactive one-shot mode, resumable
-session stored under the contact's `session/`, cwd = contact root. A `harness:`
-set to a **bare name** picks that CLI's built-in template; `pi` is the default
-when unset. Built-in names: `pi`, `claude`, `codex`, `copilot` — each bakes in
-that CLI's headless/resume/approval flags (e.g. resume-or-first-run fallback,
-`--allow-all`/skip-permissions so the agent can actually send). There are no
-provider/model/thinking frontmatter keys — every such flag lives straight in
-your template.
+```bash
+echo '{"cmd":"send-text","to":"Alice","content":"hello"}' | npx wechat-bro
 
-`harness:` (frontmatter, or the `--harness` flag to override every agent) is
-either a built-in name or a custom shell command template run via
-`/bin/sh -c`; `{var}` placeholders are substituted with shell-quoted values:
+echo '{"cmd":"send-image","to":"Alice","path":"/tmp/photo.jpg"}' | npx wechat-bro
+
+echo '{"cmd":"send-file","to":"Alice","path":"/tmp/report.pdf","filename":"report.pdf"}' | npx wechat-bro
+```
+
+`send-voice` does **not** create a native WeChat voice bubble: it transcribes the local audio with Whisper and sends the transcription as text.
+
+### Contact ambiguity
+
+Never guess when a name resolves to zero or multiple contacts. Surface the resolution error and ask the user to disambiguate/use a unique remark name.
+
+### Room mentions
+
+Use the exact quoted syntax:
+
+```text
+@"Alice Chen"
+```
+
+Example:
+
+```json
+{"cmd":"send-text","to":"Dev Team","content":"@\"Alice Chen\" please check the PR"}
+```
+
+Unquoted `@Alice Chen` is literal text, not a structured mention. A room member who is not an individual contact may be mentioned in the room but cannot be direct-messaged as a contact.
+
+### Markdown and generated assets
+
+`send-text` supports lightweight markdown conversion. Fenced blocks are special:
+
+- `mermaid` → `diagram.png`;
+- `marpit` → `slides.pdf`.
+
+Text outside the block is sent as normal message content. Multiple render blocks are supported in order.
+
+## 5. Build a custom listener or orchestrator
+
+The bundled orchestrator is optional. For custom automation, connect directly to:
+
+```text
+ws://localhost:9231
+```
+
+A custom listener can:
+
+1. connect to the WebSocket daemon;
+2. receive events;
+3. filter contacts/messages itself;
+4. invoke any agent/business logic;
+5. issue JSON commands back to `wechat-bro`.
+
+Minimal Node.js listener shape:
+
+```js
+const WebSocket = require('ws')
+const ws = new WebSocket('ws://localhost:9231')
+
+ws.on('message', async (raw) => {
+  const event = JSON.parse(raw.toString())
+  if (event.event !== 'message:text') return
+  if (event.data.from !== 'Alice') return
+
+  // custom logic here
+})
+```
+
+Use this path when you need custom routing, another persistence model, business workflows, or an orchestrator architecture different from the bundled one.
+
+## Protocol reference
+
+### WebSocket events
+
+Server events are broadcast as JSON:
+
+```json
+{"event":"message:text","data":{...},"ts":1785200000000}
+```
+
+Important lifecycle events include `connected`, `ready`, `scan`, `login`, `logout`, and `contacts-ready`.
+
+Incoming text messages expose text through `data.Content`.
+
+Incoming non-text message events use simplified `data.content` values:
+
+| type | `content` | extra |
+|---|---|---|
+| image | downloaded image path | |
+| voice | Whisper transcription, falling back to audio path | `voiceFile` |
+| video / microvideo | downloaded `.mp4` path | |
+| emoticon | emoji CDN URL | |
+| location | readable label | |
+| card | readable contact-card text | |
+| verify / status | readable text | |
+
+Downloaded media is stored in the relevant chat's `download/` folder.
+
+Suppressed incoming types currently include `app` (49, including file attachments/shared articles), `system` (10000), and `recalled` (10002); do not design a custom listener assuming those events will arrive.
+
+### Room event fields
+
+For a room message:
+
+- `from` identifies the room/chat;
+- `sender` identifies the actual member who spoke;
+- `mentions` lists resolved mentions;
+- `mentionMe` indicates whether the account was mentioned.
+
+### Bundled agent definitions
+
+Default agents are shipped in `skills/wechat-bro/agents/` and are used as fallbacks. User overrides live only in:
+
+```text
+~/.wechat-bro/agents/
+```
+
+User agent files reload on each incoming message, so editing frontmatter or instructions does not require an orchestrator restart.
+
+Frontmatter example:
+
+```markdown
+---
+name: wechat-alice
+contacts: [Alice]
+type: contact
+harness: codex
+session-id: wechat-alice
+session-dir: ~/.wechat-bro/contacts/Alice/session
+cwd: ~/.wechat-bro/contacts/Alice
+timeout: 900
+notify: true
+---
+Alice-specific instructions...
+```
+
+Useful frontmatter keys:
+
+- `name` — unique agent name;
+- `contacts` — exact names watched in maintainer mode;
+- `contacts-assistant` — exact names watched in assistant-managed mode;
+- `type` — `contact`, `room`, or `orchestrator`;
+- `harness` — built-in harness name or custom command template;
+- `session-id`, `session-dir`, `cwd`, `timeout`, `notify` — dispatch controls.
+
+The `type: orchestrator` task uses fixed orchestrator cwd/session paths under the data directory.
+
+### Harness template placeholders
+
+Custom harness command templates may use:
 
 | placeholder | value |
 |---|---|
-| `{task}` | task file name relative to the task cwd |
-| `{task-path}` | absolute task file path |
-| `{session-dir}` / `{session-id}` | where the harness stores/resumes that contact's history |
-| `{cwd}` | task working directory (the contact root) |
-| `{contact}` / `{name}` | chat being served / agent name |
-| `{timeout}` | dispatch timeout in seconds (frontmatter `timeout:`) |
+| `{task}` | task filename relative to cwd |
+| `{task-path}` | absolute task path |
+| `{session-dir}` | contact session directory |
+| `{session-id}` | resumable session id |
+| `{cwd}` | task working directory |
+| `{contact}` | contact/chat name |
+| `{name}` | agent name |
+| `{timeout}` | task timeout seconds |
 
-Example custom templates (when the built-ins don't fit):
+Example:
 
 ```markdown
-harness: claude -p --session-id {session-id} --append-system-prompt "$(cat AGENTS.md)" < {task}
 harness: codex exec resume {session-id} < {task-path}
 ```
 
-   filehelper. Nothing is monitored until that scan happens.
+## When to use which layer
+
+Use the **bundled orchestrator** when the goal is ongoing personal WeChat assistance, watch-list management, per-contact behavior, persistence, and escalation.
+
+Use the **direct commands** when the goal is a one-off WeChat action such as sending a message or inspecting contacts.
+
+Use the **WebSocket protocol** when the goal is to build a custom listener, custom orchestrator, or application-specific automation.

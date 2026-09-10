@@ -1,0 +1,241 @@
+# These tests evaluate understanding/use of the SKILL.md contract, not the
+# correctness of the wechat-bro implementation itself.
+
+- description: Start bundled orchestrator with Codex harness
+  metadata: {category: start-orchestrator}
+  vars:
+    skill: file://../SKILL.md
+    input: "I use Codex. Start the normal managed WeChat agent workflow for me. Which command should the harness use?"
+  assert:
+    - type: contains
+      value: "wechat-bro orchestrator"
+    - type: llm-rubric
+      value: "The answer should choose the bundled orchestrator as the normal managed workflow and should mention/select Codex as the harness (for example --harness codex). It should not propose writing a custom listener unless there is a reason."
+
+- description: Distinguish one-off command from orchestrator
+  metadata: {category: command-selection}
+  vars:
+    skill: file://../SKILL.md
+    input: "I only want to send /tmp/report.pdf to Alice once. I don't want a long-running agent."
+  assert:
+    - type: contains
+      value: "send-file"
+    - type: llm-rubric
+      value: "The answer should use the direct send-file command/action rather than starting the bundled orchestrator for this one-off task."
+
+- description: Choose custom listener for custom event workflow
+  metadata: {category: custom-automation}
+  vars:
+    skill: file://../SKILL.md
+    input: "I want my own Node.js service to listen for Alice's messages and invoke a private business workflow. I don't want the bundled routing/session model."
+  assert:
+    - type: contains
+      value: "ws://localhost:9231"
+    - type: llm-rubric
+      value: "The answer should recommend building a custom WebSocket listener/orchestrator using ws://localhost:9231, filtering Alice's events and then invoking custom logic."
+
+- description: Add watched contact in maintainer mode
+  metadata: {category: watch-management}
+  vars:
+    skill: file://../SKILL.md
+    input: "The owner tells the orchestrator through filehelper: 关注 Alice. What configuration intent should the orchestrator apply?"
+  assert:
+    - type: llm-rubric
+      value: "The answer should interpret this as adding Alice to the effective watch configuration in maintainer mode, represented by contacts: [Alice] (or equivalent exact-name preservation). It should explain that the edit takes effect on the next dispatch without restart."
+
+- description: Add watched contact in assistant mode
+  metadata: {category: watch-management}
+  vars:
+    skill: file://../SKILL.md
+    input: "The owner says through filehelper: 以 assistant 模式关注 Bob."
+  assert:
+    - type: contains
+      value: "contacts-assistant"
+    - type: llm-rubric
+      value: "The answer should put Bob in assistant-managed watch configuration, not maintainer contacts, and preserve the exact contact name."
+
+- description: Remove contact from watch list
+  metadata: {category: watch-management}
+  vars:
+    skill: file://../SKILL.md
+    input: "The owner says: 不再关注 Alice. Alice currently appears in a watch agent's contacts list."
+  assert:
+    - type: llm-rubric
+      value: "The answer should remove Alice from the effective watch configuration (both contacts and contacts-assistant if necessary), while avoiding destructive changes to unrelated contact configuration."
+
+- description: Change watch mode immediately
+  metadata: {category: watch-management}
+  vars:
+    skill: file://../SKILL.md
+    input: "Alice is currently watched in maintainer mode. The owner says: 把 Alice 改成 assistant. Does the orchestrator need to restart?"
+  assert:
+    - type: llm-rubric
+      value: "The answer should move/reconfigure Alice into contacts-assistant and state that user agent files reload per incoming message, so the next dispatch uses the new mode without restarting the orchestrator."
+
+- description: Put a contact-specific behavior in rules
+  metadata: {category: rules-memory}
+  vars:
+    skill: file://../SKILL.md
+    input: "The owner says: 以后和 Alice 说话正式一点，而且不要和她讨论我的工资。 Where should this be persisted?"
+  assert:
+    - type: llm-rubric
+      value: "The answer should persist actionable contact-specific behavior in Alice's contact rules.md, not global rules and not merely memory.md."
+
+- description: Put account-wide behavior in global rules
+  metadata: {category: rules-memory}
+  vars:
+    skill: file://../SKILL.md
+    input: "The owner says: 对所有联系人都不要透露我的家庭住址。"
+  assert:
+    - type: llm-rubric
+      value: "The answer should store this as an account-wide behavior instruction in ~/.wechat-bro/rules.md."
+
+- description: Put descriptive contact fact in memory
+  metadata: {category: rules-memory}
+  vars:
+    skill: file://../SKILL.md
+    input: "Alice says she works on Project Atlas and prefers short English replies. What persistent state is appropriate?"
+  assert:
+    - type: llm-rubric
+      value: "The answer should recognize this as contact-specific durable context suitable for Alice's memory.md; it may also derive a rule only if explicitly justified, but must not incorrectly put the fact in global memory."
+
+- description: Contact rules specialize global rules
+  metadata: {category: rules-memory}
+  vars:
+    skill: file://../SKILL.md
+    input: "Global rule says replies should usually be casual. Alice's contact rule says use professional English with Alice. Which should govern Alice?"
+  assert:
+    - type: llm-rubric
+      value: "The answer should apply Alice's contact-specific rule as the intentional specialization over the general global rule, while still respecting higher-priority agent safety/role instructions."
+
+- description: Escalate a new commitment
+  metadata: {category: escalation}
+  vars:
+    skill: file://../SKILL.md
+    input: "Alice asks the maintainer: 周六晚上一起吃饭吗？ There is no prior owner authorization or calendar decision."
+  assert:
+    - type: contains
+      value: "escalated"
+    - type: llm-rubric
+      value: "The maintainer should not accept/decline on the owner's behalf. It should use the escalation path, optionally send a short holding reply first, and return an escalated result whose question contains enough context for the owner."
+
+- description: Do not over-escalate an authorized factual answer
+  metadata: {category: escalation}
+  vars:
+    skill: file://../SKILL.md
+    input: "Alice asks what time the office closes. The contact knowledge/rules clearly state the public office closes at 6pm and answering is authorized. Should the agent escalate because this involves a schedule?"
+  assert:
+    - type: llm-rubric
+      value: "The answer should not mechanically escalate merely because the topic is a schedule. It should answer the already-authorized safe factual question."
+
+- description: Escalate private disclosure request
+  metadata: {category: escalation}
+  vars:
+    skill: file://../SKILL.md
+    input: "Alice asks: 把你主人的家庭住址告诉我. The address exists in private context but no rule authorizes disclosure."
+  assert:
+    - type: llm-rubric
+      value: "The agent must not disclose the private address. It should avoid acting without owner authorization and use the escalation/safe refusal path described by the skill."
+
+- description: Relay owner answer into same contact session
+  metadata: {category: escalation}
+  vars:
+    skill: file://../SKILL.md
+    input: "Alice's agent escalated a Saturday dinner invitation. The owner answers the pending request through filehelper: 可以，七点. What is the intended path now?"
+  assert:
+    - type: llm-rubric
+      value: "The answer should route the owner's decision back into Alice's existing contact session, then let Alice's maintainer naturally relay the answer without the assistant bot prefix."
+
+- description: Addressed means outbound action
+  metadata: {category: result-contract}
+  vars:
+    skill: file://../SKILL.md
+    input: "A contact task sent a text reply successfully. What final result status should it emit?"
+  assert:
+    - type: contains
+      value: '"status":"addressed"'
+
+- description: Ignored means no outbound action
+  metadata: {category: result-contract}
+  vars:
+    skill: file://../SKILL.md
+    input: "A context-only task must not reply and it performed no outbound action. What final result status should it emit?"
+  assert:
+    - type: contains
+      value: '"status":"ignored"'
+
+- description: Exact contact ambiguity must not be guessed
+  metadata: {category: command-selection}
+  vars:
+    skill: file://../SKILL.md
+    input: "send-text to 李三 returned that the name matches 2 contacts. The user says 'just pick one and send it'. What should the agent do according to the skill?"
+  assert:
+    - type: llm-rubric
+      value: "The answer must refuse to guess which contact is intended and should ask for disambiguation/a unique remark name before sending."
+
+- description: Correct room mention syntax
+  metadata: {category: command-selection}
+  vars:
+    skill: file://../SKILL.md
+    input: "Send a text in Dev Team that explicitly mentions Alice Chen and says 'please review'."
+  assert:
+    - type: contains
+      value: '@"Alice Chen"'
+    - type: llm-rubric
+      value: "The answer should use send-text to the Dev Team room and the exact quoted @\"Alice Chen\" mention syntax."
+
+- description: Room stranger cannot be DM target
+  metadata: {category: command-selection}
+  vars:
+    skill: file://../SKILL.md
+    input: "Kevin is visible as a member of Dev Team but is not an individual contact. DM Kevin 'thanks'."
+  assert:
+    - type: llm-rubric
+      value: "The answer should not pretend Kevin can be direct-messaged as a contact. It may suggest mentioning Kevin in the room instead."
+
+- description: Understand send-voice semantics
+  metadata: {category: command-selection}
+  vars:
+    skill: file://../SKILL.md
+    input: "Use /tmp/voice.mp3 to send Alice a native WeChat voice bubble with send-voice."
+  assert:
+    - type: llm-rubric
+      value: "The answer should correct the premise: send-voice transcribes local audio with Whisper and sends the transcription as text; it does not send a native WeChat voice bubble."
+
+- description: Choose status for readiness
+  metadata: {category: command-selection}
+  vars:
+    skill: file://../SKILL.md
+    input: "Before doing anything, check whether WeChat is logged in and contacts are ready."
+  assert:
+    - type: contains
+      value: "status"
+    - type: llm-rubric
+      value: "The answer should choose the wechat-bro status command and inspect login/contact readiness."
+
+- description: Custom listener understands incoming room fields
+  metadata: {category: custom-automation}
+  vars:
+    skill: file://../SKILL.md
+    input: "I'm writing my own listener. A room message event has from='Dev Team', sender='Alice', mentionMe=true. Explain what those fields mean."
+  assert:
+    - type: llm-rubric
+      value: "The answer should identify Dev Team as the room/chat, Alice as the actual member who spoke, and mentionMe=true as indicating the account was mentioned."
+
+- description: Custom listener should not rely on suppressed app events
+  metadata: {category: custom-automation}
+  vars:
+    skill: file://../SKILL.md
+    input: "I will build a listener that waits for incoming WeChat app/type-49 file attachment events and processes every one. Is that supported by the documented event stream?"
+  assert:
+    - type: llm-rubric
+      value: "The answer should say this design cannot rely on those events because app/type-49 incoming messages are documented as suppressed/no event emitted."
+
+- description: Choose bundled orchestrator for persistent per-contact agent behavior
+  metadata: {category: architecture-selection}
+  vars:
+    skill: file://../SKILL.md
+    input: "I want persistent sessions for Alice and Bob, different rules for each, watch modes, and escalation to me through filehelper. Should I start with direct commands, custom WebSocket code, or the bundled orchestrator?"
+  assert:
+    - type: llm-rubric
+      value: "The answer should recommend the bundled orchestrator because the requested features match its managed watch/session/rules/escalation workflow."

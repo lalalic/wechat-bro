@@ -1,0 +1,16 @@
+description: wechat-bro skill capability evaluation
+
+prompts:
+  - file://prompt.md
+
+# Override at runtime if desired, e.g.:
+#   npx promptfoo@latest eval -c skills/wechat-bro/evals/promptfooconfig.yaml --provider openai:responses:gpt-5.4-mini
+providers:
+  - openai:responses:gpt-5.4-mini
+
+defaultTest:
+  options:
+    provider: openai:responses:gpt-5.4
+
+tests:
+  - file://tests.yaml

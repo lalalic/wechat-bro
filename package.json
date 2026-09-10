@@ -1,6 +1,6 @@
 {
   "name": "wechat-bro",
-  "version": "1.6.1",
+  "version": "1.6.2",
   "description": "AI agent interface for WeChat Web — send/receive messages, manage contacts, upload media, transcribe voice",
   "type": "commonjs",
   "bin": {
@@ -14,6 +14,7 @@
   "scripts": {
     "start": "node src/cli.js",
     "test": "node test/test-inject.js",
+    "eval:skill": "npx promptfoo@latest eval -c skills/wechat-bro/evals/promptfooconfig.yaml",
     "push": "GIT_SSH_COMMAND=\"ssh -i ~/.ssh/id_ed25519_1 -o IdentitiesOnly=yes\" git push",
     "postinstall": "node -e \"const p=require('path'),o=require('os'),d=p.join(o.homedir(),'.wechat-bro','chromium');process.env.PUPPETEER_CACHE_DIR=d;const pup=require('puppeteer');(async()=>{try{await pup.executablePath()}catch{require('child_process').execSync('npx @puppeteer/browsers install chrome@stable --path \\\"'+d+'\\\"',{stdio:'inherit',timeout:300000})}})()\""
   },
