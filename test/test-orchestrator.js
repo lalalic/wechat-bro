@@ -131,10 +131,11 @@ ok(task.includes('**Alice**') && task.includes('"Content": "hi"'), 'renderTask: 
 const task2 = m.renderTask({ from: 'Dev Team', sender: 'Alice', type: 'image' }, 'media note')
 ok(task2.includes('sender: Alice') && task2.includes('media note'), 'renderTask: room sender + extra note')
 
-// me-sender modes: assistant chat answers the owner, maintainer chat records
-const taskMeAssistant = m.renderTask({ from: 'me', to: 'Carol', type: 'text', Content: 'hi' }, null, { assistant: true, recordOnly: false })
-ok(taskMeAssistant.includes('ASSISTANT MODE') && taskMeAssistant.includes('account owner'), 'renderTask: me → assistant chat gets ASSISTANT MODE (owner addressed)')
-ok(!taskMeAssistant.includes('Assistant-ping protocol'), 'renderTask: me → assistant chat has no ping-only restriction')
+// me-sender modes: assistant chats answer only an explicit ping; maintainer chats record
+const taskMeAssistant = m.renderTask({ from: 'me', to: 'Carol', type: 'text', Content: 'hi?!' }, null, { assistant: true, recordOnly: false })
+ok(taskMeAssistant.includes('ASSISTANT MODE') && taskMeAssistant.includes('account owner'), 'renderTask: me → assistant chat gets ASSISTANT MODE for an explicit ping')
+const taskMeAssistantRecord = m.renderTask({ from: 'me', to: 'Carol', type: 'text', Content: 'hi' }, null, { assistant: true, recordOnly: true })
+ok(taskMeAssistantRecord.includes('CONTEXT-ONLY MESSAGE') && taskMeAssistantRecord.includes('assistant-managed') && taskMeAssistantRecord.includes('no `?!`') && !taskMeAssistantRecord.includes('maintainer persona'), 'renderTask: me → assistant chat records ordinary owner message with assistant-managed reason')
 const taskMeRecord = m.renderTask({ from: 'me', to: 'Bob', type: 'text', Content: 'note' }, null, { assistant: false, recordOnly: true })
 ok(taskMeRecord.includes('CONTEXT-ONLY MESSAGE') && taskMeRecord.includes('account owner'), 'renderTask: me → maintainer chat recorded context-only')
 const taskContactRecord = m.renderTask({ from: 'Carol', to: 'me', type: 'text', Content: 'hi' }, null, { assistant: true, recordOnly: true })

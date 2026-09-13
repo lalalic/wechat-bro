@@ -13,7 +13,7 @@
  *      data-dir root
  *   3. unwatched contact        → no dispatch
  *   8. me → maintainer-managed contact → context-only record into that session
- *   9. me → assistant-managed contact → assistant mode reply
+ *   9. me → assistant-managed contact → context-only unless explicitly pinged
  *
  * The harness is a `cat {task} > <out>` shell template, so the rendered task
  * file survives the orchestrator's post-dispatch cleanup and can be asserted.
@@ -236,18 +236,28 @@ broadcast('message', { from: 'Alice', to: 'me', type: 'text', Content: '你能�
     ok(false, 'e2e: own message to maintainer contact dispatched')
   }
 
-  // 9. me → assistant-managed contact: the assistant answers the owner too
-  // (request: assistant mode responds to anyone's message, including me)
+  // 9. me → assistant-managed contact: ordinary owner messages are context-only
   broadcast('message', { from: 'me', to: 'Carol', type: 'text', Content: '提醒我下午三点开会', ts: Date.now() })
   await sleep(1500)
   if (fs.existsSync(out4)) {
     const t = fs.readFileSync(out4, 'utf8')
-    ok(t.includes('ASSISTANT MODE') && t.includes('account owner'), 'e2e: me → assistant-managed chat gets ASSISTANT MODE reply')
-    ok(!t.includes('CONTEXT-ONLY MESSAGE'), 'e2e: me → assistant-managed chat is not record-only')
+    ok(t.includes('CONTEXT-ONLY MESSAGE') && t.includes('assistant-managed') && t.includes('no `?!`'), 'e2e: me → assistant-managed chat records ordinary owner message with assistant-managed reason')
+    ok(!t.includes('ASSISTANT MODE'), 'e2e: ordinary owner message does NOT trigger assistant mode')
   } else {
     ok(false, 'e2e: own message to assistant-managed contact dispatched')
   }
-  ok(sent.filter(s => s.to === 'filehelper' && String(s.content).startsWith('📨 Carol:')).length === 1, 'e2e: notify NOT sent for owner-originated message (still 1 from the ping)')
+  ok(sent.filter(s => s.to === 'filehelper' && String(s.content).startsWith('📨 Carol:')).length === 1, 'e2e: notify NOT sent for ordinary owner message')
+
+  // 10. owner `?!` ping → assistant mode
+  broadcast('message', { from: 'me', to: 'Carol', type: 'text', Content: '帮我安排一下下午三点开会?!', ts: Date.now() })
+  await sleep(1500)
+  if (fs.existsSync(out4)) {
+    const t = fs.readFileSync(out4, 'utf8')
+    ok(t.includes('ASSISTANT MODE') && t.includes('account owner'), 'e2e: me → assistant-managed chat, ?! ping → assistant mode')
+    ok(!t.includes('CONTEXT-ONLY MESSAGE'), 'e2e: owner ?! ping is not record-only')
+  } else {
+    ok(false, 'e2e: owner assistant ping dispatched')
+  }
 
   child.kill('SIGTERM')
   wss.close()
