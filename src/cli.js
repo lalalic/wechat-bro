@@ -41,6 +41,7 @@ const os = require('os')
 const { execSync } = require('child_process')
 const readline = require('readline')
 const puppeteer = require('puppeteer')
+const qrcode = require('qrcode-terminal')
 // NOTE: WeChat login QR code is intentionally NOT drawn in the terminal.
 // The scan event emits {url} — open it in a browser window (headless mode)
 // or paste the URL into any browser to scan. This keeps terminal output
@@ -107,6 +108,7 @@ function toLoginUrl(qrUrl) {
 }
 
 let lastQrUrl = null
+let lastQrPayload = null
 let chromePath = null  // detected in main(), used by mermaid render
 let _wsBroadcast = null  // set by main() for event broadcasting
 
@@ -456,6 +458,17 @@ async function sendCommandViaWs(ws, request) {
     let msg
     try { msg = JSON.parse(raw.toString()) } catch { return }
     if (msg.id === id) {
+      if (request.cmd === 'barcode' && msg.ok) {
+        const payload = msg.data || {}
+        const url = payload.loginUrl || payload.url
+        if (url) {
+          process.stdout.write('Scan this WeChat QR code:\n')
+          qrcode.generate(url, { small: true })
+          process.stdout.write(`\nLogin URL: ${url}\n`)
+        }
+        ws.close()
+        process.exit(0)
+      }
       process.stdout.write(JSON.stringify(msg, null, process.argv.indexOf('--pretty') !== -1 ? 2 : 0) + '\n')
       ws.close()
       process.exit(0)
@@ -617,6 +630,7 @@ Commands:
   send-image --to <name> --path <file> [--filename <name>]
   send-file  --to <name> --path <file> --filename <name>
   send-voice --to <name> --path <file>   (transcribe + send as text)
+  barcode                      Render the current login QR in this terminal
   status                       Show login/contacts state
   emojis                       List supported emoji codes
   config --key <k> --value <v> Set a config option
@@ -697,7 +711,7 @@ async function main() {
   // "dispatch not ready".
   let _markPageReady
   const pageReady = new Promise((resolve) => { _markPageReady = resolve })
-  let wsDispatch = async (cmd, args) => { await pageReady; throw new Error('dispatch not ready') }
+  let wsDispatch = async (cmd, args) => { await pageReady; return wsDispatch(cmd, args) }
 
   const ws = wsServer.create({
     port: WS_PORT,
@@ -790,6 +804,7 @@ async function main() {
     // clean for agent piping. The user avatar is persisted above by
     // saveUserAvatar, which also swaps data.userAvatar for the file path.)
     if (event === 'scan' && data) {
+      lastQrPayload = data
       if (data.url && !HEADED && data.url !== lastQrUrl) {
         lastQrUrl = data.url
         const openCmd = process.platform === 'win32' ? 'start' : (process.platform === 'darwin' ? 'open' : 'xdg-open')
@@ -935,6 +950,14 @@ function parseSegments(content) {
 // ── Command dispatcher ────────────────────────────────────────────────────
 async function dispatch(cmd, args, page) {
   switch (cmd) {
+    case 'barcode':
+    case 'qr':
+    case 'get-barcode':
+      if (!lastQrPayload || !lastQrPayload.url) {
+        throw new Error('No login QR is currently available (the account may already be logged in)')
+      }
+      return lastQrPayload
+
     case 'contacts':
       // Individuals only (isContact===true, not a room). Names only.
       return page.evaluate(() =>

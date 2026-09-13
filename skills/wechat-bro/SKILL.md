@@ -22,8 +22,11 @@ description: 让 AI harness 操作和定制微信：启动内置 orchestrator、
 普通的长期微信 agent 场景，直接启动：
 
 ```bash
-npx wechat-bro orchestrator
+npx wechat-bro orchestrator --harness <current-session-harness>
 ```
+
+优先复用当前 AI session 使用的 harness；例如当前 session 是 Codex 时使用
+`--harness codex`。只有无法确定当前 harness 时才省略该参数并使用 `pi` 默认值。
 
 orchestrator 会：
 
@@ -44,7 +47,7 @@ npx wechat-bro orchestrator --harness pi
 npx wechat-bro orchestrator --port 9231
 ```
 
-`pi` 是默认 harness。也可以在 agent frontmatter 的 `harness:` 或 `--harness` 中提供 custom shell template。
+`--harness` 会覆盖所有 agent 的配置。也可以在 agent frontmatter 的 `harness:` 中提供 custom shell template；若未指定且当前 session harness 不可用，`pi` 是默认 fallback。
 
 ### Harness dispatch contract
 
@@ -209,6 +212,7 @@ contact
 | 发送本地图片 | `send-image` |
 | 发送任意文件 | `send-file` |
 | 转写本地音频并发送文本 | `send-voice` |
+| 在终端显示登录二维码 | `barcode` |
 | 检查登录/联系人加载状态 | `status` |
 | 列出支持的 emoji code | `emojis` |
 | 正常退出 | `exit` |
@@ -220,7 +224,10 @@ npx wechat-bro contacts
 npx wechat-bro rooms
 npx wechat-bro get-contact --name "Alice"
 npx wechat-bro room-members --name "Dev Team"
+npx wechat-bro barcode
 ```
+
+账号未登录时，`barcode` 会把当前登录二维码直接渲染到终端，适合 SSH 或系统浏览器未能打开二维码的情况。
 
 agent action 常用 stdin JSON：
 

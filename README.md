@@ -46,6 +46,9 @@ wechat-bro --headed
 # Subsequent runs — headless with saved cookies:
 wechat-bro
 
+# Render the current login QR directly in this terminal (also works over SSH):
+wechat-bro barcode
+
 # Connect agents via WebSocket:
 ws://localhost:9231
 ```
@@ -73,10 +76,11 @@ is stripped. Text messages keep the raw `Content` field.
 **Never emitted**: `app` (49, incl. file attachments & shared articles),
 `system` (10000), `recalled` (10002) — XML wire noise agents don't need.
 
-> **Login QR**: the QR code is **not** drawn in the terminal. On a `scan`
-> event, when running headless the QR URL is opened in your default browser
-> so you can scan it. When scanned (code 201), `userAvatar` is a **file path**
-> to the downloaded avatar at `~/.wechat-bro/userAvatar.png`.
+> **Login QR**: on a `scan` event, headless mode opens the QR URL in the
+> default browser. If that browser is unavailable (for example over SSH), run
+> `wechat-bro barcode` to render the current QR directly in the terminal.
+> When scanned (code 201), `userAvatar` is a **file path** to the downloaded
+> avatar at `~/.wechat-bro/userAvatar.png`.
 
 ### Option 2: With Puppeteer
 
