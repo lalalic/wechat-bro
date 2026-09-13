@@ -243,7 +243,9 @@ function renderTask(msg, extra, opts = {}) {
   }
   if (recordOnly) {
     const why = msg.from === 'me'
-      ? 'this message was sent by the account owner (`me`) in a chat handled by the maintainer persona'
+      ? (assistant
+        ? 'this contact is assistant-managed, but this message from the account owner did NOT ping the assistant (no `?!`)'
+        : 'this message was sent by the account owner (`me`) in a chat handled by the maintainer persona')
       : 'this contact is assistant-managed, but this message did NOT ping the assistant (no `?!`)'
     lines.push('',
       `**CONTEXT-ONLY MESSAGE** — ${why}. Do NOT reply to it. Silently absorb it as context (update memory.md if it carries something durable) and end with \`{"status":"ignored"}\`.`,
@@ -566,10 +568,9 @@ async function runOrchestrator({ port = 9231 } = {}) {
 
     // Account owner's messages: → filehelper is ALWAYS answered in assistant
     // mode (a pending escalation routes the reply into that contact's
-    // session). → any other watched chat: assistant-managed contacts get an
-    // open assistant reply (assistant mode answers ANYONE, `me` included);
-    // maintainer-managed contacts only RECORD the owner's message in their
-    // session for context — never replied, `{"status":"ignored"}`.
+    // session). → any other watched chat: assistant-managed contacts require
+    // an explicit `?!`/`？！` ping too; ordinary owner messages are context
+    // only. Maintainer-managed contacts only RECORD the owner's message.
     if (data.from === 'me') {
       if (data.to !== 'filehelper' && !watch.has(data.to)) return
       agents = loadAgents()
@@ -596,10 +597,14 @@ async function runOrchestrator({ port = 9231 } = {}) {
       const extra = data.type && data.type !== 'text'
         ? 'Non-text message: `content` holds the useful representation (file path for media, URL for emoji, text otherwise).'
         : null
-      log(routed.assistant ? 'own message → assistant reply in' : 'own message → context-only into', data.to)
-      dispatch(routed.agent, data, extra, routed.assistant
-        ? { assistant: true, recordOnly: false }
-        : { assistant: false, recordOnly: true }, data.to)
+      const text = String(data.Content || data.content || '')
+      const ping = text.includes('?!') || text.includes('？！')
+      const assistant = routed.assistant && ping
+      log(assistant ? 'own message → assistant reply in' : 'own message → context-only into', data.to)
+      dispatch(routed.agent, data, extra, {
+        assistant: routed.assistant,
+        recordOnly: !assistant,
+      }, data.to)
       return
     }
     if (!watch.has(data.from)) return
