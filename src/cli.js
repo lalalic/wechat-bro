@@ -50,6 +50,7 @@ const WebSocket = require('ws')
 const { transcribeVoice, transcribeFile } = require('./transcribe')
 const { sendImage, sendFile } = require('./upload')
 const wsServer = require('./ws-server')
+const { DaemonLifecycle, isAuthCommand } = require('./daemon-lifecycle')
 
 // Overridable for tests so unit suites never touch the real ~/.wechat-bro
 const DATA_DIR = process.env.WECHAT_BRO_DATA_DIR || path.join(os.homedir(), '.wechat-bro')
@@ -339,9 +340,11 @@ function log(...args) {
 // ── Graceful shutdown ─────────────────────────────────────────────────────
 let _wsServer = null  // set by main()
 let _exitSave = null  // set by main(): flush cookies to disk before exit
+let _lifecycle = null  // daemon-owned auth/lifecycle state
 
 function shutdown() {
   log('Shutting down...')
+  if (_lifecycle) { try { _lifecycle.stop() } catch {} }
   if (_exitSave) { try { _exitSave() } catch {} }
   if (_wsServer) {
     try { _wsServer.close() } catch {}
@@ -746,20 +749,37 @@ async function main() {
   })
   const page = (await browser.pages())[0]
 
+  // The lifecycle controller deliberately lives outside the replaceable page
+  // context. Navigation/reinjection must not erase the daemon's knowledge that
+  // the previous page was authenticated.
+  const lifecycle = new DaemonLifecycle({
+    log,
+    emit: write,
+    flush: () => saveCookies(page),
+  })
+  _lifecycle = lifecycle
+  lifecycle.setPage(page).start()
+
   // Dialog handler
   page.on('dialog', async (dialog) => { log('Dialog:', dialog.message()); await dialog.accept() })
 
   // Auto-reinject on navigation
   page.on('framenavigated', async (frame) => {
     if (frame !== page.mainFrame() || !frame.url().includes('wx.qq.com')) return
+    lifecycle.pageReplaced(page, 'page navigation')
     log('Page navigated — re-injecting')
     try {
       await page.waitForFunction(() => typeof angular !== 'undefined' && angular.element(document).injector(), { timeout: 15000 })
       await page.evaluate(INJECT_SCRIPT)
       await page.evaluate(() => { if (window.WechatyBro && !window.WechatyBro.vars.initState) return window.WechatyBro.init(); return { code: 304 } })
       await page.evaluate(() => { if (window.WechatyBro) window.WechatyBro._loadLastMsgTime() })
+      await lifecycle.revalidate('page re-injected')
     } catch (e) { log('Re-inject failed:', e.message) }
   })
+
+  page.on('error', (error) => lifecycle.pageLost('page error', { error: error.message }))
+  page.on('close', () => lifecycle.pageLost('page closed'))
+  browser.on('disconnected', () => lifecycle.pageLost('browser disconnected'))
 
   // Load cookies
   if (fs.existsSync(COOKIE_FILE)) {
@@ -780,6 +800,7 @@ async function main() {
   try { msgFd = fs.openSync(MESSAGES_FILE, 'a') } catch {}
 
   await page.exposeFunction('sendToPuppeteer', (event, data) => {
+    lifecycle.handleBridgeEvent(event)
     if (data && data.voiceBase64 && (event === 'message:voice' || (event === 'message' && data.MsgType === 34))) {
       transcribeVoice(data)
     }
@@ -835,6 +856,7 @@ async function main() {
 
   try { await page.waitForFunction(() => window.WechatyBro && window.WechatyBro.vars.contactsReady === true, { timeout: 120_000 }); log('Contacts ready') } catch {}
   await saveCookies(page)
+  await lifecycle.revalidate('startup ready')
 
   // Periodic snapshot: session cookies rotate and the bridge keeps updating
   // the wx_last_msg_time replay marker as messages arrive — persist both.
@@ -846,7 +868,7 @@ async function main() {
   _exitSave = () => saveCookiesOnExit(page)
 
   // Emit a "ready" event so the agent knows it can start sending commands
-  write({ event: 'ready', data: { loggedIn: isLoggedIn, contactsReady: true } })
+  write({ event: 'ready', data: lifecycle.readyData(!!(lifecycle.lastSignals && lifecycle.lastSignals.contactsReady)) })
 
   // ── Wire up WebSocket dispatch (now that page is ready) ───────────────
   wsDispatch = async (cmd, args) => {
@@ -861,6 +883,7 @@ async function main() {
       })
       return { shuttingDown: true }
     }
+    if (isAuthCommand(cmd)) lifecycle.requireAuthenticated()
     return dispatch(cmd, args, page)
   }
 
@@ -1103,7 +1126,7 @@ async function dispatch(cmd, args, page) {
         lastMsgTime: window.WechatyBro._lastMsgTime || 0,
         initState: !!window.WechatyBro.vars.initState,
         account: window.WechatyBro.getAccount()
-      }))
+      })).then(data => ({ ...data, lifecycle: _lifecycle ? _lifecycle.state : 'page_lost/recovering' }))
 
     case 'emojis':
     case 'supported-emojis':   // backward-compat alias
