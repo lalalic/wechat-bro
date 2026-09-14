@@ -471,7 +471,7 @@ async function sendCommandViaWs(ws, request) {
       }
       process.stdout.write(JSON.stringify(msg, null, process.argv.indexOf('--pretty') !== -1 ? 2 : 0) + '\n')
       ws.close()
-      process.exit(0)
+      process.exit(request.cmd === 'host' && msg.ok === false ? 1 : 0)
     }
   })
 
@@ -627,6 +627,8 @@ Commands:
   send-text --to <name> --content <text>
                                Send a text message. @\\"name\\" = mention in rooms.
                                Marpit/mermaid code blocks are auto-rendered.
+  host --to <name> --prompt <rich context>
+                               Ask the running orchestrator to host a discussion.
   send-image --to <name> --path <file> [--filename <name>]
   send-file  --to <name> --path <file> --filename <name>
   send-voice --to <name> --path <file>   (transcribe + send as text)
