@@ -55,6 +55,7 @@ function create(opts = {}) {
 
   /** Map of clientId → { ws, agentName } */
   const clients = new Map()
+  const pendingHosts = new Map()
 
   const server = new WebSocket.Server({ port })
 
@@ -94,6 +95,37 @@ function create(opts = {}) {
         return
       }
 
+      // Forward orchestration control over the daemon socket; this is not a
+      // WeChat send and the orchestrator owns routing and continuation.
+      if (cmd === 'host') {
+        if (!req.to || !req.prompt) {
+          const missing = !req.to ? '--to (target contact or room)' : '--prompt (discussion context)'
+          ws.send(JSON.stringify({ ok: false, id, error: `Missing ${missing}` }))
+          return
+        }
+        const requestId = `host-${makeId()}`
+        const timer = setTimeout(() => {
+          const pending = pendingHosts.get(requestId)
+          if (!pending) return
+          pendingHosts.delete(requestId)
+          pending.ws.send(JSON.stringify({ ok: false, id: pending.id, error: 'host request timed out: no orchestrator accepted the target' }))
+        }, opts.hostTimeoutMs || 10000)
+        pendingHosts.set(requestId, { ws, id, timer })
+        broadcast({ event: 'host-discussion', data: { requestId, to: req.to, prompt: req.prompt }, ts: Date.now() })
+        return
+      }
+
+      if (cmd === 'host-result') {
+        const pending = pendingHosts.get(req.requestId)
+        if (!pending) return
+        pendingHosts.delete(req.requestId)
+        clearTimeout(pending.timer)
+        pending.ws.send(JSON.stringify(req.ok
+          ? { ok: true, id: pending.id, data: req.data || { accepted: true } }
+          : { ok: false, id: pending.id, error: req.error || 'host request rejected' }))
+        return
+      }
+
       // Dispatch command
       try {
         const result = await dispatch(cmd, req)
@@ -104,6 +136,9 @@ function create(opts = {}) {
     })
 
     ws.on('close', () => {
+      for (const [requestId, pending] of pendingHosts) {
+        if (pending.ws === ws) { clearTimeout(pending.timer); pendingHosts.delete(requestId) }
+      }
       clients.delete(clientId)
       wsLog(`Client ${clientId}${clientInfo.agentName ? ` (${clientInfo.agentName})` : ''} disconnected (${clients.size} remaining)`) 
     })

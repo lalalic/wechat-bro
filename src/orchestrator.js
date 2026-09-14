@@ -71,6 +71,16 @@ const AGENTS_DIR = path.join(DATA_DIR, 'agents')
 const PKG_AGENTS_DIR = path.join(__dirname, '..', 'skills', 'wechat-bro', 'agents')
 const CLI = path.join(__dirname, 'cli.js')
 
+// Scheduled self-wakeup (`next_action.wake`) bounds and durable store. The
+// ORCHESTRATOR — never the worker — owns timers, bounds and persistence, so a
+// worker only ever *requests* a continuation. Env overrides are for tests and
+// unusual deployments.
+const num = (v, d) => (v != null && v !== '' && Number.isFinite(Number(v)) ? Number(v) : d)
+const WAKE_MIN_SECONDS = num(process.env.WECHAT_BRO_WAKE_MIN_SECONDS, 30)
+const WAKE_MAX_SECONDS = num(process.env.WECHAT_BRO_WAKE_MAX_SECONDS, 7 * 24 * 60 * 60)
+const WAKE_MAX_OVERDUE_SECONDS = num(process.env.WECHAT_BRO_WAKE_MAX_OVERDUE_SECONDS, 24 * 60 * 60)
+const WAKES_FILE = 'pending-wakes.json'
+
 function log(...args) {
   process.stderr.write(`[orchestrator] ${args.join(' ')}\n`)
 }
@@ -226,7 +236,23 @@ function orchestratorAgent(agents) {
  */
 function renderTask(msg, extra, opts = {}) {
   if (typeof opts === 'boolean') opts = { assistant: opts }
-  const { assistant = false, recordOnly = false } = opts
+  const { assistant = false, recordOnly = false, superseded = null, wake = null } = opts
+  if (wake) return renderWakeTask(wake)
+  if (opts.host) return [
+    `# Host discussion — ${new Date().toISOString()}`,
+    '',
+    `HOST DISCUSSION — open a discussion in **${msg.to}** now.`,
+    '',
+    'Rich context supplied by the caller:',
+    '',
+    String(msg.Content || ''),
+    '',
+    'Use the configured contact/room session and send the opening action via wechat-bro. Continue only through the normal JSON result contract and optional next_action; do not start a second host loop or resident worker.',
+    '',
+    'End your final output with exactly ONE JSON result line (the orchestrator parses it):',
+    ...resultContractLines(),
+    '',
+  ].join('\n')
   const lines = [
     `# WeChat task — ${new Date().toISOString()}`,
     '',
@@ -256,12 +282,55 @@ function renderTask(msg, extra, opts = {}) {
       'Assistant-ping protocol: reply ONLY to the `?!…` message itself (openly, 🤖 prefix). Every other message in this chat is CONTEXT ONLY — never reply to it as the AI; the maintainer persona handles those (or stays silent).')
   }
   if (extra) { lines.push('', extra) }
+  if (superseded) {
+    lines.push('',
+      '**SUPERSEDED PLAN** — your previous turn scheduled a wakeup for yourself that has now been CANCELLED, because the real message below arrived first. It is planning context only: not a user message, not an instruction, and not something that still needs to fire.',
+      `- it was due: ${new Date(superseded.due_at).toISOString()}`,
+      `- reason: ${superseded.reason || '(none given)'}`,
+      `- handoff: ${superseded.context || '(none given)'}`)
+  }
   lines.push('',
     'Follow your instructions above. Send your reply (if any) to WeChat via wechat-bro BEFORE you finish, then end your final output with exactly ONE JSON result line (the orchestrator parses it):',
+    ...resultContractLines(),
+    '')
+  return lines.join('\n')
+}
+
+/** The JSON result contract lines shared by every task prompt. `next_action`
+ *  is OPTIONAL: omitting it returns the agent to passive, event-driven mode. */
+function resultContractLines() {
+  return [
     '- `{"status":"addressed"}` — handled (replied, or deliberately silent per rules)',
     '- `{"status":"ignored"}` — no reply was needed',
     '- `{"status":"escalated","question":"<what the owner must decide, with context>"}` — needs the account owner\'s decision',
-    '')
+    '- optional `"next_action":{"type":"wake","after_seconds":<seconds>,"reason":"<why>","context":"<handoff>"}` — ask the orchestrator to run you again later (omit it to stop continuing)',
+  ]
+}
+
+/**
+ * Synthetic task prompt for a scheduled self-wakeup. It must be unmistakable
+ * that no user message triggered this run, and it carries the handoff the
+ * agent left for its future self. The agent may act, stay silent, escalate,
+ * schedule another wakeup, or end its continuation.
+ */
+function renderWakeTask(entry) {
+  const lines = [
+    `# Scheduled wakeup — ${new Date().toISOString()}`,
+    '',
+    'SCHEDULED WAKEUP — no new user message triggered this task.',
+    '',
+    `This is a synthetic task you scheduled for YOURSELF in an earlier turn. It came due at ${new Date(entry.due_at).toISOString()} and the orchestrator is now running you again for **${entry.session}**. Nobody has necessarily said anything since your last turn — inspect the current state before acting.`,
+    '',
+    `- Reason you set: ${entry.reason || '(none given)'}`,
+    '',
+    'Handoff from your previous turn:',
+    '',
+    entry.context || '(none given)',
+    '',
+    'Inspect the current conversation/session state and decide whether any outbound message/action is appropriate. You may remain silent. Send any WeChat reply (if any) via wechat-bro BEFORE you finish, then end your final output with exactly ONE JSON result line (the orchestrator parses it):',
+    ...resultContractLines(),
+    '',
+  ]
   return lines.join('\n')
 }
 
@@ -342,10 +411,247 @@ function parseTaskResult(stdout) {
     if (!line.startsWith('{')) continue
     try {
       const obj = JSON.parse(line)
-      if (obj && RESULT_STATUS.has(obj.status)) return obj
+      if (obj && RESULT_STATUS.has(obj.status)) return normalizeResult(obj)
     } catch { /* not JSON — keep scanning */ }
   }
   return null
+}
+
+/**
+ * Backward-compatible result normalization. The only added key is the
+ * OPTIONAL `next_action`; when it is present but invalid the raw value is
+ * replaced by `next_action: null` plus `next_action_error`, so an invalid
+ * request can never silently create a timer. A result without `next_action`
+ * is returned untouched.
+ */
+function normalizeResult(obj) {
+  if (!Object.prototype.hasOwnProperty.call(obj, 'next_action')) return obj
+  const { action, error } = validateNextAction(obj.next_action)
+  if (error) return { ...obj, next_action: null, next_action_error: error }
+  if (!action) { const c = { ...obj }; delete c.next_action; return c }
+  return { ...obj, next_action: action }
+}
+
+/** Validate a worker's optional `next_action`. Returns `{action, error}`:
+ *  `action` is the normalized request, `error` a human-readable rejection.
+ *  Shape only — delay BOUNDS are clamped by the scheduler, not here. */
+function validateNextAction(raw) {
+  if (raw === undefined || raw === null) return { action: null, error: null }
+  if (typeof raw !== 'object' || Array.isArray(raw)) return { action: null, error: 'next_action must be an object' }
+  if (raw.type !== 'wake') return { action: null, error: `next_action.type ${JSON.stringify(raw.type)} is not supported (only "wake")` }
+  const secs = Number(raw.after_seconds)
+  if (!Number.isFinite(secs) || secs <= 0) return { action: null, error: 'next_action.after_seconds must be a positive number' }
+  return { action: {
+    type: 'wake',
+    after_seconds: secs,
+    reason: typeof raw.reason === 'string' ? raw.reason.trim() : '',
+    context: typeof raw.context === 'string' ? raw.context : '',
+  }, error: null }
+}
+
+/** Clamp a requested delay into configured bounds. Never trusts the worker. */
+function clampDelay(seconds, { minSeconds = WAKE_MIN_SECONDS, maxSeconds = WAKE_MAX_SECONDS } = {}) {
+  if (seconds < minSeconds) return { seconds: minSeconds, clamped: `clamped up to the ${minSeconds}s minimum` }
+  if (seconds > maxSeconds) return { seconds: maxSeconds, clamped: `clamped down to the ${maxSeconds}s maximum` }
+  return { seconds, clamped: null }
+}
+
+function wakeFile(dir) { return path.join(dir, WAKES_FILE) }
+
+/**
+ * Durable one-pending-wake-per-session store + timer owner.
+ *
+ * Each entry carries an opaque `id` and a monotonic `version`, so a timer
+ * callback that races a replacement/cancellation is detected and ignored.
+ * The pending set is persisted to `<DATA_DIR>/pending-wakes.json` on every
+ * mutation (atomic tmp+rename), which is what makes restart recovery and
+ * duplicate-fire prevention possible.
+ */
+class WakeScheduler {
+  constructor({ dir, dispatchWake, minSeconds = WAKE_MIN_SECONDS, maxSeconds = WAKE_MAX_SECONDS,
+                maxOverdueSeconds = WAKE_MAX_OVERDUE_SECONDS, now = () => Date.now() } = {}) {
+    this.dir = dir
+    this.file = dir ? wakeFile(dir) : null
+    this.dispatchWake = dispatchWake || (() => {})
+    this.minSeconds = minSeconds
+    this.maxSeconds = maxSeconds
+    this.maxOverdueSeconds = maxOverdueSeconds
+    this.now = now
+    this.wakes = new Map()   // session key → entry
+    this.timers = new Map()  // entry id → Timeout
+    this.versions = new Map() // session key → last version issued in this process
+    this._seq = 0
+    this._load()
+  }
+
+  _load() {
+    if (!this.file) return
+    let raw = null
+    try { raw = JSON.parse(fs.readFileSync(this.file, 'utf8')) } catch (e) {
+      if (e.code !== 'ENOENT') log('pending-wakes: unreadable, starting empty —', e.message)
+    }
+    for (const [key, e] of Object.entries((raw && raw.wakes) || {})) {
+      if (!e || typeof e !== 'object' || !Number.isFinite(Number(e.due_at))) continue
+      this.wakes.set(key, e)
+      this.versions.set(key, Math.max(this.versions.get(key) || 0, Number(e.version) || 0))
+      this._seq = Math.max(this._seq, Number(e.version) || 0)
+    }
+  }
+
+  _persist() {
+    if (!this.file) return
+    fs.mkdirSync(this.dir, { recursive: true })
+    const tmp = `${this.file}.${process.pid}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify({ version: 1, wakes: Object.fromEntries(this.wakes) }, null, 2))
+    fs.renameSync(tmp, this.file)
+  }
+
+  _newId(key) {
+    this._seq += 1
+    return `${sanitizeFsName(key)}-${Date.now().toString(36)}-${this._seq.toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+  }
+
+  list() { return [...this.wakes.values()].map(e => ({ ...e })) }
+  get(key) { const e = this.wakes.get(key); return e ? { ...e } : null }
+
+  /** Replace (or create) the single pending wake for `key`. */
+  schedule(key, action, agentName, identity = {}) {
+    const { action: norm, error } = validateNextAction(action)
+    if (!norm) { log(`next_action rejected for ${key}: ${error} — not scheduling`); return { entry: null, error } }
+    const { seconds, clamped } = clampDelay(norm.after_seconds, this)
+    if (clamped) log(`next_action for ${key}: after_seconds=${norm.after_seconds}s ${clamped}`)
+    const now = this.now()
+    const prev = this.wakes.get(key)
+    const version = (this.versions.get(key) || 0) + 1
+    this.versions.set(key, version)
+    const entry = {
+      id: this._newId(key),
+      version,
+      session: key,
+      agent: agentName || null,
+      session_id: identity.sessionId || null,
+      session_dir: identity.sessionDir || null,
+      due_at: now + Math.round(seconds * 1000),
+      after_seconds: seconds,
+      reason: norm.reason,
+      context: norm.context,
+      created_at: prev && prev.created_at ? prev.created_at : now,
+      updated_at: now,
+    }
+    if (prev) this._cancel(prev.id) // drop the replaced schedule's timer
+    this._arm(entry)
+    this.wakes.set(key, entry)
+    this._persist()
+    log(`wake scheduled for ${key} in ${seconds}s (id ${entry.id} v${entry.version})${entry.reason ? ` — ${entry.reason}` : ''}`)
+    return { entry: { ...entry }, error: null }
+  }
+
+  /** Remove + cancel a pending wake (returns the cancelled entry, or null). */
+  take(key) {
+    const entry = this.wakes.get(key)
+    if (!entry) return null
+    this._cancel(entry.id)
+    this.wakes.delete(key)
+    this._persist()
+    return { ...entry }
+  }
+
+  /** Claim exactly the due entry immediately before its worker is spawned. */
+  claim(key, id, version) {
+    const entry = this.wakes.get(key)
+    if (!entry || entry.id !== id || Number(entry.version) !== Number(version)) {
+      log(`stale queued wake for ${key} skipped (id ${id} v${version})`)
+      return null
+    }
+    this._cancel(entry.id)
+    this.wakes.delete(key)
+    this._persist()
+    return { ...entry }
+  }
+
+  clear(key) {
+    const entry = this.take(key)
+    if (entry) log(`wake cleared for ${key} (id ${entry.id})`)
+    return entry
+  }
+
+  /** (Re)arm timers for every persisted wake. Idempotent; called once at
+   *  process start. Future wakes get their remaining delay; overdue wakes
+   *  inside the grace window fire once promptly; wakes stale beyond the grace
+   *  window are dropped instead of replayed. */
+  start() {
+    this.stop()
+    const now = this.now()
+    for (const entry of [...this.wakes.values()]) {
+      const overdueMs = now - Number(entry.due_at)
+      if (overdueMs > this.maxOverdueSeconds * 1000) {
+        log(`wake ${entry.id} for ${entry.session} is ${Math.round(overdueMs / 1000)}s overdue (> ${this.maxOverdueSeconds}s grace) — dropped`)
+        this.wakes.delete(entry.session)
+        this._persist()
+        continue
+      }
+      if (overdueMs > 0) log(`wake ${entry.id} for ${entry.session} overdue by ${Math.round(overdueMs / 1000)}s — firing once now`)
+      else log(`wake ${entry.id} restored for ${entry.session} in ${Math.round((entry.due_at - now) / 1000)}s`)
+      this._arm(entry)
+    }
+  }
+
+  stop() { for (const t of this.timers.values()) clearTimeout(t); this.timers.clear() }
+
+  /** Re-arm a consumed entry (e.g. the target cannot be reached right now). */
+  reschedule(entry, delayMs) {
+    const current = this.wakes.get(entry.session)
+    if (!current || current.id !== entry.id || Number(current.version) !== Number(entry.version)) {
+      log(`wake reschedule for ${entry.session} skipped: entry was superseded`)
+      return null
+    }
+    const now = this.now()
+    const version = Math.max(this.versions.get(entry.session) || 0, Number(entry.version) || 0) + 1
+    this.versions.set(entry.session, version)
+    const next = {
+      ...entry,
+      id: this._newId(entry.session),
+      version,
+      due_at: now + Math.max(0, delayMs),
+      updated_at: now,
+    }
+    this._arm(next)
+    this.wakes.set(next.session, next)
+    this._persist()
+    return { ...next }
+  }
+
+  _arm(entry) {
+    this._cancel(entry.id)
+    const MAX_TIMER = 2147483647
+    const delay = Math.max(0, Number(entry.due_at) - this.now())
+    const timer = setTimeout(() => {
+      if (delay >= MAX_TIMER) this._arm(entry) // longer than setTimeout can hold
+      else this._fire(entry.session, entry.id, entry.version)
+    }, Math.min(delay, MAX_TIMER))
+    if (timer.unref) timer.unref()
+    this.timers.set(entry.id, timer)
+  }
+
+  _cancel(id) {
+    const t = this.timers.get(id)
+    if (t) { clearTimeout(t); this.timers.delete(id) }
+  }
+
+  _fire(session, id, version) {
+    this.timers.delete(id)
+    const entry = this.wakes.get(session)
+    if (!entry || entry.id !== id || Number(entry.version) !== Number(version)) {
+      log(`stale wake callback for ${session} ignored (id ${id} v${version})`)
+      return
+    }
+    // Keep the durable entry until the queued worker reaches its spawn point.
+    // A real message can therefore supersede a due-but-not-yet-started wake.
+    log(`wake due for ${session} (id ${entry.id} v${entry.version})${entry.reason ? ` — ${entry.reason}` : ''}`)
+    try {
+      Promise.resolve(this.dispatchWake({ ...entry })).catch(e => log('wake dispatch failed:', e.message))
+    } catch (e) { log('wake dispatch failed:', e.message) }
+  }
 }
 
 class ContactQueue { // serializes dispatches per contact
@@ -357,7 +663,7 @@ class ContactQueue { // serializes dispatches per contact
   }
 }
 
-function makeDispatcher({ wsSend, onEscalation }) {
+function makeDispatcher({ wsSend, onEscalation, wakes = null }) {
   const queues = new Map()
 
   return function dispatch(agent, msg, extra, opts, contactName) {
@@ -365,6 +671,11 @@ function makeDispatcher({ wsSend, onEscalation }) {
     const d = agent.data
     const isOrch = d.type === 'orchestrator'
     const name = isOrch ? d.name : (contactName || msg.from || d.name)
+    const isWake = !!(opts && opts.wake)
+    // A real inbound task SUPERSEDES this session's pending wakeup before it
+    // starts; the cancelled plan is injected as planning context (never as a
+    // user message). A wake task is already the consumed continuation.
+    const superseded = (isWake || !wakes) ? null : wakes.take(name)
     if (!queues.has(name)) queues.set(name, new ContactQueue())
     const queue = queues.get(name)
 
@@ -376,17 +687,17 @@ function makeDispatcher({ wsSend, onEscalation }) {
       : expand(d.cwd || path.join(DATA_DIR, 'contacts', sanitizeFsName(name)))
     d.sessionDir = isOrch
       ? path.join(DATA_DIR, 'session')
-      : expand(d['session-dir'] || path.join(base, 'session'))
+      : expand((isWake && opts.wake.session_dir) || d['session-dir'] || path.join(base, 'session'))
     d.sessionId = isOrch
       ? 'wechat-orchestrator'
-      : (d['session-id'] || `wechat-${sanitizeFsName(name)}`)
+      : ((isWake && opts.wake.session_id) || d['session-id'] || `wechat-${sanitizeFsName(name)}`)
     d.cwd = base
     fs.mkdirSync(base, { recursive: true })
     fs.mkdirSync(d.sessionDir, { recursive: true })
     ensureAgentsMd(base, agent.path)
 
-    const taskFile = path.join(base, `.task-${Date.now()}.md`)
-    fs.writeFileSync(taskFile, renderTask(msg, extra, opts))
+    const taskFile = path.join(base, `.task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.md`)
+    fs.writeFileSync(taskFile, renderTask(msg, extra, { ...opts, superseded }))
 
     // Bare harness name → its built-in template; custom template or unset
     // (→ pi) passes through. All templates run via /bin/sh with {var} subs.
@@ -406,7 +717,7 @@ function makeDispatcher({ wsSend, onEscalation }) {
     // but only when it NEEDS A RESPONSE: a real incoming message the persona
     // handles or an assistant ping. Never for context-only recordings (no
     // reply will happen) nor for the owner's own messages (they sent them).
-    if (d.notify && !isOrch && msg.from !== 'me' && !opts.recordOnly) {
+    if (d.notify && !isOrch && !isWake && msg.from !== 'me' && !opts.recordOnly) {
       const snippet = String(msg.Content || msg.content || '').split('\n')[0].trim().slice(0, 100)
       wsSend({ cmd: 'send-text', to: 'filehelper', content: `📨 ${name}: ${snippet}` })
     }
@@ -425,6 +736,9 @@ function makeDispatcher({ wsSend, onEscalation }) {
 
     return queue.run(async () => {
       try {
+        if (isWake && !wakes.claim(name, opts.wake.id, opts.wake.version)) {
+          return { code: 0, stdout: '', skipped: true }
+        }
         const { code, stdout } = await spawnTask()
         log(`done (${Date.now() - startedAt}ms, exit ${code})`, label)
         const tail = stdout.trim().split('\n').slice(-8).join('\n')
@@ -435,6 +749,16 @@ function makeDispatcher({ wsSend, onEscalation }) {
           log('result', label, JSON.stringify(result || { status: 'addressed (no JSON)' }))
           if (result && result.status === 'escalated' && !isOrch) {
             onEscalation(name, String(result.question || '(no question given)'))
+          }
+          // Each completed turn IS the authoritative plan for what happens
+          // next: a valid wake replaces the schedule, anything else clears it.
+          if (wakes) {
+            if (result && result.next_action) {
+              wakes.schedule(name, result.next_action, d.name, { sessionId: d.sessionId, sessionDir: d.sessionDir })
+            } else {
+              if (result && result.next_action_error) log(`next_action rejected for ${name}: ${result.next_action_error} — not scheduling`)
+              wakes.clear(name)
+            }
           }
         }
         return { code, stdout }
@@ -538,6 +862,35 @@ async function runOrchestrator({ port = 9231 } = {}) {
 
   const wsSend = (req) => ws ? sendCommand(ws, req).catch(e => log('send failed:', e.message)) : Promise.resolve()
 
+  // Scheduled self-wakeups (worker `next_action`). The orchestrator owns the
+  // durable one-pending-wake-per-session store and all timers; a worker only
+  // ever *requests* a continuation. Firing reuses the normal dispatch path,
+  // so a wake is serialized per contact exactly like a real message task.
+  const wakes = new WakeScheduler({ dir: DATA_DIR, dispatchWake: (entry) => fireWake(entry) })
+
+  async function fireWake(entry) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      log(`wake for ${entry.session}: daemon not connected — retrying in 5s`)
+      wakes.reschedule(entry, 5000)
+      return
+    }
+    const current = loadAgents()
+    if (cliHarness) for (const a of current) a.data.harness = cliHarness
+    let agent = entry.agent ? current.find(a => a.data.name === entry.agent) : null
+    if (agent && agent.data.type !== 'orchestrator') {
+      const routed = routeAgent(current, entry.session, await isRoomContact(ws, roomCache, entry.session))
+      agent = routed ? routed.agent : null
+    }
+    if (!agent) {
+      log(`wake for ${entry.session}: no agent routes there any more — dropped`)
+      wakes.claim(entry.session, entry.id, entry.version)
+      return
+    }
+    if (!dispatch) { wakes.reschedule(entry, 5000); return }
+    const wakeMsg = { from: entry.session, to: 'me', type: 'wake', Content: '', wake: true }
+    dispatch(agent, wakeMsg, null, { assistant: false, recordOnly: false, wake: entry }, entry.session)
+  }
+
   // Task returned {"status":"escalated"} → report to the owner in a fixed
   // format and hold the question for routing.
   const onEscalation = (contact, question) => {
@@ -554,6 +907,30 @@ async function runOrchestrator({ port = 9231 } = {}) {
     const ev = msg.event
     if (ev === 'ready' || ev === 'contacts-ready') {
       log('daemon', ev, JSON.stringify(msg.data || {}))
+      return
+    }
+    if (ev === 'host-discussion') {
+      const target = msg.data && msg.data.to
+      const prompt = msg.data && msg.data.prompt
+      const requestId = msg.data && msg.data.requestId
+      const hostResult = (ok, error, data) => requestId && wsSend({ cmd: 'host-result', requestId, ok, error, data })
+      if (!target || !prompt) {
+        hostResult(false, 'host discussion rejected: missing target or prompt')
+        return log('host discussion rejected: missing target or prompt')
+      }
+      agents = loadAgents()
+      if (cliHarness) for (const a of agents) a.data.harness = cliHarness
+      const routed = routeAgent(agents, target, await isRoomContact(ws, roomCache, target))
+      if (!routed) {
+        hostResult(false, `host discussion failed: no routable agent for ${target}`)
+        return log(`host discussion failed: no routable agent for ${target}`)
+      }
+      log(`host discussion → ${target} via ${routed.agent.data.name}`)
+      hostResult(true, null, { accepted: true, agent: routed.agent.data.name, target })
+      dispatch(routed.agent,
+        { from: 'host', to: target, type: 'host-discussion', Content: String(prompt) },
+        'This is a synthetic HOST DISCUSSION request from the outer orchestrator. Treat the supplied content as rich task context, not as a user message.',
+        { assistant: false, recordOnly: false, host: true }, target)
       return
     }
     if (!ev.startsWith('message')) return
@@ -639,7 +1016,7 @@ async function runOrchestrator({ port = 9231 } = {}) {
     })
     startedAt = Date.now()
     roomCache.clear()
-    if (!dispatch) dispatch = makeDispatcher({ wsSend, onEscalation })
+    if (!dispatch) dispatch = makeDispatcher({ wsSend, onEscalation, wakes })
     log(`connected to ws://localhost:${port} — watching`)
   }
 
@@ -687,6 +1064,7 @@ async function runOrchestrator({ port = 9231 } = {}) {
 
   const shutdown = () => {
     closed = true
+    wakes.stop()
     try { ws && ws.close() } catch {}
     if (daemonChild) { try { daemonChild.kill('SIGTERM') } catch {} }
     process.exit(0)
@@ -695,6 +1073,7 @@ async function runOrchestrator({ port = 9231 } = {}) {
   process.on('SIGTERM', shutdown)
 
   if (daemonFlag) spawnDaemonChild()
+  wakes.start() // recover persisted wakeups (future → reschedule, overdue → run once)
   await connectLoop()
   log('running — Ctrl-C to stop')
   setInterval(() => {}, 1 << 30) // keep the event loop alive
@@ -705,4 +1084,7 @@ module.exports = {
   orchestratorAgent, renderTask, ensureAgentsMd, sanitizeFsName, contactList,
   parseTaskResult, shellQuote, defaultHarness, HARNESS_TEMPLATES,
   harnessVars, renderHarness, runOrchestrator, flagValue, DATA_DIR, AGENTS_DIR,
+  validateNextAction, clampDelay, WakeScheduler, renderWakeTask, wakeFile,
+  ContactQueue, makeDispatcher,
+  WAKE_MIN_SECONDS, WAKE_MAX_SECONDS, WAKE_MAX_OVERDUE_SECONDS, WAKES_FILE,
 }

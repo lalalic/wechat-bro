@@ -195,6 +195,13 @@ Suggested CLI shape:
 npx wechat-bro host --to "三人组" --prompt "<topic/background/style/goal>"
 ```
 
+`host` is forwarded over the daemon WebSocket as a synthetic `HOST DISCUSSION`
+request. The running orchestrator resolves the target with the ordinary
+`routeAgent` configuration and dispatches the configured agent/session/contact
+queue immediately. It does not send the prompt as a WeChat message or start a
+second host loop; the worker's normal result and optional `next_action` own all
+continuation.
+
 Equivalent structured arguments such as `--topic`, `--context-file`, `--goal`, or `--style` are acceptable if the implementation keeps the same semantics.
 
 Required behavior:
