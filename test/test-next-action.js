@@ -217,6 +217,39 @@ async function main() {
   ok(wakeSched.get('Dave') === null, 'superseded wake is gone from the store')
   ok(!log.includes('SCHEDULED WAKEUP'), 'stale queued wake does not run')
 
+  console.log('# dispatcher — queued real message supersedes a wake produced by the turn ahead of it')
+  {
+    const raceDir = path.join(tmpDir, 'dispatch-race')
+    fs.mkdirSync(raceDir, { recursive: true })
+    const raceLog = path.join(raceDir, 'harness.log')
+    const raceHelper = path.join(raceDir, 'harness.sh')
+    fs.writeFileSync(raceHelper, [
+      '#!/bin/sh',
+      'task="$1"; log="$2"',
+      'cat "$task" >> "$log"',
+      'if grep -q "first message" "$task"; then',
+      '  sleep 0.2',
+      `  echo '{"status":"addressed","next_action":{"type":"wake","after_seconds":30,"reason":"late-plan","context":"made by the turn ahead"}}'`,
+      'else',
+      `  echo '{"status":"addressed"}'`,
+      'fi',
+      '',
+    ].join('\n'))
+    const raceAgentMd = path.join(raceDir, 'wechat-race.agent.md')
+    fs.writeFileSync(raceAgentMd, '---\nname: wechat-race\ncontacts: [Race]\n---\nbody')
+    const raceAgent = { path: raceAgentMd, data: { name: 'wechat-race', type: 'contact', cwd: raceDir, harness: `sh ${raceHelper} {task-path} ${raceLog}` } }
+    const raceSched = new m.WakeScheduler({ dir: raceDir, minSeconds: 0.02, maxSeconds: 60, maxOverdueSeconds: 60, dispatchWake: () => {} })
+    const raceDispatch = m.makeDispatcher({ wsSend: async () => {}, onEscalation: () => {}, wakes: raceSched })
+    const first = raceDispatch(raceAgent, { from: 'Race', to: 'me', type: 'text', Content: 'first message' }, null, {}, 'Race')
+    await sleep(30) // second message arrives while the first turn is still running
+    const second = raceDispatch(raceAgent, { from: 'Race', to: 'me', type: 'text', Content: 'second message' }, null, {}, 'Race')
+    await Promise.all([first, second])
+    const raceTasks = fs.readFileSync(raceLog, 'utf8')
+    ok(raceTasks.includes('SUPERSEDED PLAN') && raceTasks.includes('late-plan') && raceTasks.includes('second message'), 'queued real message cancels the late wake immediately before its own turn starts')
+    ok(raceSched.get('Race') === null, 'second turn remains authoritative and leaves no stale pending wake')
+    raceSched.stop()
+  }
+
   console.log('# dispatcher — result drives the schedule')
   const schedDir = path.join(tmpDir, 'dispatch-results')
   fs.mkdirSync(schedDir, { recursive: true })

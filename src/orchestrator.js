@@ -672,10 +672,10 @@ function makeDispatcher({ wsSend, onEscalation, wakes = null }) {
     const isOrch = d.type === 'orchestrator'
     const name = isOrch ? d.name : (contactName || msg.from || d.name)
     const isWake = !!(opts && opts.wake)
-    // A real inbound task SUPERSEDES this session's pending wakeup before it
-    // starts; the cancelled plan is injected as planning context (never as a
-    // user message). A wake task is already the consumed continuation.
-    const superseded = (isWake || !wakes) ? null : wakes.take(name)
+    // Supersession is resolved inside the per-contact queue, immediately
+    // before this task starts. Doing it at enqueue time is too early: the
+    // currently-running turn may still publish a wake after this message has
+    // arrived, and that late plan must also be superseded by the real message.
     if (!queues.has(name)) queues.set(name, new ContactQueue())
     const queue = queues.get(name)
 
@@ -697,7 +697,6 @@ function makeDispatcher({ wsSend, onEscalation, wakes = null }) {
     ensureAgentsMd(base, agent.path)
 
     const taskFile = path.join(base, `.task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.md`)
-    fs.writeFileSync(taskFile, renderTask(msg, extra, { ...opts, superseded }))
 
     // Bare harness name → its built-in template; custom template or unset
     // (→ pi) passes through. All templates run via /bin/sh with {var} subs.
@@ -736,9 +735,18 @@ function makeDispatcher({ wsSend, onEscalation, wakes = null }) {
 
     return queue.run(async () => {
       try {
-        if (isWake && !wakes.claim(name, opts.wake.id, opts.wake.version)) {
-          return { code: 0, stdout: '', skipped: true }
+        let superseded = null
+        if (isWake) {
+          if (!wakes.claim(name, opts.wake.id, opts.wake.version)) {
+            return { code: 0, stdout: '', skipped: true }
+          }
+        } else if (wakes) {
+          // A real task supersedes whichever plan is pending at START time,
+          // including a wake produced by the task that was ahead of it in
+          // this same queue after the real message had already arrived.
+          superseded = wakes.take(name)
         }
+        fs.writeFileSync(taskFile, renderTask(msg, extra, { ...opts, superseded }))
         const { code, stdout } = await spawnTask()
         log(`done (${Date.now() - startedAt}ms, exit ${code})`, label)
         const tail = stdout.trim().split('\n').slice(-8).join('\n')
