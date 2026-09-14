@@ -168,9 +168,9 @@ The important artifact is the future intent:
 
 The timer is only the transport for that delegated continuation.
 
-## First intended use: hosted discussion
+## First consumer: hosted discussion
 
-A future `host` / `host discussion` command can use this primitive without
+This PR also adds the first user-facing consumer: a `host` / `host discussion` command that uses this primitive without
 requiring a permanently-running LLM worker:
 
 ```text
@@ -183,8 +183,31 @@ host command
   -> when the topic is finished, omit next_action and return to passive mode
 ```
 
-The `host` CLI/API itself is intentionally out of scope for this PR. This PR
-creates the reusable orchestrator continuation primitive that `host` can build on.
+The `host` CLI/API is IN SCOPE for this PR as a thin adapter over the continuation primitive. It must not introduce a second hosting loop or a permanently-resident LLM worker.
+
+## Host command requirements
+
+The first version should stay thin and reuse the existing room/contact agent plus `next_action` lifecycle.
+
+Suggested CLI shape:
+
+```bash
+npx wechat-bro host --to "三人组" --prompt "<topic/background/style/goal>"
+```
+
+Equivalent structured arguments such as `--topic`, `--context-file`, `--goal`, or `--style` are acceptable if the implementation keeps the same semantics.
+
+Required behavior:
+
+1. `host` resolves the target room/contact through the orchestrator routing configuration; it must not invent a separate agent registry.
+2. It immediately invokes the already-configured target agent with a clearly marked synthetic `HOST DISCUSSION` task containing the caller-supplied topic/background/goal/style.
+3. The agent is instructed to open the discussion now, then use the normal JSON result contract and optional `next_action` to decide future proactive involvement.
+4. Hosting state is represented by the continuation itself (the pending `next_action` / wake plan), not by a separate permanently-running worker. Avoid introducing a durable `host_mode=true` flag unless the implementation proves it is strictly necessary.
+5. A real incoming room message continues to wake the same agent immediately and supersedes any stale scheduled wakeup according to the existing next-action rules.
+6. When the agent stops returning `next_action`, proactive hosting ends automatically and the room returns to ordinary event-driven maintainer behavior.
+7. The command must fail clearly if the target has no routable agent, rather than silently sending a raw message.
+8. `host` must support rich caller-provided context so an outer orchestrator can hand off a topic even though the room agent cannot see the outer ChatGPT conversation.
+9. Add an end-to-end controlled test covering: `host` -> room agent immediate invocation -> opening action -> `next_action` scheduled -> simulated real room message supersedes the timer -> same agent/session handles the new message and chooses the next action.
 
 ## Acceptance criteria
 
@@ -202,7 +225,6 @@ creates the reusable orchestrator continuation primitive that `host` can build o
 
 ## Non-goals
 
-- Implementing the user-facing `host discussion` command in this PR.
 - Keeping an LLM/harness process resident while waiting.
 - General cron/recurring-job infrastructure.
 - Multiple simultaneous scheduled continuations for one contact/session.
