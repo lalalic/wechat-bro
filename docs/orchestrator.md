@@ -61,6 +61,9 @@ Key invariants:
 - **No long argv** — the message goes into a task file (`@{task}` /
   `$(cat {task})`); the agent persona is a **symlinked `AGENTS.md`**, never an
   argument (EDR kills >1KB command lines).
+- **The orchestrator owns continuation** — a worker may *request* a future
+  self-wakeup (`next_action`), but only the orchestrator creates timers,
+  enforces delay bounds, persists them, and can cancel/replace them.
 
 ---
 
@@ -235,10 +238,95 @@ missing/garbled line degrades to `addressed` so the loop never stalls):
 | `{"status":"addressed"}` | nothing (reply already sent by the agent) |
 | `{"status":"ignored"}` | nothing |
 | `{"status":"escalated","question":…}` | filehelper `🤖❓ 请示` + hold for routing (contact agents only) |
+| `next_action:{…}` (optional) | schedule/replace/clear this session's pending wakeup — see §6 |
+
+An optional **`next_action`** object lets a worker delegate its own
+continuation. It is the only supported shape in this version:
+
+```json
+"next_action": {
+  "type": "wake",
+  "after_seconds": 1800,
+  "reason": "check whether the room discussion stalled",
+  "context": "if nobody added a substantive reply, ask one short follow-up…"
+}
+```
+
+`reason`/`context` are optional (default empty); `context` is task handoff for
+the *future* invocation, **not** durable contact memory. Omitting `next_action`
+returns the agent to passive, event-driven mode. `escalated` keeps its existing
+owner-decision meaning and is never expressed as a `next_action`.
 
 ---
 
-## 6. Escalation loop
+## 6. Scheduled self-wakeups (`next_action`)
+
+The LLM never stays resident between turns. A worker that wants to come back
+later ends its turn with `next_action.wake`, and the durable orchestrator owns
+everything else. There is **at most one pending wakeup per routed
+agent/session/contact**.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Contact / Room
+    participant O as Orchestrator
+    participant S as pending-wakes.json
+    participant A as Agent session
+
+    C->>O: message
+    O->>A: task (real message)
+    A-->>O: {"status":"addressed","next_action":{"type":"wake","after_seconds":1800,…}}
+    O->>S: persist one entry (id + version + due_at + reason + context)
+    O->>O: setTimeout(due_at − now)
+    Note over O,A: agent exits — nothing sleeps
+    alt a real message arrives first
+        C->>O: newer message
+        O->>S: cancel/replace BEFORE dispatch
+        O->>A: task + "SUPERSEDED PLAN" (prior reason/context as context only)
+    else due_at arrives
+        O->>A: SCHEDULED WAKEUP synthetic task (same session)
+        A-->>O: result decides the next schedule (or none → passive)
+    end
+```
+
+Semantics:
+
+| rule | behaviour |
+|---|---|
+| **Replacement** | every completed turn replaces the previous pending wakeup: a valid wake schedules one; a valid result *without* `next_action` clears it |
+| **Invalid request** | rejected and logged — never silently schedules |
+| **Incoming message** | cancels the pending wake *before* the next task starts; the cancelled `reason`/`context` is injected as clearly-marked **SUPERSEDED PLAN** planning context |
+| **Synthetic task** | `SCHEDULED WAKEUP — no new user message triggered this task.` + `Reason:` + handoff, in the **same** session (same `session-dir`/`session-id`) |
+| **Serialization** | a wake goes through the same per-contact `ContactQueue`; a timer and a real message never run the same session concurrently |
+| **Stale callbacks** | each schedule has an opaque `id` + monotonic `version`; a callback whose entry was replaced/cancelled is ignored |
+| **Restart** | pending wakes are reloaded on startup: future ones are rescheduled; overdue ones inside the grace window fire **once** promptly; ones stale beyond it are dropped |
+| **Bounds** | defaults: min **30 s**, max **7 days**, overdue grace **24 h**; requests are clamped (and logged). Override with `WECHAT_BRO_WAKE_MIN_SECONDS` / `WECHAT_BRO_WAKE_MAX_SECONDS` / `WECHAT_BRO_WAKE_MAX_OVERDUE_SECONDS` |
+
+The store is one JSON file, `<DATA_DIR>/pending-wakes.json` (atomic
+tmp+rename), keyed by routed session, e.g.
+
+```json
+{ "version": 1, "wakes": { "Alice": {
+  "id": "Alice-…", "version": 2, "session": "Alice", "agent": "wechat-alice",
+  "session_id": "wechat-Alice", "session_dir": "…/contacts/Alice/session",
+  "due_at": 1766000000000, "reason": "…", "context": "…",
+  "created_at": 1765990000000, "updated_at": 1765990000000 } } }
+```
+
+A due wake remains durable until the serialized contact queue reaches the
+worker launch boundary. The queue claims the exact `id` + `version` there;
+stale queued callbacks are skipped, while a crash after the claim cannot fire
+the wake twice. Entries retain the exact `session_id` and `session_dir` used by
+the scheduled worker. The `host` / `host discussion` command is in scope: it
+uses the daemon WebSocket handshake, waits for the running orchestrator to
+accept normal routing, and then dispatches a synthetic `HOST DISCUSSION` task
+through this same continuation primitive. No route or timeout is returned as a
+clear CLI error.
+
+---
+
+## 7. Escalation loop
 
 ```mermaid
 sequenceDiagram
@@ -264,7 +352,7 @@ are held per contact until answered.
 
 ---
 
-## 7. Harness templates
+## 8. Harness templates
 
 `harness:` (frontmatter) or `--harness` (CLI, overrides every agent) is either
 a **bare name** → built-in template, or a custom `/bin/sh -c` command line
@@ -284,7 +372,7 @@ conventions live **in its template** — the orchestrator hardcodes none.
 
 ---
 
-## 8. Running it
+## 9. Running it
 
 ```bash
 wechat-bro orchestrator                 # adopt or spawn daemon, watch, dispatch

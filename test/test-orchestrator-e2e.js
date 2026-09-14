@@ -43,6 +43,7 @@ function ok(cond, name) {
 // ── Fake daemon ───────────────────────────────────────────────────────────
 const wss = new WebSocket.Server({ port: PORT })
 const clients = new Set()
+const pendingHosts = new Map()
 
 wss.on('connection', (ws) => {
   clients.add(ws)
@@ -52,7 +53,19 @@ wss.on('connection', (ws) => {
     let req
     try { req = JSON.parse(raw.toString()) } catch { return }
     if (!req.id) return
-    if (req.cmd === 'get-contact') {
+    if (req.cmd === 'host') {
+      const requestId = 'host-' + req.id
+      pendingHosts.set(requestId, { ws, id: req.id })
+      broadcast('host-discussion', { requestId, to: req.to, prompt: req.prompt })
+    } else if (req.cmd === 'host-result') {
+      const pending = pendingHosts.get(req.requestId)
+      if (pending) {
+        pendingHosts.delete(req.requestId)
+        pending.ws.send(JSON.stringify(req.ok
+          ? { id: pending.id, ok: true, data: req.data }
+          : { id: pending.id, ok: false, error: req.error }))
+      }
+    } else if (req.cmd === 'get-contact') {
       ws.send(JSON.stringify({ id: req.id, ok: true, data: { name: req.id, isRoomContact: req.id === 'Dev Team' } }))
     } else if (req.cmd === 'send-text') {
       sent.push(req)
@@ -72,6 +85,22 @@ function broadcast(event, data) {
 // ── Fixture: agents dir with a dedicated agent + harness template ─────────
 const agentsDir = path.join(tmpDir, 'agents')
 fs.mkdirSync(agentsDir, { recursive: true })
+// Restrict bundled generic fallbacks in this fixture so the host no-route
+// branch is observable. Dedicated Alice/Bob/Carol/Dave agents still route.
+fs.writeFileSync(path.join(agentsDir, 'generic-contact.agent.md'), `---
+name: wechat-individual-maintainer
+type: contact
+contacts: [FixtureOnlyContact]
+---
+fixture override
+`)
+fs.writeFileSync(path.join(agentsDir, 'generic-room.agent.md'), `---
+name: wechat-room-maintainer
+type: room
+contacts: [FixtureOnlyRoom]
+---
+fixture override
+`)
 const out1 = path.join(tmpDir, 'task-alice.md')
 const out2 = path.join(tmpDir, 'task-orchestrator.md')
 const meta1 = path.join(tmpDir, 'meta-alice.txt')
@@ -125,17 +154,58 @@ cwd: ${path.join(tmpDir, 'contacts', 'Carol')}
 ---
 Carol-specific body.
 `)
+// Dave exercises the worker `next_action` contract. His harness captures the
+// task and only a REAL message requests a follow-up wakeup; the synthetic wake
+// task itself returns a plain result, so the continuation ends after one fire.
+const daveLog = path.join(tmpDir, 'task-dave.log')
+fs.writeFileSync(path.join(agentsDir, 'wechat-dave.agent.md'), `---
+name: wechat-dave
+description: e2e next-action agent
+contacts: [Dave]
+type: contact
+session-id: e2e-dave-session
+harness: cat {task-path} >> ${JSON.stringify(daveLog)} && ( grep -q "SCHEDULED WAKEUP" {task-path} && echo '{"status":"addressed"}' || ( grep -q "HOST DISCUSSION" {task-path} && echo '{"status":"addressed","next_action":{"type":"wake","after_seconds":60,"reason":"Host follow-up with Dave","context":"Continue the hosted workshop discussion only if it still needs a nudge."}}' || echo '{"status":"addressed","next_action":{"type":"wake","after_seconds":6,"reason":"Follow up with Dave","context":"Check whether Dave replied; if the thread is active, stay silent."}}' ) )
+cwd: ${path.join(tmpDir, 'contacts', 'Dave')}
+---
+Dave-specific body.
+`)
 
 const sent = []
 const sleep = (ms) => new Promise(r => setTimeout(r, ms))
+const runCli = (args) => new Promise((resolve) => {
+  const p = spawn(process.execPath, [ORCH, ...args], { env: process.env, stdio: ['ignore', 'pipe', 'pipe'] })
+  let stdout = '', stderr = ''
+  p.stdout.on('data', c => { stdout += c })
+  p.stderr.on('data', c => { stderr += c })
+  p.on('close', status => resolve({ status, stdout, stderr }))
+})
+let child
 
 async function main() {
   // Start the orchestrator as a real subprocess of src/cli.js. Agents come
   // from <WECHAT_BRO_DATA_DIR>/agents (the fixture dir above).
-  const child = spawn('node', [ORCH, 'orchestrator', '--port', String(PORT)], {
+  const spawnOrch = () => spawn('node', [ORCH, 'orchestrator', '--port', String(PORT)], {
     stdio: ['ignore', 'inherit', 'inherit'],
+    // Lower the wake minimum so the e2e can exercise real timers quickly.
+    env: { ...process.env, WECHAT_BRO_WAKE_MIN_SECONDS: '0.2' },
   })
+  child = spawnOrch()
   await sleep(1200) // let it connect
+
+  const wakesFile = path.join(tmpDir, 'pending-wakes.json')
+  const pendingWakes = () => { try { return JSON.parse(fs.readFileSync(wakesFile, 'utf8')).wakes || {} } catch { return {} } }
+
+  // 0. host control request → same routed agent/session, synthetic task only.
+  const host = await runCli(['host', '--port', String(PORT), '--to', 'Dave', '--prompt', 'Topic: workshop adoption; goal: open a thoughtful discussion.'])
+  await sleep(1200)
+  ok(host.status === 0 && fs.existsSync(daveLog), 'e2e: host command forwarded to the running orchestrator')
+  if (fs.existsSync(daveLog)) {
+    const hosted = fs.readFileSync(daveLog, 'utf8')
+    ok(hosted.includes('HOST DISCUSSION') && hosted.includes('workshop adoption'), 'e2e: host uses the same room agent with rich context')
+    ok(pendingWakes().Dave && pendingWakes().Dave.reason === 'Host follow-up with Dave' && pendingWakes().Dave.session_id === 'e2e-dave-session', 'e2e: accepted host result schedules its pending wake in the configured session')
+  }
+  const missingHost = await runCli(['host', '--port', String(PORT), '--to', 'Unknown', '--prompt', 'should fail'])
+  ok(missingHost.status !== 0 && missingHost.stdout.includes('no routable agent'), 'e2e: host reports a clear no-route failure')
 
   // 1. watched contact message
   broadcast('message', { from: 'Alice', to: 'me', type: 'text', Content: 'hello there', ts: Date.now() })
@@ -259,6 +329,38 @@ broadcast('message', { from: 'Alice', to: 'me', type: 'text', Content: '你能�
     ok(false, 'e2e: owner assistant ping dispatched')
   }
 
+  // 11. a real message before the host wake is due supersedes that plan and
+  // the same configured session chooses the replacement continuation.
+  broadcast('message', { from: 'Dave', to: 'me', type: 'text', Content: 'should we continue the workshop?', ts: Date.now() })
+  await sleep(1200)
+  const afterHostReply = fs.readFileSync(daveLog, 'utf8')
+  ok(afterHostReply.includes('SUPERSEDED PLAN') && afterHostReply.includes('Host follow-up with Dave'), 'e2e: real message supersedes the pending host wake before due')
+  ok(pendingWakes().Dave && pendingWakes().Dave.reason === 'Follow up with Dave' && pendingWakes().Dave.session_id === 'e2e-dave-session', 'e2e: same configured session chooses the replacement next_action')
+  ok((afterHostReply.match(/SCHEDULED WAKEUP/g) || []).length === 0, 'e2e: superseded host wake did not fire before the real message')
+
+  // 12. a real incoming message supersedes the pending wakeup BEFORE dispatch
+  broadcast('message', { from: 'Dave', to: 'me', type: 'text', Content: 'actually I have an update', ts: Date.now() })
+  await sleep(1500)
+  const daveTasks = fs.readFileSync(daveLog, 'utf8')
+  ok(daveTasks.includes('SUPERSEDED PLAN') && daveTasks.includes('Follow up with Dave'), 'e2e: incoming message injects the cancelled wake as superseded planning context')
+  ok(daveTasks.includes('actually I have an update'), 'e2e: the newer message itself still drives the task')
+  ok(pendingWakes().Dave && pendingWakes().Dave.version >= 3 && pendingWakes().Dave.session_id === 'e2e-dave-session', 'e2e: same configured session replaced the host wake (version bumped)')
+
+  // 13. restart recovery: the pending wakeup survives, then fires EXACTLY once
+  // as a synthetic wake task in the same session.
+  child.kill('SIGTERM')
+  await sleep(700)
+  child = spawnOrch()
+  await sleep(1200)
+  ok(!!pendingWakes().Dave, 'e2e: pending wakeup survived the orchestrator restart')
+  const firedBefore = (fs.readFileSync(daveLog, 'utf8').match(/SCHEDULED WAKEUP/g) || []).length
+  await sleep(7000)
+  const afterRestart = fs.readFileSync(daveLog, 'utf8')
+  const firedAfter = (afterRestart.match(/SCHEDULED WAKEUP/g) || []).length
+  ok(firedAfter === firedBefore + 1, 'e2e: recovered wake fired once as a synthetic task (no duplicate)')
+  ok(afterRestart.includes('Reason you set: Follow up with Dave'), 'e2e: synthetic wake carried the saved reason + handoff')
+  ok(!pendingWakes().Dave, 'e2e: fired wake is consumed from the durable store')
+
   child.kill('SIGTERM')
   wss.close()
   console.log(`\n${pass} passed, ${fail} failed`)
@@ -266,4 +368,3 @@ broadcast('message', { from: 'Alice', to: 'me', type: 'text', Content: '你能�
 }
 
 main().catch(e => { console.error(e); child && child.kill(); process.exit(1) })
-let child
