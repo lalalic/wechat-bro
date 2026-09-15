@@ -1,0 +1,56 @@
+name: Publish to npm
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+
+      - name: Choose next version
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME=$(node -p "require('./package.json').name")
+          LOCAL=$(node -p "require('./package.json').version")
+          REMOTE=$(npm view "$NAME" version 2>/dev/null || echo 0.0.0)
+          NEXT=$(node - "$LOCAL" "$REMOTE" <<'NODE'
+          const [local, remote] = process.argv.slice(2)
+          const core = v => v.replace(/^v/, '').split('-')[0].split('.').map(Number)
+          const cmp = (a, b) => {
+            const x = core(a), y = core(b)
+            for (let i = 0; i < 3; i++) {
+              if (x[i] !== y[i]) return x[i] - y[i]
+            }
+            return 0
+          }
+          if (cmp(local, remote) > 0) {
+            console.log(local)
+          } else {
+            const [major, minor, patch] = core(remote)
+            console.log(`${major}.${minor}.${patch + 1}`)
+          }
+          NODE
+          )
+          echo "Publishing $NAME@$NEXT (repo=$LOCAL, registry=$REMOTE)"
+          npm version "$NEXT" --no-git-tag-version --allow-same-version
+
+      - name: Publish
+        run: npm publish --access public
