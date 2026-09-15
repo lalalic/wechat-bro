@@ -63,6 +63,24 @@ async function run() {
   assert.throws(() => replacement.requireAuthenticated(), /login_required/)
   console.log('  ok - navigation/reinjection preserves prior auth and surfaces login_required')
 
+  const oldPage = { generation: 1 }
+  const newPage = { generation: 2 }
+  let recoveredPage = oldPage
+  let reconnects = 0
+  const disconnected = new DaemonLifecycle({
+    maxAttempts: 1,
+    retryDelaysMs: [0],
+    probe: async page => page === newPage ? { authenticated: true } : { pageLost: true },
+    recoverPage: async () => { reconnects++; recoveredPage = newPage; return recoveredPage },
+    observer: { start() {}, stop() {} },
+  }).setPage(oldPage)
+  await disconnected.revalidate('before disconnect')
+  await disconnected.pageLost('browser disconnected')
+  assert.strictEqual(reconnects, 1, 'browser disconnect invokes one bounded reconnect')
+  assert.strictEqual(disconnected.page, newPage, 'reconnect installs the replacement page')
+  assert.strictEqual(disconnected.state, STATES.AUTHENTICATED, 'replacement page is revalidated after reconnect')
+  console.log('  ok - browser disconnect reconnects and revalidates the replacement page')
+
   let attempts = 0
   const delays = []
   const recovering = new DaemonLifecycle({
@@ -111,7 +129,8 @@ async function run() {
   assert.strictEqual(fallbackSpawned, 0, 'non-macOS observer is optional')
   lifecycle.stop(); replacement.stop(); recovering.stop()
   console.log('  ok - auth command classification')
-  console.log('\n--- Results ---\n  Passed: 8\n  Failed: 0')
+  disconnected.stop()
+  console.log('\n--- Results ---\n  Passed: 9\n  Failed: 0')
 }
 
 run().catch(error => {

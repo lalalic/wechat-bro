@@ -163,6 +163,7 @@ class DaemonLifecycle {
     this.log = options.log || (() => {})
     this.emit = options.emit || (() => {})
     this.flush = options.flush || (async () => {})
+    this.recoverPage = options.recoverPage || null
     this.probe = options.probe || ((page) => readPageSignals(page))
     this.sleep = options.sleep || ((ms) => new Promise(resolve => setTimeout(resolve, ms)))
     this.setInterval = options.setInterval || setInterval
@@ -174,6 +175,7 @@ class DaemonLifecycle {
     })
     this.timer = null
     this.revalidation = null
+    this.recovery = null
     this.lastSignals = null
     this.transitionLog = []
   }
@@ -202,7 +204,35 @@ class DaemonLifecycle {
   pageLost(reason = 'page lost', detail) {
     this.page = null
     this.transition(STATES.RECOVERING, reason, detail)
-    return this.revalidation
+    return this.recover(reason)
+  }
+
+  async recover(reason = 'page lost') {
+    if (!this.recoverPage) return STATES.RECOVERING
+    if (this.recovery) return this.recovery
+    this.recovery = (async () => {
+      let lastError = null
+      for (let attempt = 0; attempt <= this.maxAttempts; attempt++) {
+        try {
+          const page = await this.recoverPage(reason, attempt)
+          if (!page) throw new Error('page recovery unavailable')
+          this.setPage(page)
+          const result = await this.revalidate(`page recovery: ${reason}`)
+          if (result !== STATES.RECOVERING) return result
+          lastError = new Error('page_lost/recovering')
+        } catch (e) {
+          lastError = e
+        }
+        if (attempt >= this.maxAttempts) break
+        const delay = this.retryDelaysMs[attempt] === undefined
+          ? this.retryDelaysMs[this.retryDelaysMs.length - 1] || 0
+          : this.retryDelaysMs[attempt]
+        if (delay > 0) await this.sleep(delay)
+      }
+      this.transition(STATES.RECOVERING, reason, { error: lastError && lastError.message })
+      return STATES.RECOVERING
+    })()
+    try { return await this.recovery } finally { this.recovery = null }
   }
 
   handleBridgeEvent(event) {
