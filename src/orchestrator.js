@@ -238,21 +238,35 @@ function renderTask(msg, extra, opts = {}) {
   if (typeof opts === 'boolean') opts = { assistant: opts }
   const { assistant = false, recordOnly = false, superseded = null, wake = null } = opts
   if (wake) return renderWakeTask(wake)
-  if (opts.host) return [
-    `# Host discussion — ${new Date().toISOString()}`,
-    '',
-    `HOST DISCUSSION — open a discussion in **${msg.to}** now.`,
-    '',
-    'Rich context supplied by the caller:',
-    '',
-    String(msg.Content || ''),
-    '',
-    'Use the configured contact/room session and send the opening action via wechat-bro. Continue only through the normal JSON result contract and optional next_action; do not start a second host loop or resident worker.',
-    '',
-    'End your final output with exactly ONE JSON result line (the orchestrator parses it):',
-    ...resultContractLines(),
-    '',
-  ].join('\n')
+  if (opts.host) {
+    const update = !!superseded
+    return [
+      `# Host ${update ? 'guidance update' : 'discussion'} — ${new Date().toISOString()}`,
+      '',
+      update ? 'HOST GUIDANCE UPDATE' : `HOST DISCUSSION — open a discussion in **${msg.to}** now.`,
+      '',
+      ...(update ? [
+        'A hosted discussion for this target was already active.',
+        'The previous scheduled plan was superseded by this new authoritative guidance.',
+        '',
+        'Superseded plan (planning context only):',
+        `Reason: ${superseded.reason || '(none given)'}`,
+        `Context: ${superseded.context || '(none given)'}`,
+        '',
+        'New authoritative host guidance:',
+      ] : ['Rich context supplied by the caller:']),
+      '',
+      String(msg.Content || ''),
+      '',
+      update
+        ? 'Do not assume you must send a message immediately. Inspect the current conversation state and decide whether to send something, stay silent, escalate, schedule a new next_action, or end proactive hosting by omitting next_action.'
+        : 'Use the configured contact/room session and send the opening action via wechat-bro. Continue only through the normal JSON result contract and optional next_action; do not start a second host loop or resident worker.',
+      '',
+      'End your final output with exactly ONE JSON result line (the orchestrator parses it):',
+      ...resultContractLines(),
+      '',
+    ].join('\n')
+  }
   const lines = [
     `# WeChat task — ${new Date().toISOString()}`,
     '',
@@ -529,8 +543,6 @@ class WakeScheduler {
       version,
       session: key,
       agent: agentName || null,
-      session_id: identity.sessionId || null,
-      session_dir: identity.sessionDir || null,
       due_at: now + Math.round(seconds * 1000),
       after_seconds: seconds,
       reason: norm.reason,
@@ -687,10 +699,10 @@ function makeDispatcher({ wsSend, onEscalation, wakes = null }) {
       : expand(d.cwd || path.join(DATA_DIR, 'contacts', sanitizeFsName(name)))
     d.sessionDir = isOrch
       ? path.join(DATA_DIR, 'session')
-      : expand((isWake && opts.wake.session_dir) || d['session-dir'] || path.join(base, 'session'))
+      : expand(d['session-dir'] || path.join(base, 'session'))
     d.sessionId = isOrch
       ? 'wechat-orchestrator'
-      : ((isWake && opts.wake.session_id) || d['session-id'] || `wechat-${sanitizeFsName(name)}`)
+      : (d['session-id'] || `wechat-${sanitizeFsName(name)}`)
     d.cwd = base
     fs.mkdirSync(base, { recursive: true })
     fs.mkdirSync(d.sessionDir, { recursive: true })
@@ -744,7 +756,7 @@ function makeDispatcher({ wsSend, onEscalation, wakes = null }) {
           // A real task supersedes whichever plan is pending at START time,
           // including a wake produced by the task that was ahead of it in
           // this same queue after the real message had already arrived.
-          superseded = wakes.take(name)
+          superseded = wakes.take(name) || opts.superseded
         }
         fs.writeFileSync(taskFile, renderTask(msg, extra, { ...opts, superseded }))
         const { code, stdout } = await spawnTask()
@@ -803,7 +815,7 @@ async function isRoomContact(ws, cache, name) {
   try {
     const data = await sendCommand(ws, { cmd: 'get-contact', id: name })
     room = !!(data && data.isRoomContact)
-  } catch { /* unknown → treat as individual */ }
+  } catch { return null }
   cache.set(name, room)
   return room
 }
@@ -884,11 +896,17 @@ async function runOrchestrator({ port = 9231 } = {}) {
     }
     const current = loadAgents()
     if (cliHarness) for (const a of current) a.data.harness = cliHarness
-    let agent = entry.agent ? current.find(a => a.data.name === entry.agent) : null
-    if (agent && agent.data.type !== 'orchestrator') {
-      const routed = routeAgent(current, entry.session, await isRoomContact(ws, roomCache, entry.session))
-      agent = routed ? routed.agent : null
+    const isRoom = await isRoomContact(ws, roomCache, entry.session)
+    if (isRoom === null) {
+      log(`wake for ${entry.session}: contact type lookup failed — retrying in 5s`)
+      wakes.reschedule(entry, 5000)
+      return
     }
+    const recorded = entry.agent ? current.find(a => a.data.name === entry.agent) : null
+    const routed = routeAgent(current, entry.session, isRoom)
+    const agent = routed && (recorded && recorded.data.type === 'orchestrator'
+      ? recorded
+      : routed.agent)
     if (!agent) {
       log(`wake for ${entry.session}: no agent routes there any more — dropped`)
       wakes.claim(entry.session, entry.id, entry.version)
@@ -938,11 +956,12 @@ async function runOrchestrator({ port = 9231 } = {}) {
         return log(`host discussion failed: no routable agent for ${target}`)
       }
       log(`host discussion → ${target} via ${routed.agent.data.name}`)
+      const superseded = wakes && wakes.take(target)
       hostResult(true, null, { accepted: true, agent: routed.agent.data.name, target })
       dispatch(routed.agent,
         { from: 'host', to: target, type: 'host-discussion', Content: String(prompt) },
         'This is a synthetic HOST DISCUSSION request from the outer orchestrator. Treat the supplied content as rich task context, not as a user message.',
-        { assistant: false, recordOnly: false, host: true }, target)
+        { assistant: false, recordOnly: false, host: true, superseded }, target)
       return
     }
     if (!ev.startsWith('message')) return

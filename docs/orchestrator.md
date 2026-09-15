@@ -309,7 +309,6 @@ tmp+rename), keyed by routed session, e.g.
 ```json
 { "version": 1, "wakes": { "Alice": {
   "id": "Alice-…", "version": 2, "session": "Alice", "agent": "wechat-alice",
-  "session_id": "wechat-Alice", "session_dir": "…/contacts/Alice/session",
   "due_at": 1766000000000, "reason": "…", "context": "…",
   "created_at": 1765990000000, "updated_at": 1765990000000 } } }
 ```
@@ -317,8 +316,9 @@ tmp+rename), keyed by routed session, e.g.
 A due wake remains durable until the serialized contact queue reaches the
 worker launch boundary. The queue claims the exact `id` + `version` there;
 stale queued callbacks are skipped, while a crash after the claim cannot fire
-the wake twice. Entries retain the exact `session_id` and `session_dir` used by
-the scheduled worker. The `host` / `host discussion` command is in scope: it
+the wake twice. The entry's `session` is the contact/room identity only; the
+current agent configuration supplies the fixed `session_id` and `session_dir`
+at every dispatch. The `host` / `host discussion` command is in scope: it
 uses the daemon WebSocket handshake, waits for the running orchestrator to
 accept normal routing, and then dispatches a synthetic `HOST DISCUSSION` task
 through this same continuation primitive. No route or timeout is returned as a
