@@ -851,85 +851,83 @@ function makeDispatcher({ wsSend, onEscalation, wakes = null, canDispatch = null
   const queues = new Map()
   const taskStates = new Map()
 
-  return function dispatch(agent, msg, extra, opts, contactName) {
+  const dispatch = function dispatch(agent, msg, extra, opts, contactName) {
     if (typeof opts === 'boolean') opts = { assistant: opts }
     const d = agent.data
     const isOrch = d.type === 'orchestrator'
     const name = isOrch ? d.name : (contactName || msg.from || d.name)
     const isWake = !!(opts && opts.wake)
+    if (canDispatch && !canDispatch(name, 'enqueue')) {
+      return { code: 0, stdout: '', skipped: true, reason: 'watch-control' }
+    }
     // Supersession is resolved inside the per-contact queue, immediately
     // before this task starts. Doing it at enqueue time is too early: the
     // currently-running turn may still publish a wake after this message has
     // arrived, and that late plan must also be superseded by the real message.
     if (!queues.has(name)) queues.set(name, new ContactQueue())
     const queue = queues.get(name)
-    if (!canDispatch || canDispatch(name, 'enqueue')) {
-      if (!taskStates.has(name)) taskStates.set(name, { active: 0, queued: 0 })
-      taskStates.get(name).queued += 1
-    }
-
-    // Orchestrator agent has FIXED paths (not configurable): it works in the
-    // data dir with one dedicated session. Contact agents derive paths from
-    // frontmatter (re-resolved per dispatch so edits apply next message).
-    const base = isOrch
-      ? DATA_DIR
-      : expand(d.cwd || path.join(DATA_DIR, 'contacts', sanitizeFsName(name)))
-    d.sessionDir = isOrch
-      ? path.join(DATA_DIR, 'session')
-      : expand(d['session-dir'] || path.join(base, 'session'))
-    d.sessionId = isOrch
-      ? 'wechat-orchestrator'
-      : (d['session-id'] || `wechat-${sanitizeFsName(name)}`)
-    d.cwd = base
-    fs.mkdirSync(base, { recursive: true })
-    fs.mkdirSync(d.sessionDir, { recursive: true })
-    ensureAgentsMd(base, agent.path)
-
-    const taskFile = path.join(base, `.task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.md`)
-
-    // Bare harness name → its built-in template; custom template or unset
-    // (→ pi) passes through. All templates run via /bin/sh with {var} subs.
-    const tpl = defaultHarness(d.harness)
-    const timeoutS = parseInt(d.timeout, 10) || 900
-    const timeoutMs = timeoutS * 1000
-    const taskRef = path.basename(taskFile)
-    const cmdline = renderHarness(tpl, harnessVars(d, {
-      task: taskRef, taskPath: taskFile, contact: name, timeoutS,
-    }))
-
-    const label = `${d.name} ← ${name}`
-    log('dispatch', label, d.sessionId)
-    const startedAt = Date.now()
-
-    // notify:true → a concise note fires NOW, when the message is received —
-    // but only when it NEEDS A RESPONSE: a real incoming message the persona
-    // handles or an assistant ping. Never for context-only recordings (no
-    // reply will happen) nor for the owner's own messages (they sent them).
-    if (d.notify && !isOrch && !isWake && msg.from !== 'me' && !opts.recordOnly) {
-      const snippet = String(msg.Content || msg.content || '').split('\n')[0].trim().slice(0, 100)
-      wsSend({ cmd: 'send-text', to: 'filehelper', content: `📨 ${name}: ${snippet}` })
-    }
-
-    const spawnTask = () => new Promise((resolve) => {
-      let stdout = ''
-      const child = spawn('/bin/sh', ['-c', cmdline], { cwd: base, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] })
-      const timer = setTimeout(() => { log('timeout', label); child.kill('SIGKILL') }, timeoutMs)
-      child.stdout.on('data', c => { stdout += c })
-      child.stderr.on('data', c => { stdout += c })
-      child.on('close', (code) => {
-        clearTimeout(timer)
-        resolve({ code, stdout })
-      })
-    })
+    if (!taskStates.has(name)) taskStates.set(name, { active: 0, queued: 0 })
+    taskStates.get(name).queued += 1
 
     return queue.run(async () => {
+      let taskFile = null
       try {
+        const state = taskStates.get(name)
+        if (state) state.queued = Math.max(0, state.queued - 1)
         if (canDispatch && !canDispatch(name, 'start')) {
           if (wakes) wakes.clear(name)
           return { code: 0, stdout: '', skipped: true, reason: 'watch-control' }
         }
-        const state = taskStates.get(name)
-        if (state) { state.queued = Math.max(0, state.queued - 1); state.active += 1 }
+        if (state) state.active += 1
+
+        // Orchestrator agent has FIXED paths (not configurable): it works in
+        // the data dir with one dedicated session. Contact agents derive paths
+        // from frontmatter (re-resolved per dispatch so edits apply next run).
+        const base = isOrch
+          ? DATA_DIR
+          : expand(d.cwd || path.join(DATA_DIR, 'contacts', sanitizeFsName(name)))
+        d.sessionDir = isOrch
+          ? path.join(DATA_DIR, 'session')
+          : expand(d['session-dir'] || path.join(base, 'session'))
+        d.sessionId = isOrch
+          ? 'wechat-orchestrator'
+          : (d['session-id'] || `wechat-${sanitizeFsName(name)}`)
+        d.cwd = base
+        fs.mkdirSync(base, { recursive: true })
+        fs.mkdirSync(d.sessionDir, { recursive: true })
+        ensureAgentsMd(base, agent.path)
+
+        taskFile = path.join(base, `.task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.md`)
+
+        const tpl = defaultHarness(d.harness)
+        const timeoutS = parseInt(d.timeout, 10) || 900
+        const timeoutMs = timeoutS * 1000
+        const taskRef = path.basename(taskFile)
+        const cmdline = renderHarness(tpl, harnessVars(d, {
+          task: taskRef, taskPath: taskFile, contact: name, timeoutS,
+        }))
+
+        const label = `${d.name} ← ${name}`
+        log('dispatch', label, d.sessionId)
+        const startedAt = Date.now()
+
+        if (d.notify && !isOrch && !isWake && msg.from !== 'me' && !opts.recordOnly) {
+          const snippet = String(msg.Content || msg.content || '').split('\n')[0].trim().slice(0, 100)
+          wsSend({ cmd: 'send-text', to: 'filehelper', content: `📨 ${name}: ${snippet}` })
+        }
+
+        const spawnTask = () => new Promise((resolve) => {
+          let stdout = ''
+          const child = spawn('/bin/sh', ['-c', cmdline], { cwd: base, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] })
+          const timer = setTimeout(() => { log('timeout', label); child.kill('SIGKILL') }, timeoutMs)
+          child.stdout.on('data', c => { stdout += c })
+          child.stderr.on('data', c => { stdout += c })
+          child.on('close', (code) => {
+            clearTimeout(timer)
+            resolve({ code, stdout })
+          })
+        })
+
         let superseded = null
         if (isWake) {
           if (!wakes.claim(name, opts.wake.id, opts.wake.version)) {
@@ -971,8 +969,11 @@ function makeDispatcher({ wsSend, onEscalation, wakes = null, canDispatch = null
         return { code, stdout }
       } finally {
         const state = taskStates.get(name)
-        if (state) state.active = Math.max(0, state.active - 1)
-        try { fs.unlinkSync(taskFile) } catch {}
+        if (state) {
+          state.active = Math.max(0, state.active - 1)
+          if (state.active === 0 && state.queued === 0) taskStates.delete(name)
+        }
+        if (taskFile) { try { fs.unlinkSync(taskFile) } catch {} }
       }
     })
   }

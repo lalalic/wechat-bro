@@ -25,6 +25,7 @@ function ok(condition, name) {
   if (condition) { pass++; console.log(`  ok - ${name}`) }
   else { fail++; console.error(`  NOT OK - ${name}`) }
 }
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 function writeAgent(name, frontmatter, body = 'prompt body') {
   const file = path.join(tmpDir, 'agents', `${name}.agent.md`)
@@ -80,6 +81,10 @@ async function main() {
   ok(states.find(item => item.context === 'Grace').paused, 'runtime-only pause is visible in status')
 
   console.log('# dispatcher gates')
+  const accessorDispatch = m.makeDispatcher({ wsSend: async () => {} })
+  ok(typeof accessorDispatch.taskStates === 'function' && typeof accessorDispatch.queues === 'function', 'dispatcher exposes status metadata accessors')
+  ok(typeof accessorDispatch.taskStates() === 'object' && typeof accessorDispatch.queues() === 'object', 'richer status can call dispatcher metadata accessors')
+
   const dispatchDir = path.join(tmpDir, 'dispatch')
   fs.mkdirSync(dispatchDir, { recursive: true })
   const agentPath = writeAgent('wechat-dispatch', 'name: wechat-dispatch\ncontacts: [Paused]')
@@ -88,6 +93,49 @@ async function main() {
   const skipped = await pausedDispatch(pausedAgent, { from: 'Paused', to: 'me', type: 'text', Content: 'hi' }, null, {}, 'Paused')
   ok(skipped.skipped === true && skipped.reason === 'watch-control', 'dispatcher rejects an unwatched/paused task before starting')
   ok(fs.readdirSync(dispatchDir).filter(name => name.startsWith('.task-')).length === 0, 'rejected dispatch does not create a task file')
+
+  const blockedDir = path.join(tmpDir, 'blocked-dispatch')
+  const blockedAgentPath = writeAgent('wechat-blocked', 'name: wechat-blocked\ncontacts: [Blocked]\nnotify: true')
+  const blockedNotifications = []
+  const blockedDispatch = m.makeDispatcher({
+    wsSend: async request => blockedNotifications.push(request),
+    canDispatch: () => false,
+  })
+  const blockedResult = await blockedDispatch(
+    { path: blockedAgentPath, data: { name: 'wechat-blocked', type: 'contact', cwd: blockedDir, notify: 'true', harness: 'false' } },
+    { from: 'Blocked', to: 'me', type: 'text', Content: 'hi' },
+    null, {}, 'Blocked',
+  )
+  ok(blockedResult.skipped === true && !fs.existsSync(blockedDir), 'blocked enqueue creates no cwd/session directories or AGENTS.md')
+  ok(blockedNotifications.length === 0, 'blocked enqueue sends no receipt notification')
+
+  const deferredDir = path.join(tmpDir, 'deferred-dispatch')
+  const deferredAgentPath = writeAgent('wechat-deferred', 'name: wechat-deferred\ncontacts: [Deferred]')
+  let gateOpen = true
+  const deferredDispatch = m.makeDispatcher({
+    wsSend: async () => {},
+    canDispatch: (context, phase) => phase === 'enqueue' || gateOpen,
+  })
+  const deferredAgent = {
+    path: deferredAgentPath,
+    data: { name: 'wechat-deferred', type: 'contact', cwd: deferredDir, harness: 'sleep 0.12; printf %s \'{"status":"addressed"}\'' },
+  }
+  const firstDeferred = deferredDispatch(deferredAgent, { from: 'Deferred', to: 'me', type: 'text', Content: 'first' }, null, {}, 'Deferred')
+  await sleep(35)
+  ok(deferredDispatch.taskStates().Deferred.active === 1 && deferredDispatch.taskStates().Deferred.queued === 0, 'active task is reflected in dispatcher status')
+  gateOpen = false
+  const secondDeferred = deferredDispatch(
+    { ...deferredAgent, data: { ...deferredAgent.data, harness: 'printf %s > blocked-worker-marker' } },
+    { from: 'Deferred', to: 'me', type: 'text', Content: 'second' },
+    null, {}, 'Deferred',
+  )
+  ok(deferredDispatch.taskStates().Deferred.queued === 1, 'accepted task is queued before its start gate')
+  const [firstResult, secondResult] = await Promise.all([firstDeferred, secondDeferred])
+  ok(secondResult.skipped && secondResult.reason === 'watch-control', 'task accepted at enqueue is blocked before start')
+  ok(!deferredDispatch.taskStates().Deferred, 'queued accounting is removed after an accepted task is blocked')
+  ok(Object.values(deferredDispatch.queues()).every(queue => queue.queued === 0), 'queue accounting has no stale queued count')
+  ok(!fs.existsSync(path.join(deferredDir, 'blocked-worker-marker')), 'blocked queued task does not spawn its harness')
+  ok(fs.readdirSync(deferredDir).filter(name => name.startsWith('.task-')).length === 0, 'blocked queued task leaves no task file')
 
   const continuationDir = path.join(tmpDir, 'continuation')
   fs.mkdirSync(continuationDir, { recursive: true })
