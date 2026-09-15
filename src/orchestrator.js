@@ -917,6 +917,10 @@ async function runOrchestrator({ port = 9231 } = {}) {
       log('daemon', ev, JSON.stringify(msg.data || {}))
       return
     }
+    if (ev === 'lifecycle') {
+      log('daemon lifecycle', JSON.stringify(msg.data || {}))
+      return
+    }
     if (ev === 'host-discussion') {
       const target = msg.data && msg.data.to
       const prompt = msg.data && msg.data.prompt

@@ -50,6 +50,7 @@ const WebSocket = require('ws')
 const { transcribeVoice, transcribeFile } = require('./transcribe')
 const { sendImage, sendFile } = require('./upload')
 const wsServer = require('./ws-server')
+const { DaemonLifecycle, isAuthCommand } = require('./daemon-lifecycle')
 
 // Overridable for tests so unit suites never touch the real ~/.wechat-bro
 const DATA_DIR = process.env.WECHAT_BRO_DATA_DIR || path.join(os.homedir(), '.wechat-bro')
@@ -339,9 +340,11 @@ function log(...args) {
 // ── Graceful shutdown ─────────────────────────────────────────────────────
 let _wsServer = null  // set by main()
 let _exitSave = null  // set by main(): flush cookies to disk before exit
+let _lifecycle = null  // daemon-owned auth/lifecycle state
 
 function shutdown() {
   log('Shutting down...')
+  if (_lifecycle) { try { _lifecycle.stop() } catch {} }
   if (_exitSave) { try { _exitSave() } catch {} }
   if (_wsServer) {
     try { _wsServer.close() } catch {}
@@ -738,73 +741,41 @@ async function main() {
     process.exit(1)
   }
 
-  const browser = await puppeteer.launch({
+  let browser = await puppeteer.launch({
     executablePath: chromePath,
     headless: !HEADED,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-web-security', '--disable-features=IsolateOrigins,site-per-process'],
     defaultViewport: { width: 1280, height: 900 },
   })
-  const page = (await browser.pages())[0]
-
-  // Dialog handler
-  page.on('dialog', async (dialog) => { log('Dialog:', dialog.message()); await dialog.accept() })
-
-  // Auto-reinject on navigation
-  page.on('framenavigated', async (frame) => {
-    if (frame !== page.mainFrame() || !frame.url().includes('wx.qq.com')) return
-    log('Page navigated — re-injecting')
-    try {
-      await page.waitForFunction(() => typeof angular !== 'undefined' && angular.element(document).injector(), { timeout: 15000 })
-      await page.evaluate(INJECT_SCRIPT)
-      await page.evaluate(() => { if (window.WechatyBro && !window.WechatyBro.vars.initState) return window.WechatyBro.init(); return { code: 304 } })
-      await page.evaluate(() => { if (window.WechatyBro) window.WechatyBro._loadLastMsgTime() })
-    } catch (e) { log('Re-inject failed:', e.message) }
-  })
-
-  // Load cookies
-  if (fs.existsSync(COOKIE_FILE)) {
-    try {
-      const raw = JSON.parse(fs.readFileSync(COOKIE_FILE, 'utf-8'))
-      const arr = Array.isArray(raw) ? raw : (raw.cookies || [])
-      if (arr.length) await page.setCookie(...arr)
-    } catch (e) { log('Cookie load:', e.message) }
-  }
-
-  await page.goto(WX_URL, { waitUntil: 'domcontentloaded', timeout: 30000 })
-  await page.waitForFunction(() => typeof angular !== 'undefined' && angular.element(document).injector(), { timeout: 30000 })
-  log('Angular ready')
-
-  // Expose event bridge — events stream to stdout as JSON lines.
-  // Message events are also appended to messages.jsonl for external agents to watch.
+  let page = (await browser.pages())[0]
   let msgFd
   try { msgFd = fs.openSync(MESSAGES_FILE, 'a') } catch {}
 
-  await page.exposeFunction('sendToPuppeteer', (event, data) => {
+  // The lifecycle controller deliberately lives outside the replaceable page
+  // context. Navigation/reinjection must not erase the daemon's knowledge that
+  // the previous page was authenticated.
+  const lifecycle = new DaemonLifecycle({
+    log,
+    emit: write,
+    flush: () => saveCookies(page),
+    recoverPage: (reason) => reconnectBrowser(reason),
+  })
+  _lifecycle = lifecycle
+  lifecycle.setPage(page).start()
+
+  async function handlePuppeteerEvent(event, data) {
+    lifecycle.handleBridgeEvent(event)
     if (data && data.voiceBase64 && (event === 'message:voice' || (event === 'message' && data.MsgType === 34))) {
       transcribeVoice(data)
     }
-    // Persist binary payloads (voice/image/video/file base64) to the owning
-    // contact's download folder (~/.wechat-bro/contacts/<name>/download/) and
-    // replace the field with a file path — keeps events small and gives
-    // agents a path they can open directly.
     saveBinaryContent(data)
-    // Distill non-text messages: content → file path / extracted text,
-    // drop raw wire-format noise + empty fields. Returns false for
-    // suppressed types (app/system/recalled) — don't send those at all.
     if (!simplifyMessageEvent(event, data)) return
-    // For scan events: persist the user avatar URL to disk and swap the field
-    // for the file path before emitting the event.
     if (event === 'scan') saveUserAvatar(data)
     const line = { event, data, ts: Date.now() }
     write(line)
-    // Append message events to JSONL file for external agents
     if ((event === 'message' || event.startsWith('message:')) && msgFd) {
       try { fs.writeSync(msgFd, JSON.stringify(line) + '\n') } catch {}
     }
-    // On scan event: when running headless, open the QR URL in a browser
-    // window so the user can scan it. (Not drawn in terminal — keep stdout
-    // clean for agent piping. The user avatar is persisted above by
-    // saveUserAvatar, which also swaps data.userAvatar for the file path.)
     if (event === 'scan' && data) {
       lastQrPayload = data
       if (data.url && !HEADED && data.url !== lastQrUrl) {
@@ -813,7 +784,87 @@ async function main() {
         execSync(`${openCmd} "${data.url}" 2>/dev/null || true`, { shell: true })
       }
     }
-  })
+  }
+
+  function wireBrowser(nextBrowser) {
+    nextBrowser.on('disconnected', () => {
+      if (nextBrowser === browser) lifecycle.pageLost('browser disconnected')
+    })
+  }
+
+  async function wirePage(nextPage) {
+    nextPage.on('dialog', async (dialog) => { log('Dialog:', dialog.message()); await dialog.accept() })
+    nextPage.on('framenavigated', async (frame) => {
+      if (nextPage !== page || frame !== nextPage.mainFrame() || !frame.url().includes('wx.qq.com')) return
+      lifecycle.pageReplaced(nextPage, 'page navigation')
+      log('Page navigated — re-injecting')
+      try {
+        await nextPage.waitForFunction(() => typeof angular !== 'undefined' && angular.element(document).injector(), { timeout: 15000 })
+        await nextPage.evaluate(INJECT_SCRIPT)
+        await nextPage.evaluate(() => { if (window.WechatyBro && !window.WechatyBro.vars.initState) return window.WechatyBro.init(); return { code: 304 } })
+        await nextPage.evaluate(() => { if (window.WechatyBro) window.WechatyBro._loadLastMsgTime() })
+        await lifecycle.revalidate('page re-injected')
+      } catch (e) { log('Re-inject failed:', e.message) }
+    })
+    nextPage.on('error', (error) => {
+      if (nextPage === page) lifecycle.pageLost('page error', { error: error.message })
+    })
+    nextPage.on('close', () => {
+      if (nextPage === page) lifecycle.pageLost('page closed')
+    })
+    await nextPage.exposeFunction('sendToPuppeteer', handlePuppeteerEvent)
+  }
+
+  async function loadCookies(nextPage) {
+    if (!fs.existsSync(COOKIE_FILE)) return
+    try {
+      const raw = JSON.parse(fs.readFileSync(COOKIE_FILE, 'utf-8'))
+      const arr = Array.isArray(raw) ? raw : (raw.cookies || [])
+      if (arr.length) await nextPage.setCookie(...arr)
+    } catch (e) { log('Cookie load:', e.message) }
+  }
+
+  async function reconnectBrowser(reason) {
+    const oldBrowser = browser
+    const oldPage = page
+    try { await saveCookiesOnExit(oldPage) } catch {}
+    page = null
+    browser = null
+    try { await oldBrowser.close() } catch {}
+    try {
+      const processHandle = oldBrowser && oldBrowser.process && oldBrowser.process()
+      if (processHandle && !processHandle.killed) processHandle.kill('SIGTERM')
+    } catch {}
+
+    browser = await puppeteer.launch({
+      executablePath: chromePath,
+      headless: !HEADED,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-web-security', '--disable-features=IsolateOrigins,site-per-process'],
+      defaultViewport: { width: 1280, height: 900 },
+    })
+    page = (await browser.pages())[0]
+    lifecycle.setPage(page)
+    wireBrowser(browser)
+    await wirePage(page)
+    await loadCookies(page)
+    await page.goto(WX_URL, { waitUntil: 'domcontentloaded', timeout: 30000 })
+    await page.waitForFunction(() => typeof angular !== 'undefined' && angular.element(document).injector(), { timeout: 30000 })
+    await page.evaluate(INJECT_SCRIPT)
+    await page.evaluate(() => { if (window.WechatyBro && !window.WechatyBro.vars.initState) return window.WechatyBro.init(); return { code: 304 } })
+    await page.evaluate(() => { if (window.WechatyBro) window.WechatyBro._loadLastMsgTime() })
+    log('Browser/page recovered after', reason)
+    return page
+  }
+
+  wireBrowser(browser)
+  await wirePage(page)
+
+  // Load cookies
+  await loadCookies(page)
+
+  await page.goto(WX_URL, { waitUntil: 'domcontentloaded', timeout: 30000 })
+  await page.waitForFunction(() => typeof angular !== 'undefined' && angular.element(document).injector(), { timeout: 30000 })
+  log('Angular ready')
 
   await page.evaluate(INJECT_SCRIPT)
   const initResult = await page.evaluate(() => {
@@ -835,6 +886,7 @@ async function main() {
 
   try { await page.waitForFunction(() => window.WechatyBro && window.WechatyBro.vars.contactsReady === true, { timeout: 120_000 }); log('Contacts ready') } catch {}
   await saveCookies(page)
+  await lifecycle.revalidate('startup ready')
 
   // Periodic snapshot: session cookies rotate and the bridge keeps updating
   // the wx_last_msg_time replay marker as messages arrive — persist both.
@@ -846,7 +898,7 @@ async function main() {
   _exitSave = () => saveCookiesOnExit(page)
 
   // Emit a "ready" event so the agent knows it can start sending commands
-  write({ event: 'ready', data: { loggedIn: isLoggedIn, contactsReady: true } })
+  write({ event: 'ready', data: lifecycle.readyData(!!(lifecycle.lastSignals && lifecycle.lastSignals.contactsReady)) })
 
   // ── Wire up WebSocket dispatch (now that page is ready) ───────────────
   wsDispatch = async (cmd, args) => {
@@ -861,6 +913,7 @@ async function main() {
       })
       return { shuttingDown: true }
     }
+    if (isAuthCommand(cmd)) lifecycle.requireAuthenticated()
     return dispatch(cmd, args, page)
   }
 
@@ -1103,7 +1156,7 @@ async function dispatch(cmd, args, page) {
         lastMsgTime: window.WechatyBro._lastMsgTime || 0,
         initState: !!window.WechatyBro.vars.initState,
         account: window.WechatyBro.getAccount()
-      }))
+      })).then(data => ({ ...data, lifecycle: _lifecycle ? _lifecycle.state : 'page_lost/recovering' }))
 
     case 'emojis':
     case 'supported-emojis':   // backward-compat alias
