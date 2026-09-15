@@ -169,6 +169,28 @@ flowchart LR
   fallback only applies to contacts that passed the gate (or the owner's own
   messages to a watched chat).
 
+### Runtime watch controls
+
+Four daemon-relayed commands expose one runtime state owner:
+
+| command | persistent config | runtime routing | continuation |
+|---|---|---|---|
+| `watch <context>` | add to the routed agent's `contacts:` | add immediately | resumes when already watched |
+| `unwatch <context>` | remove from all watch lists | remove immediately | clears pending wakes/escalations |
+| `pause <context>` | unchanged | keeps watching but blocks dispatch | clears/skips pending work |
+| `unpause <context>` | unchanged | resumes dispatch | leaves no pause after restart |
+
+`watch`/`unwatch` and `pause`/`unpause` are idempotent. Pause does not edit an
+agent definition; the daemon still records inbound chat history, but the
+dispatcher checks the pause gate before enqueue/start and again before a
+completed worker may schedule its next wake. Restart constructs runtime state
+from persistent configuration, so pause is intentionally volatile.
+
+`status` merges daemon health with orchestrator state: agents, configured
+watches, runtime watches/pauses, configured-vs-runtime mismatches, agent/mode
+per context, active/queued dispatch counts, pending wakes, pending
+escalations, uptime, and daemon connection health.
+
 ---
 
 ## 4. Dispatch — one message, one task
@@ -379,6 +401,10 @@ wechat-bro orchestrator                 # adopt or spawn daemon, watch, dispatch
 wechat-bro orchestrator --port 9500     # custom WS port
 wechat-bro orchestrator --harness claude
 wechat-bro orchestrator --daemon        # force a fresh daemon child
+wechat-bro watch "Alice Chen"           # persist + immediately route
+wechat-bro pause "Alice Chen"           # runtime-only suppression
+wechat-bro unpause "Alice Chen"         # runtime-only resume
+wechat-bro unwatch "Alice Chen"         # persist + immediately stop
 wechat-bro exit                         # stop daemon (a running orchestrator respawns it)
 ```
 

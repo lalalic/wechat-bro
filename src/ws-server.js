@@ -36,7 +36,7 @@ function makeId() {
  * @returns {{ server: WebSocket.Server, broadcast: function, close: function, getClients: function }}
  */
 function create(opts = {}) {
-  const port = opts.port || 9231
+  const port = opts.port ?? 9231
   const quiet = !!opts.quiet
   const dispatch = opts.dispatch || (() => { throw new Error('no dispatch') })
   const onBroadcast = opts.broadcastEvent || null
@@ -56,6 +56,7 @@ function create(opts = {}) {
   /** Map of clientId → { ws, agentName } */
   const clients = new Map()
   const pendingHosts = new Map()
+  const pendingOrchestratorRequests = new Map()
 
   const server = new WebSocket.Server({ port })
 
@@ -92,6 +93,43 @@ function create(opts = {}) {
       // Special: ping/pong for liveness
       if (cmd === 'ping') {
         ws.send(JSON.stringify({ ok: true, id, data: { pong: true, ts: Date.now() } }))
+        return
+      }
+
+      // The orchestrator is a separate WebSocket client, so management
+      // controls are broadcast to it and its response is matched by ID.
+      const orchestratorActions = new Set(['watch', 'unwatch', 'pause', 'unpause', 'status'])
+      if (orchestratorActions.has(cmd)) {
+        const context = cmd === 'status' ? null : (req.context || req.name || req.to || '')
+        if (cmd !== 'status' && !context) {
+          ws.send(JSON.stringify({ ok: false, id, error: 'Missing context (positional value or --context)' }))
+          return
+        }
+        const requestId = `orchestrator-${makeId()}`
+        const timer = setTimeout(() => {
+          const pending = pendingOrchestratorRequests.get(requestId)
+          if (!pending) return
+          pendingOrchestratorRequests.delete(requestId)
+          pending.ws.send(JSON.stringify({ ok: false, id: pending.id, error: 'orchestrator request timed out: no orchestrator is running' }))
+        }, opts.orchestratorTimeoutMs || 5000)
+        pendingOrchestratorRequests.set(requestId, { ws, id, timer })
+        broadcast({
+          event: 'orchestrator-request',
+          data: { requestId, request: { cmd, ...(context ? { context } : {}) } },
+          ts: Date.now(),
+        })
+        return
+      }
+
+      if (cmd === 'orchestrator-response') {
+        const pending = pendingOrchestratorRequests.get(req.requestId)
+        if (!pending) return
+        pendingOrchestratorRequests.delete(req.requestId)
+        clearTimeout(pending.timer)
+        pending.ws.send(JSON.stringify(req.ok
+          ? { ok: true, id: pending.id, data: req.data || {} }
+          : { ok: false, id: pending.id, error: req.error || 'orchestrator request rejected' }))
+        ws.send(JSON.stringify({ ok: true, id, data: { delivered: true, requestId: req.requestId } }))
         return
       }
 
@@ -138,6 +176,9 @@ function create(opts = {}) {
     ws.on('close', () => {
       for (const [requestId, pending] of pendingHosts) {
         if (pending.ws === ws) { clearTimeout(pending.timer); pendingHosts.delete(requestId) }
+      }
+      for (const [requestId, pending] of pendingOrchestratorRequests) {
+        if (pending.ws === ws) { clearTimeout(pending.timer); pendingOrchestratorRequests.delete(requestId) }
       }
       clients.delete(clientId)
       wsLog(`Client ${clientId}${clientInfo.agentName ? ` (${clientInfo.agentName})` : ''} disconnected (${clients.size} remaining)`) 
