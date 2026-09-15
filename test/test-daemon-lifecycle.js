@@ -14,6 +14,8 @@ async function run() {
   console.log('# daemon lifecycle')
 
   assert.strictEqual(classifyPageSignals({ isLogin: true, userName: '@me', chatUi: true }), STATES.AUTHENTICATED)
+  assert.strictEqual(classifyPageSignals({ bridgeLogin: true, contactsReady: true }), STATES.AUTHENTICATED,
+    'startup bridge login + contacts-ready is authenticated even when MMCgi is stale')
   assert.strictEqual(classifyPageSignals({ isLogin: false, loginUi: true, chatUi: false }), STATES.LOGIN_REQUIRED)
   assert.strictEqual(classifyPageSignals({ pageLost: true }), STATES.RECOVERING)
   console.log('  ok - page signals distinguish authenticated, login_required, and page_lost')

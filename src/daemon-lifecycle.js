@@ -30,6 +30,10 @@ function classifyPageSignals(signals) {
   const loggedIn = signals.isLogin === true || signals.mmCgiLogin === true
   const hasAccount = !!(signals.userName || signals.account)
   if (loggedIn && (hasAccount || signals.chatUi || signals.bridgeLogin)) return STATES.AUTHENTICATED
+  // MMCgi.isLogin can be unavailable/stale after startup reinjection. The
+  // current page's bridge state plus a completed contact load is an explicit
+  // authenticated signal; do not leave a healthy daemon in recovery.
+  if (signals.bridgeLogin === true && signals.contactsReady === true) return STATES.AUTHENTICATED
 
   const loginUi = !!signals.loginUi
   const chatUi = !!signals.chatUi
