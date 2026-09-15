@@ -66,7 +66,7 @@ wss.on('connection', (ws) => {
           : { id: pending.id, ok: false, error: req.error }))
       }
     } else if (req.cmd === 'get-contact') {
-      ws.send(JSON.stringify({ id: req.id, ok: true, data: { name: req.id, isRoomContact: req.id === 'Dev Team' } }))
+      ws.send(JSON.stringify({ id: req.id, ok: true, data: { name: req.id, isRoomContact: req.id === 'Dev Team' || req.id === '三人组' } }))
     } else if (req.cmd === 'send-text') {
       sent.push(req)
       ws.send(JSON.stringify({ id: req.id, ok: true, data: { sent: true } }))
@@ -169,6 +169,19 @@ cwd: ${path.join(tmpDir, 'contacts', 'Dave')}
 ---
 Dave-specific body.
 `)
+// 三人组 exercises the dedicated ROOM wake path and host upsert semantics.
+const sanrenzuLog = path.join(tmpDir, 'task-sanrenzu.log')
+fs.writeFileSync(path.join(agentsDir, 'wechat-sanrenzu.agent.md'), `---
+name: wechat-sanrenzu
+description: e2e dedicated room host agent
+contacts: [三人组]
+type: room
+session-id: e2e-sanrenzu-session
+harness: cat {task-path} >> ${JSON.stringify(sanrenzuLog)} && echo SESSION={session-id} >> ${JSON.stringify(sanrenzuLog)} && if grep -Fq "FLOWCHART-GUIDANCE-UPDATE" {task-path}; then echo '{"status":"addressed"}'; elif grep -q "SCHEDULED WAKEUP" {task-path}; then echo '{"status":"addressed","next_action":{"type":"wake","after_seconds":5,"reason":"room replacement wake","context":"continue the updated room discussion"}}'; else echo '{"status":"addressed","next_action":{"type":"wake","after_seconds":0.3,"reason":"room first wake","context":"resume the 三人组 discussion"}}'; fi
+cwd: ${path.join(tmpDir, 'contacts', '三人组')}
+---
+三人组-specific body.
+`)
 
 const sent = []
 const sleep = (ms) => new Promise(r => setTimeout(r, ms))
@@ -202,8 +215,25 @@ async function main() {
   if (fs.existsSync(daveLog)) {
     const hosted = fs.readFileSync(daveLog, 'utf8')
     ok(hosted.includes('HOST DISCUSSION') && hosted.includes('workshop adoption'), 'e2e: host uses the same room agent with rich context')
-    ok(pendingWakes().Dave && pendingWakes().Dave.reason === 'Host follow-up with Dave' && pendingWakes().Dave.session_id === 'e2e-dave-session', 'e2e: accepted host result schedules its pending wake in the configured session')
+    ok(pendingWakes().Dave && pendingWakes().Dave.reason === 'Host follow-up with Dave' && !pendingWakes().Dave.session_id, 'e2e: accepted host result stores contact identity without transient session metadata')
   }
+  // Dedicated room host: first start, due wake, then a second host supersedes
+  // the replacement wake in the same configured session and ends hosting.
+  const roomHost = await runCli(['host', '--port', String(PORT), '--to', '三人组', '--prompt', 'Start the room discussion.'])
+  await sleep(700)
+  ok(roomHost.status === 0 && fs.existsSync(sanrenzuLog), 'e2e: host starts the dedicated room agent')
+  let roomLog = fs.existsSync(sanrenzuLog) ? fs.readFileSync(sanrenzuLog, 'utf8') : ''
+  ok(roomLog.includes('HOST DISCUSSION') && roomLog.includes('SESSION=e2e-sanrenzu-session'), 'e2e: room host uses its fixed contact session')
+  await sleep(900)
+  roomLog = fs.readFileSync(sanrenzuLog, 'utf8')
+  ok(roomLog.includes('SCHEDULED WAKEUP') && (roomLog.match(/SESSION=e2e-sanrenzu-session/g) || []).length >= 2, 'e2e: due wake dispatches the same dedicated room session')
+  const wakesBeforeRoomUpdate = (roomLog.match(/SCHEDULED WAKEUP/g) || []).length
+  const roomUpdate = await runCli(['host', '--port', String(PORT), '--to', '三人组', '--prompt', 'FLOWCHART-GUIDANCE-UPDATE: if useful, add one short flowchart, but do not message merely because guidance changed.'])
+  await sleep(500)
+  roomLog = fs.readFileSync(sanrenzuLog, 'utf8')
+  ok(roomLog.includes('HOST GUIDANCE UPDATE') && roomLog.includes('FLOWCHART-GUIDANCE-UPDATE') && roomLog.includes('Do not assume you must send a message immediately'), 'e2e: second host supersedes the due continuation with authoritative guidance')
+  ok((roomLog.match(/SCHEDULED WAKEUP/g) || []).length === wakesBeforeRoomUpdate, 'e2e: updated host omitting next_action ends hosting and old callback never fires')
+  ok(!pendingWakes()['三人组'], 'e2e: room host update clears the pending continuation')
   const missingHost = await runCli(['host', '--port', String(PORT), '--to', 'Unknown', '--prompt', 'should fail'])
   ok(missingHost.status !== 0 && missingHost.stdout.includes('no routable agent'), 'e2e: host reports a clear no-route failure')
 
@@ -335,7 +365,7 @@ broadcast('message', { from: 'Alice', to: 'me', type: 'text', Content: '你能�
   await sleep(1200)
   const afterHostReply = fs.readFileSync(daveLog, 'utf8')
   ok(afterHostReply.includes('SUPERSEDED PLAN') && afterHostReply.includes('Host follow-up with Dave'), 'e2e: real message supersedes the pending host wake before due')
-  ok(pendingWakes().Dave && pendingWakes().Dave.reason === 'Follow up with Dave' && pendingWakes().Dave.session_id === 'e2e-dave-session', 'e2e: same configured session chooses the replacement next_action')
+  ok(pendingWakes().Dave && pendingWakes().Dave.reason === 'Follow up with Dave' && !pendingWakes().Dave.session_id, 'e2e: same configured contact chooses the replacement next_action')
   ok((afterHostReply.match(/SCHEDULED WAKEUP/g) || []).length === 0, 'e2e: superseded host wake did not fire before the real message')
 
   // 12. a real incoming message supersedes the pending wakeup BEFORE dispatch
@@ -344,7 +374,7 @@ broadcast('message', { from: 'Alice', to: 'me', type: 'text', Content: '你能�
   const daveTasks = fs.readFileSync(daveLog, 'utf8')
   ok(daveTasks.includes('SUPERSEDED PLAN') && daveTasks.includes('Follow up with Dave'), 'e2e: incoming message injects the cancelled wake as superseded planning context')
   ok(daveTasks.includes('actually I have an update'), 'e2e: the newer message itself still drives the task')
-  ok(pendingWakes().Dave && pendingWakes().Dave.version >= 3 && pendingWakes().Dave.session_id === 'e2e-dave-session', 'e2e: same configured session replaced the host wake (version bumped)')
+  ok(pendingWakes().Dave && pendingWakes().Dave.version >= 3 && !pendingWakes().Dave.session_id, 'e2e: same configured contact replaced the host wake (version bumped)')
 
   // 13. restart recovery: the pending wakeup survives, then fires EXACTLY once
   // as a synthetic wake task in the same session.

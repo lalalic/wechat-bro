@@ -17,6 +17,15 @@ Make `host` the single idempotent control surface for both:
 
 The caller should be able to issue `host --to <target> --prompt <guidance>` without first checking whether the target is already being hosted.
 
+## Fixed contact-session invariant
+
+Every contact or room has exactly one configured contact session. The same
+session is reused for normal inbound messages, host starts, host guidance
+updates, escalation resumes, and scheduled wakes. A wake entry identifies its
+contact/room with `session`; it never carries authority to override the
+contact's current `session-id` or `session-dir`. Those values are resolved
+from the current agent configuration at dispatch time.
+
 ## Desired semantics
 
 ### No active continuation

@@ -95,7 +95,7 @@ async function main() {
   ok(r1.entry && r1.entry.version === 1, 'first schedule → version 1')
   const onDisk = JSON.parse(fs.readFileSync(m.wakeFile(sdir), 'utf8'))
   ok(onDisk.wakes.Alice && onDisk.wakes.Alice.reason === 'first' && onDisk.wakes.Alice.due_at > Date.now(), 'persisted to pending-wakes.json with a future due_at')
-  ok(onDisk.wakes.Alice.session === 'Alice' && onDisk.wakes.Alice.agent === 'wechat-alice', 'entry records session + agent identity')
+  ok(onDisk.wakes.Alice.session === 'Alice' && onDisk.wakes.Alice.agent === 'wechat-alice' && !('session_id' in onDisk.wakes.Alice), 'entry records contact + agent identity, not a transient worker session')
 
   const r2 = sched.schedule('Alice', { type: 'wake', after_seconds: 2, reason: 'second', context: 'ctx-2' }, 'wechat-alice')
   ok(r2.entry.version === 2 && sched.list().length === 1, 'replacement keeps ONE pending wake, version bumped')
