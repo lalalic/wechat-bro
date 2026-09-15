@@ -27,7 +27,7 @@
  *   send-image        → {sent: true, to, file}        (args: --to, --path, [--filename])
  *   send-file         → {sent: true, to, file}        (args: --to, --path, --filename)
  *   send-voice        → {sent, to, transcription}     (args: --to, --path)
- *   status            → {loggedIn, contactsReady, lastMsgTime, account}
+ *   status            → orchestrator watch/runtime state + daemon health
  *   emojis            → [string]
  *   ping              → {pong: true, ts: ...}         (liveness check)
  *   exit              → shut down
@@ -431,6 +431,9 @@ function parseCliCommand() {
   if (positional.length === 0) return null
 
   const request = { cmd: positional[0] }
+  if (['watch', 'unwatch', 'pause', 'unpause'].includes(request.cmd) && positional[1] && !positional[1].startsWith('--')) {
+    request.context = positional[1]
+  }
   for (let i = 1; i < positional.length; i++) {
     const arg = positional[i]
     if (arg.startsWith('--')) {
@@ -474,7 +477,7 @@ async function sendCommandViaWs(ws, request) {
       }
       process.stdout.write(JSON.stringify(msg, null, process.argv.indexOf('--pretty') !== -1 ? 2 : 0) + '\n')
       ws.close()
-      process.exit(request.cmd === 'host' && msg.ok === false ? 1 : 0)
+      process.exit(['host', 'watch', 'unwatch', 'pause', 'unpause'].includes(request.cmd) && msg.ok === false ? 1 : 0)
     }
   })
 
@@ -632,11 +635,15 @@ Commands:
                                Marpit/mermaid code blocks are auto-rendered.
   host --to <name> --prompt <rich context>
                                Ask the running orchestrator to host a discussion.
+  watch <context>              Persistently watch and immediately route a chat.
+  unwatch <context>            Persistently unwatch and immediately stop routing.
+  pause <context>              Runtime-only pause; restart clears it.
+  unpause <context>            Runtime-only resume.
   send-image --to <name> --path <file> [--filename <name>]
   send-file  --to <name> --path <file> --filename <name>
   send-voice --to <name> --path <file>   (transcribe + send as text)
   barcode                      Render the current login QR in this terminal
-  status                       Show login/contacts state
+  status                       Show orchestrator watch/runtime state and daemon health
   emojis                       List supported emoji codes
   config --key <k> --value <v> Set a config option
   exit                         Shut down the daemon
@@ -1150,6 +1157,7 @@ async function dispatch(cmd, args, page) {
       }, args.to, text)
 
     case 'status':
+    case 'daemon-status': // orchestrator-internal health probe; CLI status is orchestrator-rich
       return page.evaluate(() => ({
         loggedIn: !!window.WechatyBro.vars.loginState,
         contactsReady: !!window.WechatyBro.vars.contactsReady,

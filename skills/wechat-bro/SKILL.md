@@ -213,7 +213,11 @@ contact
 | 发送任意文件 | `send-file` |
 | 转写本地音频并发送文本 | `send-voice` |
 | 在终端显示登录二维码 | `barcode` |
-| 检查登录/联系人加载状态 | `status` |
+| 检查 orchestrator watch/runtime 状态与 daemon 健康 | `status` |
+| 持久关注并立即启用路由 | `watch <context>` |
+| 持久取消关注并立即停止路由 | `unwatch <context>` |
+| 仅在 runtime 暂停一个已关注 context | `pause <context>` |
+| 仅在 runtime 恢复一个已暂停 context | `unpause <context>` |
 | 列出支持的 emoji code | `emojis` |
 | 正常退出 | `exit` |
 
@@ -225,7 +229,28 @@ npx wechat-bro rooms
 npx wechat-bro get-contact --name "Alice"
 npx wechat-bro room-members --name "Dev Team"
 npx wechat-bro barcode
+npx wechat-bro status
+npx wechat-bro watch "Alice Chen"
+npx wechat-bro pause "Alice Chen"
+npx wechat-bro unpause "Alice Chen"
+npx wechat-bro unwatch "Alice Chen"
 ```
+
+### Runtime watch controls
+
+`watch` 和 `unwatch` 同时修改 assigned agent 的持久 frontmatter 与当前
+runtime routing。`watch` 会把 context 放到 routed agent 的 `contacts:`（也就是
+默认 maintainer mode），并从重复的 routing 中移除；`unwatch` 会移除配置并取消
+pending wake/escalation。两类命令幂等。
+
+`pause` 和 `unpause` 是 runtime-only，不会修改 `.agent.md`。暂停中的 context
+仍会由 daemon 记录 inbound message，但 orchestrator 不会创建/启动 worker，也不
+会执行它的 scheduled self-wake；queued continuation 会被跳过。重启后 pause 消失，
+并按持久 watch 配置恢复路由。
+
+`status` 需要运行中的 orchestrator。它返回 daemon health、orchestrator uptime、
+agent assignments、configured 与 runtime watch、watching/paused、配置/runtime
+mismatch、active/queued task、pending wake 和 pending escalation。
 
 账号未登录时，`barcode` 会把当前登录二维码直接渲染到终端，适合 SSH 或系统浏览器未能打开二维码的情况。
 
@@ -314,6 +339,10 @@ Server event 以 JSON 广播：
 ```
 
 重要 lifecycle event 包括：`connected`、`ready`、`scan`、`login`、`logout`、`contacts-ready`。
+
+管理命令 `watch` / `unwatch` / `pause` / `unpause` / `status` 先由 daemon relay，
+再广播为 `orchestrator-request`；running orchestrator 用 `orchestrator-response`
+回传结果。若没有 orchestrator，daemon 返回 timeout error。
 
 文本消息内容在 `data.Content`。
 

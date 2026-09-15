@@ -192,6 +192,78 @@ function contactList(d, key = 'contacts') {
   return Array.isArray(v) ? v : (v ? [v] : [])
 }
 
+function frontmatterValue(value) {
+  return /^[\w.-]+$/.test(String(value)) ? String(value) : `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+}
+
+/** Update YAML-lite watch lists without touching agent prompt bodies. */
+function updateAgentWatchConfig(agent, context, add) {
+  const raw = fs.readFileSync(agent.path, 'utf8')
+  const match = /^(---\r?\n)([\s\S]*?)(\r?\n---\r?\n?)/.exec(raw)
+  if (!match) throw new Error(`agent has no frontmatter: ${agent.path}`)
+
+  let parsed = parseFrontmatter(raw).data
+  const updates = new Map()
+  const contactNames = contactList(parsed)
+  const assistantNames = contactList(parsed, 'contacts-assistant')
+  if (add) {
+    if (assistantNames.includes(context)) {
+      updates.set('contacts-assistant', assistantNames.filter(name => name !== context))
+      updates.set('contacts', contactNames.includes(context) ? contactNames : [...contactNames, context])
+    } else if (!contactNames.includes(context)) {
+      updates.set('contacts', [...contactNames, context])
+    }
+  } else {
+    if (assistantNames.includes(context)) updates.set('contacts-assistant', assistantNames.filter(name => name !== context))
+    if (contactNames.includes(context)) updates.set('contacts', contactNames.filter(name => name !== context))
+  }
+  if (updates.size === 0) return false
+
+  const lines = match[2].split(/\r?\n/)
+  for (const [key, values] of updates) {
+    const lineIndex = lines.findIndex(line => new RegExp(`^\\s*${key}\\s*:`).test(line))
+    const line = values.length ? `${key}: [${values.map(frontmatterValue).join(', ')}]` : null
+    if (lineIndex !== -1) {
+      if (line) lines[lineIndex] = line
+      else lines.splice(lineIndex, 1)
+    } else if (line) {
+      const insertAt = lines.reduce((at, text, index) => /^#/.test(text.trim()) ? index : at + 1, 0)
+      lines.splice(insertAt, 0, line)
+    }
+  }
+
+  const next = match[1] + lines.join('\n') + match[3] + raw.slice(match[0].length)
+  if (next === raw) return false
+  const tmp = `${agent.path}.${process.pid}.tmp`
+  fs.writeFileSync(tmp, next)
+  fs.renameSync(tmp, agent.path)
+  agent.data = parseFrontmatter(next).data
+  return true
+}
+
+/** Persist a context on exactly one routing agent, removing duplicate routes. */
+function applyPersistentWatch(agents, context, selectedAgent, add) {
+  let selected = selectedAgent || routeAgent(agents, context, false)?.agent
+  if (!selected) throw new Error(`no routable agent for ${context}`)
+  if (selected.path.startsWith(PKG_AGENTS_DIR)) {
+    // Package defaults are immutable installation assets; persist user watch
+    // changes as the same-name override that loadAgents already prefers.
+    fs.mkdirSync(AGENTS_DIR, { recursive: true })
+    const overridePath = path.join(AGENTS_DIR, `${sanitizeFsName(selected.data.name)}.agent.md`)
+    fs.copyFileSync(selected.path, overridePath)
+    selected = loadAgentFile(overridePath)
+  }
+  const currentAgents = selectedAgent
+    ? agents.map(agent => agent === selectedAgent ? selected : agent)
+    : agents
+  for (const agent of currentAgents) {
+    if (agent === selected) continue
+    updateAgentWatchConfig(agent, context, false)
+  }
+  updateAgentWatchConfig(selected, context, add)
+  return loadAgents()
+}
+
 /** Route a contact name to its agent AND its configured mode:
  *  `contacts-assistant` matches win (assistant-managed contact), then
  *  dedicated `contacts` (maintainer default), then the unrestricted agent of
@@ -666,87 +738,196 @@ class WakeScheduler {
   }
 }
 
+/**
+ * One owner for watch-command semantics. Persistent agent files define what
+ * survives a restart; runtimeWatches and paused define immediate routing.
+ */
+class WatchControlManager {
+  constructor({ agents, port = null, applyWatch = applyPersistentWatch } = {}) {
+    this.agents = agents
+    this.port = port
+    this.applyWatch = applyWatch
+    this.configuredWatches = watchList(agents)
+    this.configuredWatches.delete('filehelper')
+    this.runtimeWatches = new Set(this.configuredWatches)
+    this.paused = new Set()
+    this.startedAt = Date.now()
+  }
+
+  refreshConfigured(agents) {
+    this.agents = agents
+    this.configuredWatches = watchList(agents)
+    this.configuredWatches.delete('filehelper')
+  }
+
+  async handle(action, context, { isRoom = false } = {}) {
+    if (!context || context === 'filehelper') throw new Error('context is required (filehelper is always managed by the orchestrator)')
+    if (!['watch', 'unwatch', 'pause', 'unpause'].includes(action)) throw new Error(`unknown watch action: ${action}`)
+
+    if (action === 'pause') {
+      if (!this.runtimeWatches.has(context)) throw new Error(`${context} is not being watched`)
+      const changed = !this.paused.has(context)
+      this.paused.add(context)
+      return { action, context, changed, state: 'paused' }
+    }
+    if (action === 'unpause') {
+      const changed = this.paused.delete(context)
+      return { action, context, changed, state: this.runtimeWatches.has(context) ? 'watching' : 'unwatched' }
+    }
+
+    const routed = routeAgent(this.agents, context, isRoom)
+    if (!routed) throw new Error(`no routable agent for ${context}`)
+    const wasConfigured = this.configuredWatches.has(context)
+    const wasRuntime = this.runtimeWatches.has(context) || this.paused.has(context)
+    this.agents = this.applyWatch(this.agents, context, routed.agent, action === 'watch')
+    this.refreshConfigured(this.agents)
+    if (action === 'watch') {
+      this.runtimeWatches.add(context)
+      this.paused.delete(context)
+    } else {
+      this.runtimeWatches.delete(context)
+      this.paused.delete(context)
+    }
+    return {
+      action,
+      context,
+      changed: action === 'watch' ? !(wasConfigured && wasRuntime) : (wasConfigured || wasRuntime),
+      state: action === 'watch' ? 'watching' : 'unwatched',
+      agent: routed.agent.data.name,
+      mode: routed.assistant ? 'assistant' : 'maintainer',
+    }
+  }
+
+  isWatched(context) { return this.runtimeWatches.has(context) }
+  isPaused(context) { return this.paused.has(context) }
+  canDispatch(context, phase = 'start') {
+    if (!this.isWatched(context) || this.isPaused(context)) return false
+    return phase !== 'continuation' || this.isWatched(context)
+  }
+  clearRuntime(context) {
+    this.runtimeWatches.delete(context)
+    this.paused.delete(context)
+  }
+
+  contextStates() {
+    return [...new Set([...this.configuredWatches, ...this.runtimeWatches, ...this.paused])]
+      .sort().map(context => {
+        const configured = this.configuredWatches.has(context)
+        const watching = this.runtimeWatches.has(context)
+        const paused = this.paused.has(context)
+        return {
+          context,
+          configured,
+          watching,
+          paused,
+          state: paused ? 'paused' : (watching ? 'watching' : 'unwatched'),
+          mismatch: configured !== watching,
+        }
+      })
+  }
+
+  serialize() {
+    return {
+      configuredWatches: [...this.configuredWatches].sort(),
+      runtimeWatches: [...this.runtimeWatches].sort(),
+      pausedContexts: [...this.paused].sort(),
+      contexts: this.contextStates(),
+    }
+  }
+}
+
 class ContactQueue { // serializes dispatches per contact
   constructor() { this.tail = Promise.resolve() }
   run(fn) {
+    this.queued = (this.queued || 0) + 1
     const next = this.tail.then(fn, fn)
+    next.finally(() => { this.queued = Math.max(0, (this.queued || 0) - 1) })
     this.tail = next.catch(() => {})
     return next
   }
 }
 
-function makeDispatcher({ wsSend, onEscalation, wakes = null }) {
+function makeDispatcher({ wsSend, onEscalation, wakes = null, canDispatch = null }) {
   const queues = new Map()
+  const taskStates = new Map()
 
-  return function dispatch(agent, msg, extra, opts, contactName) {
+  const dispatch = function dispatch(agent, msg, extra, opts, contactName) {
     if (typeof opts === 'boolean') opts = { assistant: opts }
     const d = agent.data
     const isOrch = d.type === 'orchestrator'
     const name = isOrch ? d.name : (contactName || msg.from || d.name)
     const isWake = !!(opts && opts.wake)
+    if (canDispatch && !canDispatch(name, 'enqueue')) {
+      return { code: 0, stdout: '', skipped: true, reason: 'watch-control' }
+    }
     // Supersession is resolved inside the per-contact queue, immediately
     // before this task starts. Doing it at enqueue time is too early: the
     // currently-running turn may still publish a wake after this message has
     // arrived, and that late plan must also be superseded by the real message.
     if (!queues.has(name)) queues.set(name, new ContactQueue())
     const queue = queues.get(name)
-
-    // Orchestrator agent has FIXED paths (not configurable): it works in the
-    // data dir with one dedicated session. Contact agents derive paths from
-    // frontmatter (re-resolved per dispatch so edits apply next message).
-    const base = isOrch
-      ? DATA_DIR
-      : expand(d.cwd || path.join(DATA_DIR, 'contacts', sanitizeFsName(name)))
-    d.sessionDir = isOrch
-      ? path.join(DATA_DIR, 'session')
-      : expand(d['session-dir'] || path.join(base, 'session'))
-    d.sessionId = isOrch
-      ? 'wechat-orchestrator'
-      : (d['session-id'] || `wechat-${sanitizeFsName(name)}`)
-    d.cwd = base
-    fs.mkdirSync(base, { recursive: true })
-    fs.mkdirSync(d.sessionDir, { recursive: true })
-    ensureAgentsMd(base, agent.path)
-
-    const taskFile = path.join(base, `.task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.md`)
-
-    // Bare harness name → its built-in template; custom template or unset
-    // (→ pi) passes through. All templates run via /bin/sh with {var} subs.
-    const tpl = defaultHarness(d.harness)
-    const timeoutS = parseInt(d.timeout, 10) || 900
-    const timeoutMs = timeoutS * 1000
-    const taskRef = path.basename(taskFile)
-    const cmdline = renderHarness(tpl, harnessVars(d, {
-      task: taskRef, taskPath: taskFile, contact: name, timeoutS,
-    }))
-
-    const label = `${d.name} ← ${name}`
-    log('dispatch', label, d.sessionId)
-    const startedAt = Date.now()
-
-    // notify:true → a concise note fires NOW, when the message is received —
-    // but only when it NEEDS A RESPONSE: a real incoming message the persona
-    // handles or an assistant ping. Never for context-only recordings (no
-    // reply will happen) nor for the owner's own messages (they sent them).
-    if (d.notify && !isOrch && !isWake && msg.from !== 'me' && !opts.recordOnly) {
-      const snippet = String(msg.Content || msg.content || '').split('\n')[0].trim().slice(0, 100)
-      wsSend({ cmd: 'send-text', to: 'filehelper', content: `📨 ${name}: ${snippet}` })
-    }
-
-    const spawnTask = () => new Promise((resolve) => {
-      let stdout = ''
-      const child = spawn('/bin/sh', ['-c', cmdline], { cwd: base, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] })
-      const timer = setTimeout(() => { log('timeout', label); child.kill('SIGKILL') }, timeoutMs)
-      child.stdout.on('data', c => { stdout += c })
-      child.stderr.on('data', c => { stdout += c })
-      child.on('close', (code) => {
-        clearTimeout(timer)
-        resolve({ code, stdout })
-      })
-    })
+    if (!taskStates.has(name)) taskStates.set(name, { active: 0, queued: 0 })
+    taskStates.get(name).queued += 1
 
     return queue.run(async () => {
+      let taskFile = null
       try {
+        const state = taskStates.get(name)
+        if (state) state.queued = Math.max(0, state.queued - 1)
+        if (canDispatch && !canDispatch(name, 'start')) {
+          if (wakes) wakes.clear(name)
+          return { code: 0, stdout: '', skipped: true, reason: 'watch-control' }
+        }
+        if (state) state.active += 1
+
+        // Orchestrator agent has FIXED paths (not configurable): it works in
+        // the data dir with one dedicated session. Contact agents derive paths
+        // from frontmatter (re-resolved per dispatch so edits apply next run).
+        const base = isOrch
+          ? DATA_DIR
+          : expand(d.cwd || path.join(DATA_DIR, 'contacts', sanitizeFsName(name)))
+        d.sessionDir = isOrch
+          ? path.join(DATA_DIR, 'session')
+          : expand(d['session-dir'] || path.join(base, 'session'))
+        d.sessionId = isOrch
+          ? 'wechat-orchestrator'
+          : (d['session-id'] || `wechat-${sanitizeFsName(name)}`)
+        d.cwd = base
+        fs.mkdirSync(base, { recursive: true })
+        fs.mkdirSync(d.sessionDir, { recursive: true })
+        ensureAgentsMd(base, agent.path)
+
+        taskFile = path.join(base, `.task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.md`)
+
+        const tpl = defaultHarness(d.harness)
+        const timeoutS = parseInt(d.timeout, 10) || 900
+        const timeoutMs = timeoutS * 1000
+        const taskRef = path.basename(taskFile)
+        const cmdline = renderHarness(tpl, harnessVars(d, {
+          task: taskRef, taskPath: taskFile, contact: name, timeoutS,
+        }))
+
+        const label = `${d.name} ← ${name}`
+        log('dispatch', label, d.sessionId)
+        const startedAt = Date.now()
+
+        if (d.notify && !isOrch && !isWake && msg.from !== 'me' && !opts.recordOnly) {
+          const snippet = String(msg.Content || msg.content || '').split('\n')[0].trim().slice(0, 100)
+          wsSend({ cmd: 'send-text', to: 'filehelper', content: `📨 ${name}: ${snippet}` })
+        }
+
+        const spawnTask = () => new Promise((resolve) => {
+          let stdout = ''
+          const child = spawn('/bin/sh', ['-c', cmdline], { cwd: base, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] })
+          const timer = setTimeout(() => { log('timeout', label); child.kill('SIGKILL') }, timeoutMs)
+          child.stdout.on('data', c => { stdout += c })
+          child.stderr.on('data', c => { stdout += c })
+          child.on('close', (code) => {
+            clearTimeout(timer)
+            resolve({ code, stdout })
+          })
+        })
+
         let superseded = null
         if (isWake) {
           if (!wakes.claim(name, opts.wake.id, opts.wake.version)) {
@@ -760,6 +941,10 @@ function makeDispatcher({ wsSend, onEscalation, wakes = null }) {
         }
         fs.writeFileSync(taskFile, renderTask(msg, extra, { ...opts, superseded }))
         const { code, stdout } = await spawnTask()
+        if (canDispatch && !canDispatch(name, 'continuation')) {
+          if (wakes) wakes.clear(name)
+          return { code, stdout, skipped: true, reason: 'watch-control' }
+        }
         log(`done (${Date.now() - startedAt}ms, exit ${code})`, label)
         const tail = stdout.trim().split('\n').slice(-8).join('\n')
         if (code !== 0) {
@@ -783,10 +968,18 @@ function makeDispatcher({ wsSend, onEscalation, wakes = null }) {
         }
         return { code, stdout }
       } finally {
-        try { fs.unlinkSync(taskFile) } catch {}
+        const state = taskStates.get(name)
+        if (state) {
+          state.active = Math.max(0, state.active - 1)
+          if (state.active === 0 && state.queued === 0) taskStates.delete(name)
+        }
+        if (taskFile) { try { fs.unlinkSync(taskFile) } catch {} }
       }
     })
   }
+  dispatch.taskStates = () => Object.fromEntries([...taskStates].map(([name, state]) => [name, { ...state }]))
+  dispatch.queues = () => Object.fromEntries([...queues].map(([name, queue]) => [name, { queued: queue.queued || 0 }]))
+  return dispatch
 }
 
 // ── WS client loop ────────────────────────────────────────────────────────
@@ -860,13 +1053,13 @@ async function runOrchestrator({ port = 9231 } = {}) {
 
   let agents = loadAgents()
   for (const a of agents) { if (cliHarness) a.data.harness = cliHarness }
+  const controls = new WatchControlManager({ agents, port })
+  const watch = controls.runtimeWatches
 
   const orchestrator = orchestratorAgent(agents)
   if (!orchestrator) {
     log('WARNING: no agent md with `type: orchestrator` — filehelper messages will be ignored')
   }
-  const watch = watchList(agents)
-  watch.delete('filehelper')
   log(`loaded ${agents.length} agent md(s) (user: ${AGENTS_DIR}; skill defaults: ${PKG_AGENTS_DIR})`)
   for (const a of agents) log('  -', a.data.name, a.data.type || '', JSON.stringify({ contacts: contactList(a.data), assistant: contactList(a.data, 'contacts-assistant') }))
   log(`watch list: [${[...watch].join(', ') || 'none'}]`)
@@ -880,6 +1073,11 @@ async function runOrchestrator({ port = 9231 } = {}) {
   // {"status":"escalated"}; consumed by the owner's next filehelper reply.
   const pendingEscalations = new Map()
 
+  const suppressContinuation = (context) => {
+    pendingEscalations.delete(context)
+    wakes.clear(context)
+  }
+
   const wsSend = (req) => ws ? sendCommand(ws, req).catch(e => log('send failed:', e.message)) : Promise.resolve()
 
   // Scheduled self-wakeups (worker `next_action`). The orchestrator owns the
@@ -889,6 +1087,11 @@ async function runOrchestrator({ port = 9231 } = {}) {
   const wakes = new WakeScheduler({ dir: DATA_DIR, dispatchWake: (entry) => fireWake(entry) })
 
   async function fireWake(entry) {
+    if (!controls.isWatched(entry.session) || controls.isPaused(entry.session)) {
+      log(`wake for ${entry.session}: dropped by watch control`)
+      wakes.claim(entry.session, entry.id, entry.version)
+      return
+    }
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       log(`wake for ${entry.session}: daemon not connected — retrying in 5s`)
       wakes.reschedule(entry, 5000)
@@ -929,6 +1132,71 @@ async function runOrchestrator({ port = 9231 } = {}) {
     })
   }
 
+  const contextDetails = (context) => {
+    const routed = routeAgent(agents, context, roomCache.get(context) || false)
+    const state = controls.contextStates().find(item => item.context === context) || {}
+    return {
+      ...state,
+      agent: routed ? routed.agent.data.name : null,
+      mode: routed ? (routed.assistant ? 'assistant' : 'maintainer') : null,
+      hostRole: 'daemon-client',
+    }
+  }
+
+  async function buildStatus() {
+    agents = loadAgents()
+    if (cliHarness) for (const a of agents) a.data.harness = cliHarness
+    controls.refreshConfigured(agents)
+    let daemon = { connected: !!(ws && ws.readyState === WebSocket.OPEN), port }
+    if (daemon.connected) {
+      try {
+        daemon = { ...daemon, role: 'wechat-daemon', healthy: true, ...(await sendCommand(ws, { cmd: 'daemon-status' })) }
+      } catch (error) {
+        daemon = { ...daemon, healthy: false, error: error.message }
+      }
+    } else {
+      daemon.healthy = false
+    }
+    return {
+      orchestrator: {
+        healthy: !closed,
+        startedAt: new Date(controls.startedAt).toISOString(),
+        uptimeSeconds: Math.round((Date.now() - controls.startedAt) / 1000),
+        agentCount: agents.length,
+        agents: agents.map(({ data }) => ({
+          name: data.name,
+          type: data.type || 'contact',
+          harness: data.harness || 'pi',
+          contacts: contactList(data),
+          contactsAssistant: contactList(data, 'contacts-assistant'),
+        })),
+        ...controls.serialize(),
+        contexts: controls.contextStates().map(({ context }) => contextDetails(context)),
+        tasks: dispatch ? { active: dispatch.taskStates(), queues: dispatch.queues() } : { active: {}, queues: {} },
+        pendingWakes: wakes.list(),
+        pendingEscalations: Object.fromEntries(pendingEscalations),
+      },
+      daemon,
+    }
+  }
+
+  const handleControl = async (action, context) => {
+    const isRoom = await isRoomContact(ws, roomCache, context)
+    if (action === 'unwatch' || action === 'pause') suppressContinuation(context)
+    const result = await controls.handle(action, context, { isRoom: isRoom === true })
+    if (action === 'unwatch' || action === 'pause') suppressContinuation(context)
+    agents = loadAgents()
+    if (cliHarness) for (const a of agents) a.data.harness = cliHarness
+    controls.refreshConfigured(agents)
+    return result
+  }
+
+  const canDispatchTask = (name, phase) => (
+    name === (orchestrator && orchestrator.data.name)
+      ? true
+      : controls.canDispatch(name, phase)
+  )
+
   const onEvent = async (msg) => {
     const ev = msg.event
     if (ev === 'ready' || ev === 'contacts-ready') {
@@ -937,6 +1205,25 @@ async function runOrchestrator({ port = 9231 } = {}) {
     }
     if (ev === 'lifecycle') {
       log('daemon lifecycle', JSON.stringify(msg.data || {}))
+      return
+    }
+    if (ev === 'orchestrator-request') {
+      const { requestId, request } = msg.data || {}
+      const respond = (ok, data, error) => wsSend({
+        cmd: 'orchestrator-response',
+        requestId,
+        ok,
+        ...(ok ? { data } : { error }),
+      })
+      try {
+        if (!requestId || !request) throw new Error('invalid orchestrator request')
+        const result = request.cmd === 'status'
+          ? await buildStatus()
+          : await handleControl(request.cmd, request.context || request.name || request.to)
+        await respond(true, result)
+      } catch (error) {
+        await respond(false, null, error.message)
+      }
       return
     }
     if (ev === 'host-discussion') {
@@ -954,6 +1241,10 @@ async function runOrchestrator({ port = 9231 } = {}) {
       if (!routed) {
         hostResult(false, `host discussion failed: no routable agent for ${target}`)
         return log(`host discussion failed: no routable agent for ${target}`)
+      }
+      if (!controls.canDispatch(target)) {
+        hostResult(false, `host discussion rejected: ${target} is ${controls.isPaused(target) ? 'paused' : 'not watched'}`)
+        return log(`host discussion rejected by watch control: ${target}`)
       }
       log(`host discussion → ${target} via ${routed.agent.data.name}`)
       const superseded = wakes && wakes.take(target)
@@ -983,6 +1274,7 @@ async function runOrchestrator({ port = 9231 } = {}) {
       if (data.to !== 'filehelper' && !watch.has(data.to)) return
       agents = loadAgents()
       if (cliHarness) for (const a of agents) a.data.harness = cliHarness
+      controls.refreshConfigured(agents)
       if (data.to === 'filehelper') {
         if (pendingEscalations.size > 0) {
           const [contact, question] = pendingEscalations.entries().next().value
@@ -1002,6 +1294,10 @@ async function runOrchestrator({ port = 9231 } = {}) {
       }
       const routed = routeAgent(agents, data.to, await isRoomContact(ws, roomCache, data.to))
       if (!routed) { log('no agent for', data.to, '— skipping own message'); return }
+      if (!controls.canDispatch(data.to)) {
+        log('own message recorded but dispatch suppressed by watch control:', data.to)
+        return
+      }
       const extra = data.type && data.type !== 'text'
         ? 'Non-text message: `content` holds the useful representation (file path for media, URL for emoji, text otherwise).'
         : null
@@ -1020,8 +1316,13 @@ async function runOrchestrator({ port = 9231 } = {}) {
     // Reload agent mds per message so edits apply immediately.
     agents = loadAgents()
     if (cliHarness) for (const a of agents) a.data.harness = cliHarness
+    controls.refreshConfigured(agents)
     const routed = routeAgent(agents, data.from, await isRoomContact(ws, roomCache, data.from))
     if (!routed) { log('no agent for', data.from, '— skipping'); return }
+    if (!controls.canDispatch(data.from)) {
+      log('message recorded but dispatch suppressed by watch control:', data.from)
+      return
+    }
     const extra = data.type && data.type !== 'text'
       ? 'Non-text message: `content` holds the useful representation (file path for media, URL for emoji, text otherwise).'
       : null
@@ -1047,7 +1348,12 @@ async function runOrchestrator({ port = 9231 } = {}) {
     })
     startedAt = Date.now()
     roomCache.clear()
-    if (!dispatch) dispatch = makeDispatcher({ wsSend, onEscalation, wakes })
+    if (!dispatch) dispatch = makeDispatcher({
+      wsSend,
+      onEscalation,
+      wakes,
+      canDispatch: canDispatchTask,
+    })
     log(`connected to ws://localhost:${port} — watching`)
   }
 
@@ -1104,6 +1410,9 @@ async function runOrchestrator({ port = 9231 } = {}) {
   process.on('SIGTERM', shutdown)
 
   if (daemonFlag) spawnDaemonChild()
+  for (const entry of wakes.list()) {
+    if (!controls.isWatched(entry.session)) wakes.take(entry.session)
+  }
   wakes.start() // recover persisted wakeups (future → reschedule, overdue → run once)
   await connectLoop()
   log('running — Ctrl-C to stop')
@@ -1113,6 +1422,7 @@ async function runOrchestrator({ port = 9231 } = {}) {
 module.exports = {
   parseFrontmatter, loadAgents, loadAgentFile, watchList, routeAgent,
   orchestratorAgent, renderTask, ensureAgentsMd, sanitizeFsName, contactList,
+  updateAgentWatchConfig, applyPersistentWatch, WatchControlManager,
   parseTaskResult, shellQuote, defaultHarness, HARNESS_TEMPLATES,
   harnessVars, renderHarness, runOrchestrator, flagValue, DATA_DIR, AGENTS_DIR,
   validateNextAction, clampDelay, WakeScheduler, renderWakeTask, wakeFile,
