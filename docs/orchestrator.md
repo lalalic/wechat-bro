@@ -177,10 +177,11 @@ Four daemon-relayed commands expose one runtime state owner:
 |---|---|---|---|
 | `watch <context>` | add to the routed agent's `contacts:` | add immediately | resumes when already watched |
 | `unwatch <context>` | remove from all watch lists | remove immediately | clears pending wakes/escalations |
-| `pause <context>` | unchanged | keeps watching but blocks dispatch | clears/skips pending work |
-| `unpause <context>` | unchanged | resumes dispatch | leaves no pause after restart |
+| `pause <context> on` | unchanged | keeps watching but blocks dispatch/wake | clears/skips pending work and cancels resident turn |
+| `pause <context> off` | unchanged | resumes dispatch lazily | leaves no pause after restart |
+| `resident <context> on|off` | unchanged | toggles Codex app-server reuse | runtime-only; off tears down resident context |
 
-`watch`/`unwatch` and `pause`/`unpause` are idempotent. Pause does not edit an
+`watch`/`unwatch`, `pause on|off`, and `resident on|off` are idempotent. Pause does not edit an
 agent definition; the daemon still records inbound chat history, but the
 dispatcher checks the pause gate before enqueue/start and again before a
 completed worker may schedule its next wake. Restart constructs runtime state
@@ -402,8 +403,10 @@ wechat-bro orchestrator --port 9500     # custom WS port
 wechat-bro orchestrator --harness claude
 wechat-bro orchestrator --daemon        # force a fresh daemon child
 wechat-bro watch "Alice Chen"           # persist + immediately route
-wechat-bro pause "Alice Chen"           # runtime-only suppression
-wechat-bro unpause "Alice Chen"         # runtime-only resume
+wechat-bro pause "Alice Chen" on        # runtime-only suppression
+wechat-bro pause "Alice Chen" off       # runtime-only resume
+wechat-bro resident "Alice Chen" on     # reuse one Codex app-server process
+wechat-bro resident "Alice Chen" off    # tear down the contact context
 wechat-bro unwatch "Alice Chen"         # persist + immediately stop
 wechat-bro exit                         # stop daemon (a running orchestrator respawns it)
 ```

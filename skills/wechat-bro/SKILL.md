@@ -216,8 +216,8 @@ contact
 | 检查 orchestrator watch/runtime 状态与 daemon 健康 | `status` |
 | 持久关注并立即启用路由 | `watch <contact-or-room-name> [--agent <agent-name>] [--mode maintainer|assistant]` |
 | 持久取消关注并立即停止路由 | `unwatch <contact-or-room-name>` |
-| 仅在 runtime 暂停一个已关注 context | `pause <contact-or-room-name>` |
-| 仅在 runtime 恢复一个已暂停 context | `unpause <contact-or-room-name>` |
+| 仅在 runtime 暂停/恢复一个已关注 context | `pause <contact-or-room-name> on|off` |
+| 仅在 runtime 启用/关闭 Codex 常驻会话 | `resident <contact-or-room-name> on|off` |
 | 列出支持的 emoji code | `emojis` |
 | 正常退出 | `exit` |
 
@@ -232,8 +232,10 @@ npx wechat-bro barcode
 npx wechat-bro status
 npx wechat-bro watch "Alice Chen"
 npx wechat-bro watch "Dev Team" --agent wechat-room-maintainer --mode assistant
-npx wechat-bro pause "Alice Chen"
-npx wechat-bro unpause "Alice Chen"
+npx wechat-bro pause "Alice Chen" on
+npx wechat-bro pause "Alice Chen" off
+npx wechat-bro resident "Alice Chen" on
+npx wechat-bro resident "Alice Chen" off
 npx wechat-bro unwatch "Alice Chen"
 ```
 
@@ -244,10 +246,16 @@ runtime routing。`watch` 会把 context 放到 routed agent 的 `contacts:`（�
 默认 maintainer mode），并从重复的 routing 中移除；`unwatch` 会移除配置并取消
 pending wake/escalation。两类命令幂等。
 
-`pause` 和 `unpause` 是 runtime-only，不会修改 `.agent.md`。暂停中的 context
+`pause <context> on|off` 是 runtime-only，不会修改 `.agent.md`。暂停中的 context
 仍会由 daemon 记录 inbound message，但 orchestrator 不会创建/启动 worker，也不
-会执行它的 scheduled self-wake；queued continuation 会被跳过。重启后 pause 消失，
+会执行它的 scheduled self-wake；queued continuation 会被跳过。`pause on` 会取消当前
+常驻 Codex turn；`pause off` 只在下一条消息或 wake 到来时惰性恢复。重启后 pause 消失，
 并按持久 watch 配置恢复路由。
+
+`resident <context> on|off` 也是 runtime-only，只允许 `harness: codex`。启用后，一个
+长期存活的 `codex app-server --stdio` 进程只初始化一次；每个 context 复用一个
+`thread/start`，每条消息使用一个 `turn/start`。关闭 resident 或 `unwatch` 会释放该
+context 的 thread/turn。非 Codex harness 会直接报错。
 
 `status` 需要运行中的 orchestrator。它返回 daemon health、orchestrator uptime、
 agent assignments、configured 与 runtime watch、watching/paused、配置/runtime
@@ -341,7 +349,7 @@ Server event 以 JSON 广播：
 
 重要 lifecycle event 包括：`connected`、`ready`、`scan`、`login`、`logout`、`contacts-ready`。
 
-管理命令 `watch` / `unwatch` / `pause` / `unpause` / `status` 先由 daemon relay，
+管理命令 `watch` / `unwatch` / `pause` / `resident` / `status` 先由 daemon relay，
 再广播为 `orchestrator-request`；running orchestrator 用 `orchestrator-response`
 回传结果。若没有 orchestrator，daemon 返回 timeout error。
 

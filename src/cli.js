@@ -431,8 +431,11 @@ function parseCliCommand() {
   if (positional.length === 0) return null
 
   const request = { cmd: positional[0] }
-  if (['watch', 'unwatch', 'pause', 'unpause'].includes(request.cmd) && positional[1] && !positional[1].startsWith('--')) {
+  if (['watch', 'unwatch', 'pause', 'resident'].includes(request.cmd) && positional[1] && !positional[1].startsWith('--')) {
     request.context = positional[1]
+  }
+  if (['pause', 'resident'].includes(request.cmd) && positional[2] && !positional[2].startsWith('--')) {
+    request.state = positional[2]
   }
   for (let i = 1; i < positional.length; i++) {
     const arg = positional[i]
@@ -477,7 +480,7 @@ async function sendCommandViaWs(ws, request) {
       }
       process.stdout.write(JSON.stringify(msg, null, process.argv.indexOf('--pretty') !== -1 ? 2 : 0) + '\n')
       ws.close()
-      process.exit(['host', 'watch', 'unwatch', 'pause', 'unpause'].includes(request.cmd) && msg.ok === false ? 1 : 0)
+      process.exit(['host', 'watch', 'unwatch', 'pause', 'resident'].includes(request.cmd) && msg.ok === false ? 1 : 0)
     }
   })
 
@@ -641,9 +644,10 @@ Commands:
                                --mode is optional; default: maintainer.
   unwatch <contact-or-room-name>
                                Persistently unwatch and immediately stop routing.
-  pause <contact-or-room-name> Runtime-only pause; restart clears it.
-  unpause <contact-or-room-name>
-                               Runtime-only resume.
+  pause <contact-or-room-name> <on|off>
+                               Runtime-only pause/resume; restart clears it.
+  resident <contact-or-room-name> <on|off>
+                               Runtime-only Codex app-server resident mode.
   send-image --to <name> --path <file> [--filename <name>]
   send-file  --to <name> --path <file> --filename <name>
   send-voice --to <name> --path <file>   (transcribe + send as text)
