@@ -890,9 +890,14 @@ function makeDispatcher({ wsSend, onEscalation, wakes = null, canDispatch = null
   const residentCancel = async name => residents.get(name)?.cancel(name)
   const residentClose = async name => {
     const adapter = residents.get(name)
-    if (!adapter) return
-    await adapter.close(name)
-    residents.delete(name)
+    if (adapter) {
+      if (typeof adapter.closeAll === 'function') await adapter.closeAll()
+      else if (typeof adapter.close === 'function') await adapter.close(name)
+      residents.delete(name)
+    }
+    const state = taskStates.get(name)
+    if (state && state.active === 0 && state.queued === 0) taskStates.delete(name)
+    else if (state) { state.resident = false; state.worker = null; state.session = null }
   }
 
   const dispatch = function dispatch(agent, msg, extra, opts, contactName) {
@@ -991,9 +996,16 @@ function makeDispatcher({ wsSend, onEscalation, wakes = null, canDispatch = null
           superseded = wakes.take(name) || opts.superseded
         }
         fs.writeFileSync(taskFile, renderTask(msg, extra, { ...opts, superseded }))
-        const result = useResident
-          ? await residentRun(name, { cwd: base, prompt: fs.readFileSync(taskFile, 'utf8'), timeoutMs })
-          : await spawnTask()
+        let result
+        if (useResident) {
+          try {
+            result = await residentRun(name, { cwd: base, prompt: fs.readFileSync(taskFile, 'utf8'), timeoutMs })
+          } catch (error) {
+            result = { code: 1, stdout: String(error && (error.stack || error.message) || error) }
+          }
+        } else {
+          result = await spawnTask()
+        }
         const { code, stdout } = result
         if (result.cancelled) {
           if (wakes) wakes.clear(name)

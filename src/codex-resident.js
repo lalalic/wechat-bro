@@ -38,6 +38,12 @@ class CodexResidentAdapter {
       const fail = error => {
         for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(error) }
         this.pending.clear()
+        for (const turn of new Set(this.turns.values())) { clearTimeout(turn.timer); turn.resolve({ code: 1, stdout: turn.stdout }) }
+        this.turns.clear()
+        this.bufferedEvents.clear()
+        this.threads.clear()
+        this.child = null
+        this.initialized = null
         reject(error)
       }
       child.on('error', fail)
@@ -81,7 +87,13 @@ class CodexResidentAdapter {
     const turnId = params.turnId || params.turn_id || params.turn?.id
     const turn = turnId && this.turns.get(turnId)
     if (!turn) {
-      if (turnId) this.bufferedEvents.set(turnId, [...(this.bufferedEvents.get(turnId) || []), message])
+      const method = message.method || ''
+      if (turnId && (method === 'item/completed' || method === 'turn/completed' || method === 'turn/complete' || method === 'turn/failed' || method === 'turn/error')) {
+        const buffered = [...(this.bufferedEvents.get(turnId) || []), message].slice(-16)
+        this.bufferedEvents.set(turnId, buffered)
+        const timer = setTimeout(() => this.bufferedEvents.delete(turnId), 30000)
+        if (typeof timer.unref === 'function') timer.unref()
+      }
       return
     }
     const method = message.method || ''
@@ -92,6 +104,7 @@ class CodexResidentAdapter {
     if (method === 'turn/completed' || method === 'turn/complete' || method === 'turn/failed' || method === 'turn/error') {
       this.turns.delete(turnId)
       if (turn.key) this.turns.delete(`${turn.key}:${turnId}`)
+      this.bufferedEvents.delete(turnId)
       clearTimeout(turn.timer)
       const status = params.turn?.status || ''
       const failed = method.includes('failed') || method.includes('error') || status === 'failed' || !!params.turn?.error
@@ -164,6 +177,9 @@ class CodexResidentAdapter {
     for (const key of [...this.threads.keys()]) await this.close(key)
     for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(new Error('codex resident adapter closed')) }
     this.pending.clear()
+    this.turns.clear()
+    this.bufferedEvents.clear()
+    this.threads.clear()
     if (this.child) { try { this.child.kill('SIGTERM') } catch {} }
     this.child = null
     this.initialized = null
