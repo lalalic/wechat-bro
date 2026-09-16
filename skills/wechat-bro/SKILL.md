@@ -214,10 +214,10 @@ contact
 | 转写本地音频并发送文本 | `send-voice` |
 | 在终端显示登录二维码 | `barcode` |
 | 检查 orchestrator watch/runtime 状态与 daemon 健康 | `status` |
-| 持久关注并立即启用路由 | `watch <context>` |
-| 持久取消关注并立即停止路由 | `unwatch <context>` |
-| 仅在 runtime 暂停一个已关注 context | `pause <context>` |
-| 仅在 runtime 恢复一个已暂停 context | `unpause <context>` |
+| 持久关注并立即启用路由 | `watch <contact-or-room-name> [--agent <agent-name>] [--mode maintainer|assistant]` |
+| 持久取消关注并立即停止路由 | `unwatch <contact-or-room-name>` |
+| 仅在 runtime 暂停一个已关注 context | `pause <contact-or-room-name>` |
+| 仅在 runtime 恢复一个已暂停 context | `unpause <contact-or-room-name>` |
 | 列出支持的 emoji code | `emojis` |
 | 正常退出 | `exit` |
 
@@ -231,6 +231,7 @@ npx wechat-bro room-members --name "Dev Team"
 npx wechat-bro barcode
 npx wechat-bro status
 npx wechat-bro watch "Alice Chen"
+npx wechat-bro watch "Dev Team" --agent wechat-room-maintainer --mode assistant
 npx wechat-bro pause "Alice Chen"
 npx wechat-bro unpause "Alice Chen"
 npx wechat-bro unwatch "Alice Chen"

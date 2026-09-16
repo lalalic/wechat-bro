@@ -197,7 +197,7 @@ function frontmatterValue(value) {
 }
 
 /** Update YAML-lite watch lists without touching agent prompt bodies. */
-function updateAgentWatchConfig(agent, context, add) {
+function updateAgentWatchConfig(agent, context, add, mode = 'maintainer') {
   const raw = fs.readFileSync(agent.path, 'utf8')
   const match = /^(---\r?\n)([\s\S]*?)(\r?\n---\r?\n?)/.exec(raw)
   if (!match) throw new Error(`agent has no frontmatter: ${agent.path}`)
@@ -207,12 +207,13 @@ function updateAgentWatchConfig(agent, context, add) {
   const contactNames = contactList(parsed)
   const assistantNames = contactList(parsed, 'contacts-assistant')
   if (add) {
-    if (assistantNames.includes(context)) {
-      updates.set('contacts-assistant', assistantNames.filter(name => name !== context))
-      updates.set('contacts', contactNames.includes(context) ? contactNames : [...contactNames, context])
-    } else if (!contactNames.includes(context)) {
-      updates.set('contacts', [...contactNames, context])
-    }
+    const assistantMode = mode === 'assistant'
+    const targetKey = assistantMode ? 'contacts-assistant' : 'contacts'
+    const otherKey = assistantMode ? 'contacts' : 'contacts-assistant'
+    const targetNames = assistantMode ? assistantNames : contactNames
+    const otherNames = assistantMode ? contactNames : assistantNames
+    if (!targetNames.includes(context)) updates.set(targetKey, [...targetNames, context])
+    if (otherNames.includes(context)) updates.set(otherKey, otherNames.filter(name => name !== context))
   } else {
     if (assistantNames.includes(context)) updates.set('contacts-assistant', assistantNames.filter(name => name !== context))
     if (contactNames.includes(context)) updates.set('contacts', contactNames.filter(name => name !== context))
@@ -242,7 +243,7 @@ function updateAgentWatchConfig(agent, context, add) {
 }
 
 /** Persist a context on exactly one routing agent, removing duplicate routes. */
-function applyPersistentWatch(agents, context, selectedAgent, add) {
+function applyPersistentWatch(agents, context, selectedAgent, add, mode = 'maintainer') {
   let selected = selectedAgent || routeAgent(agents, context, false)?.agent
   if (!selected) throw new Error(`no routable agent for ${context}`)
   if (selected.path.startsWith(PKG_AGENTS_DIR)) {
@@ -258,9 +259,9 @@ function applyPersistentWatch(agents, context, selectedAgent, add) {
     : agents
   for (const agent of currentAgents) {
     if (agent === selected) continue
-    updateAgentWatchConfig(agent, context, false)
+    updateAgentWatchConfig(agent, context, false, mode)
   }
-  updateAgentWatchConfig(selected, context, add)
+  updateAgentWatchConfig(selected, context, add, mode)
   return loadAgents()
 }
 
@@ -760,9 +761,10 @@ class WatchControlManager {
     this.configuredWatches.delete('filehelper')
   }
 
-  async handle(action, context, { isRoom = false } = {}) {
+  async handle(action, context, { isRoom = false, agentName = null, mode = 'maintainer' } = {}) {
     if (!context || context === 'filehelper') throw new Error('context is required (filehelper is always managed by the orchestrator)')
     if (!['watch', 'unwatch', 'pause', 'unpause'].includes(action)) throw new Error(`unknown watch action: ${action}`)
+    if (action === 'watch' && !['maintainer', 'assistant'].includes(mode)) throw new Error('mode must be maintainer or assistant')
 
     if (action === 'pause') {
       if (!this.runtimeWatches.has(context)) throw new Error(`${context} is not being watched`)
@@ -775,11 +777,16 @@ class WatchControlManager {
       return { action, context, changed, state: this.runtimeWatches.has(context) ? 'watching' : 'unwatched' }
     }
 
-    const routed = routeAgent(this.agents, context, isRoom)
+    let routed = routeAgent(this.agents, context, isRoom)
+    if (action === 'watch' && agentName) {
+      const selected = this.agents.find(agent => agent.data.name === agentName && agent.data.type !== 'orchestrator')
+      if (!selected) throw new Error(`agent not found or not routable: ${agentName}`)
+      routed = { agent: selected, assistant: mode === 'assistant' }
+    }
     if (!routed) throw new Error(`no routable agent for ${context}`)
     const wasConfigured = this.configuredWatches.has(context)
     const wasRuntime = this.runtimeWatches.has(context) || this.paused.has(context)
-    this.agents = this.applyWatch(this.agents, context, routed.agent, action === 'watch')
+    this.agents = this.applyWatch(this.agents, context, routed.agent, action === 'watch', mode)
     this.refreshConfigured(this.agents)
     if (action === 'watch') {
       this.runtimeWatches.add(context)
@@ -794,7 +801,7 @@ class WatchControlManager {
       changed: action === 'watch' ? !(wasConfigured && wasRuntime) : (wasConfigured || wasRuntime),
       state: action === 'watch' ? 'watching' : 'unwatched',
       agent: routed.agent.data.name,
-      mode: routed.assistant ? 'assistant' : 'maintainer',
+      mode: action === 'watch' ? mode : (routed.assistant ? 'assistant' : 'maintainer'),
     }
   }
 
@@ -1180,10 +1187,10 @@ async function runOrchestrator({ port = 9231 } = {}) {
     }
   }
 
-  const handleControl = async (action, context) => {
+  const handleControl = async (action, context, options = {}) => {
     const isRoom = await isRoomContact(ws, roomCache, context)
     if (action === 'unwatch' || action === 'pause') suppressContinuation(context)
-    const result = await controls.handle(action, context, { isRoom: isRoom === true })
+    const result = await controls.handle(action, context, { isRoom: isRoom === true, ...options })
     if (action === 'unwatch' || action === 'pause') suppressContinuation(context)
     agents = loadAgents()
     if (cliHarness) for (const a of agents) a.data.harness = cliHarness
@@ -1219,7 +1226,7 @@ async function runOrchestrator({ port = 9231 } = {}) {
         if (!requestId || !request) throw new Error('invalid orchestrator request')
         const result = request.cmd === 'status'
           ? await buildStatus()
-          : await handleControl(request.cmd, request.context || request.name || request.to)
+          : await handleControl(request.cmd, request.context || request.name || request.to, { agentName: request.agent || null, mode: request.mode || 'maintainer' })
         await respond(true, result)
       } catch (error) {
         await respond(false, null, error.message)

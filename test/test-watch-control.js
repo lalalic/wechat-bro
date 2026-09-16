@@ -52,10 +52,23 @@ async function main() {
   const assistantData = m.parseFrontmatter(fs.readFileSync(assistantPath, 'utf8')).data
   ok(!assistantData['contacts-assistant'] && assistantData.contacts.includes('Dana'), 'plain watch moves an assistant contact to maintainer mode')
 
+  agents = m.loadAgents()
+  const teamAgain = agents.find(agent => agent.data.name === 'wechat-team')
+  agents = m.applyPersistentWatch(agents, 'Mode Test', teamAgain, true, 'assistant')
+  const modeData = m.parseFrontmatter(fs.readFileSync(teamPath, 'utf8')).data
+  ok(modeData['contacts-assistant'].includes('Mode Test') && !modeData.contacts.includes('Mode Test'), 'assistant mode writes contacts-assistant only')
+
+
   const controls = new m.WatchControlManager({ agents: m.loadAgents(), port: 9999 })
   ok(controls.contextStates().some(item => item.context === 'Carol' && item.configured && item.watching && !item.paused), 'status distinguishes configured and watching state')
 
   console.log('# runtime watch commands')
+  const explicit = await controls.handle('watch', 'Agent Mode', { isRoom: false, agentName: 'wechat-team', mode: 'assistant' })
+  ok(explicit.agent === 'wechat-team' && explicit.mode === 'assistant', 'watch accepts optional agent and assistant mode')
+  let invalidMode = null
+  try { await controls.handle('watch', 'Bad Mode', { isRoom: false, mode: 'wrong' }) } catch (error) { invalidMode = error }
+  ok(invalidMode && /maintainer or assistant/.test(invalidMode.message), 'watch rejects invalid mode')
+
   await controls.handle('watch', 'Eve', { isRoom: false })
   const firstWatch = await controls.handle('watch', 'Eve', { isRoom: false })
   ok(firstWatch.changed === false, 'watch is idempotent')

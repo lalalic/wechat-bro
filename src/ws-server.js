@@ -115,7 +115,7 @@ function create(opts = {}) {
         pendingOrchestratorRequests.set(requestId, { ws, id, timer })
         broadcast({
           event: 'orchestrator-request',
-          data: { requestId, request: { cmd, ...(context ? { context } : {}) } },
+          data: { requestId, request: { cmd, ...(context ? { context } : {}), ...(req.agent ? { agent: req.agent } : {}), ...(req.mode ? { mode: req.mode } : {}) } },
           ts: Date.now(),
         })
         return
