@@ -63,6 +63,7 @@ const path = require('path')
 const os = require('os')
 const { spawn } = require('child_process')
 const WebSocket = require('ws')
+const { CodexResidentAdapter } = require('./codex-resident')
 
 const DATA_DIR = process.env.WECHAT_BRO_DATA_DIR || path.join(os.homedir(), '.wechat-bro')
 // The ONE user agents dir. The skill's bundled agents/ (inside the installed
@@ -752,6 +753,8 @@ class WatchControlManager {
     this.configuredWatches.delete('filehelper')
     this.runtimeWatches = new Set(this.configuredWatches)
     this.paused = new Set()
+    this.resident = new Set()
+    this.hooks = {}
     this.startedAt = Date.now()
   }
 
@@ -761,20 +764,33 @@ class WatchControlManager {
     this.configuredWatches.delete('filehelper')
   }
 
-  async handle(action, context, { isRoom = false, agentName = null, mode = 'maintainer' } = {}) {
+  setHooks(hooks) { this.hooks = hooks || {}; return this }
+
+  async handle(action, context, { isRoom = false, agentName = null, mode = 'maintainer', state = null } = {}) {
     if (!context || context === 'filehelper') throw new Error('context is required (filehelper is always managed by the orchestrator)')
-    if (!['watch', 'unwatch', 'pause', 'unpause'].includes(action)) throw new Error(`unknown watch action: ${action}`)
+    if (!['watch', 'unwatch', 'pause', 'resident'].includes(action)) throw new Error(`unknown watch action: ${action}`)
     if (action === 'watch' && !['maintainer', 'assistant'].includes(mode)) throw new Error('mode must be maintainer or assistant')
 
     if (action === 'pause') {
       if (!this.runtimeWatches.has(context)) throw new Error(`${context} is not being watched`)
-      const changed = !this.paused.has(context)
-      this.paused.add(context)
-      return { action, context, changed, state: 'paused' }
+      if (!['on', 'off'].includes(state)) throw new Error('pause requires on or off')
+      const changed = state === 'on' ? !this.paused.has(context) : this.paused.delete(context)
+      if (state === 'on') {
+        this.paused.add(context)
+        await this.hooks.onPause?.(context)
+      }
+      return { action, context, changed, state: state === 'on' ? 'paused' : (this.runtimeWatches.has(context) ? 'watching' : 'unwatched') }
     }
-    if (action === 'unpause') {
-      const changed = this.paused.delete(context)
-      return { action, context, changed, state: this.runtimeWatches.has(context) ? 'watching' : 'unwatched' }
+    if (action === 'resident') {
+      if (!this.runtimeWatches.has(context)) throw new Error(`${context} is not being watched`)
+      if (!['on', 'off'].includes(state)) throw new Error('resident requires on or off')
+      const routed = routeAgent(this.agents, context, isRoom)
+      if (!routed) throw new Error(`no routable agent for ${context}`)
+      if (state === 'on' && routed.agent.data.harness !== 'codex') throw new Error('resident mode requires the codex harness')
+      const changed = state === 'on' ? !this.resident.has(context) : this.resident.delete(context)
+      if (state === 'on') this.resident.add(context)
+      else await this.hooks.onResidentOff?.(context)
+      return { action, context, changed, state: state === 'on' ? 'resident' : 'watching' }
     }
 
     let routed = routeAgent(this.agents, context, isRoom)
@@ -794,6 +810,8 @@ class WatchControlManager {
     } else {
       this.runtimeWatches.delete(context)
       this.paused.delete(context)
+      this.resident.delete(context)
+      await this.hooks.onUnwatch?.(context)
     }
     return {
       action,
@@ -807,6 +825,7 @@ class WatchControlManager {
 
   isWatched(context) { return this.runtimeWatches.has(context) }
   isPaused(context) { return this.paused.has(context) }
+  isResident(context) { return this.resident.has(context) }
   canDispatch(context, phase = 'start') {
     if (!this.isWatched(context) || this.isPaused(context)) return false
     return phase !== 'continuation' || this.isWatched(context)
@@ -822,12 +841,14 @@ class WatchControlManager {
         const configured = this.configuredWatches.has(context)
         const watching = this.runtimeWatches.has(context)
         const paused = this.paused.has(context)
+        const resident = this.resident.has(context)
         return {
           context,
           configured,
           watching,
           paused,
-          state: paused ? 'paused' : (watching ? 'watching' : 'unwatched'),
+          resident,
+          state: paused ? 'paused' : (resident ? 'resident' : (watching ? 'watching' : 'unwatched')),
           mismatch: configured !== watching,
         }
       })
@@ -838,6 +859,7 @@ class WatchControlManager {
       configuredWatches: [...this.configuredWatches].sort(),
       runtimeWatches: [...this.runtimeWatches].sort(),
       pausedContexts: [...this.paused].sort(),
+      residentContexts: [...this.resident].sort(),
       contexts: this.contextStates(),
     }
   }
@@ -854,9 +876,24 @@ class ContactQueue { // serializes dispatches per contact
   }
 }
 
-function makeDispatcher({ wsSend, onEscalation, wakes = null, canDispatch = null }) {
+function makeDispatcher({ wsSend, onEscalation, wakes = null, canDispatch = null, isResident = null, residentFactory = null }) {
   const queues = new Map()
   const taskStates = new Map()
+  const residents = new Map()
+  const makeResident = residentFactory || (() => new CodexResidentAdapter())
+
+  const residentRun = async (name, opts) => {
+    let adapter = residents.get(name)
+    if (!adapter) { adapter = makeResident(name, opts); residents.set(name, adapter) }
+    return adapter.run(name, opts)
+  }
+  const residentCancel = async name => residents.get(name)?.cancel(name)
+  const residentClose = async name => {
+    const adapter = residents.get(name)
+    if (!adapter) return
+    await adapter.close(name)
+    residents.delete(name)
+  }
 
   const dispatch = function dispatch(agent, msg, extra, opts, contactName) {
     if (typeof opts === 'boolean') opts = { assistant: opts }
@@ -873,7 +910,7 @@ function makeDispatcher({ wsSend, onEscalation, wakes = null, canDispatch = null
     // arrived, and that late plan must also be superseded by the real message.
     if (!queues.has(name)) queues.set(name, new ContactQueue())
     const queue = queues.get(name)
-    if (!taskStates.has(name)) taskStates.set(name, { active: 0, queued: 0 })
+    if (!taskStates.has(name)) taskStates.set(name, { active: 0, queued: 0, worker: null, session: null })
     taskStates.get(name).queued += 1
 
     return queue.run(async () => {
@@ -900,6 +937,13 @@ function makeDispatcher({ wsSend, onEscalation, wakes = null, canDispatch = null
           ? 'wechat-orchestrator'
           : (d['session-id'] || `wechat-${sanitizeFsName(name)}`)
         d.cwd = base
+        const useResident = !!(isResident && isResident(name))
+        if (useResident && d.harness !== 'codex') throw new Error('resident mode requires the codex harness')
+        if (state) {
+          state.worker = useResident ? 'resident' : 'process'
+          state.session = d.sessionId
+          state.resident = useResident
+        }
         fs.mkdirSync(base, { recursive: true })
         fs.mkdirSync(d.sessionDir, { recursive: true })
         ensureAgentsMd(base, agent.path)
@@ -947,7 +991,14 @@ function makeDispatcher({ wsSend, onEscalation, wakes = null, canDispatch = null
           superseded = wakes.take(name) || opts.superseded
         }
         fs.writeFileSync(taskFile, renderTask(msg, extra, { ...opts, superseded }))
-        const { code, stdout } = await spawnTask()
+        const result = useResident
+          ? await residentRun(name, { cwd: base, prompt: fs.readFileSync(taskFile, 'utf8'), timeoutMs })
+          : await spawnTask()
+        const { code, stdout } = result
+        if (result.cancelled) {
+          if (wakes) wakes.clear(name)
+          return { code, stdout, skipped: true, reason: 'resident-cancelled' }
+        }
         if (canDispatch && !canDispatch(name, 'continuation')) {
           if (wakes) wakes.clear(name)
           return { code, stdout, skipped: true, reason: 'watch-control' }
@@ -978,7 +1029,10 @@ function makeDispatcher({ wsSend, onEscalation, wakes = null, canDispatch = null
         const state = taskStates.get(name)
         if (state) {
           state.active = Math.max(0, state.active - 1)
-          if (state.active === 0 && state.queued === 0) taskStates.delete(name)
+          if (state.active === 0 && state.queued === 0) {
+            if (state.resident) { state.worker = null; state.session = state.session || null }
+            else taskStates.delete(name)
+          }
         }
         if (taskFile) { try { fs.unlinkSync(taskFile) } catch {} }
       }
@@ -986,6 +1040,8 @@ function makeDispatcher({ wsSend, onEscalation, wakes = null, canDispatch = null
   }
   dispatch.taskStates = () => Object.fromEntries([...taskStates].map(([name, state]) => [name, { ...state }]))
   dispatch.queues = () => Object.fromEntries([...queues].map(([name, queue]) => [name, { queued: queue.queued || 0 }]))
+  dispatch.cancelResident = residentCancel
+  dispatch.teardownResident = residentClose
   return dispatch
 }
 
@@ -1142,10 +1198,14 @@ async function runOrchestrator({ port = 9231 } = {}) {
   const contextDetails = (context) => {
     const routed = routeAgent(agents, context, roomCache.get(context) || false)
     const state = controls.contextStates().find(item => item.context === context) || {}
+    const task = dispatch ? (dispatch.taskStates()[context] || null) : null
     return {
       ...state,
       agent: routed ? routed.agent.data.name : null,
       mode: routed ? (routed.assistant ? 'assistant' : 'maintainer') : null,
+      worker: task && task.worker,
+      session: task && task.session,
+      task,
       hostRole: 'daemon-client',
     }
   }
@@ -1189,9 +1249,9 @@ async function runOrchestrator({ port = 9231 } = {}) {
 
   const handleControl = async (action, context, options = {}) => {
     const isRoom = await isRoomContact(ws, roomCache, context)
-    if (action === 'unwatch' || action === 'pause') suppressContinuation(context)
+    if (action === 'unwatch' || (action === 'pause' && options.state === 'on')) suppressContinuation(context)
     const result = await controls.handle(action, context, { isRoom: isRoom === true, ...options })
-    if (action === 'unwatch' || action === 'pause') suppressContinuation(context)
+    if (action === 'unwatch' || (action === 'pause' && options.state === 'on')) suppressContinuation(context)
     agents = loadAgents()
     if (cliHarness) for (const a of agents) a.data.harness = cliHarness
     controls.refreshConfigured(agents)
@@ -1226,7 +1286,7 @@ async function runOrchestrator({ port = 9231 } = {}) {
         if (!requestId || !request) throw new Error('invalid orchestrator request')
         const result = request.cmd === 'status'
           ? await buildStatus()
-          : await handleControl(request.cmd, request.context || request.name || request.to, { agentName: request.agent || null, mode: request.mode || 'maintainer' })
+          : await handleControl(request.cmd, request.context || request.name || request.to, { agentName: request.agent || null, mode: request.mode || 'maintainer', state: request.state || null })
         await respond(true, result)
       } catch (error) {
         await respond(false, null, error.message)
@@ -1360,6 +1420,12 @@ async function runOrchestrator({ port = 9231 } = {}) {
       onEscalation,
       wakes,
       canDispatch: canDispatchTask,
+      isResident: context => controls.isResident(context),
+    })
+    controls.setHooks({
+      onPause: context => dispatch && dispatch.cancelResident(context),
+      onResidentOff: context => dispatch && dispatch.teardownResident(context),
+      onUnwatch: context => dispatch && dispatch.teardownResident(context),
     })
     log(`connected to ws://localhost:${port} — watching`)
   }
@@ -1434,5 +1500,6 @@ module.exports = {
   harnessVars, renderHarness, runOrchestrator, flagValue, DATA_DIR, AGENTS_DIR,
   validateNextAction, clampDelay, WakeScheduler, renderWakeTask, wakeFile,
   ContactQueue, makeDispatcher,
+  CodexResidentAdapter,
   WAKE_MIN_SECONDS, WAKE_MAX_SECONDS, WAKE_MAX_OVERDUE_SECONDS, WAKES_FILE,
 }

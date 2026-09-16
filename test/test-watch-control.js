@@ -60,7 +60,7 @@ async function main() {
 
 
   const controls = new m.WatchControlManager({ agents: m.loadAgents(), port: 9999 })
-  ok(controls.contextStates().some(item => item.context === 'Carol' && item.configured && item.watching && !item.paused), 'status distinguishes configured and watching state')
+  ok(controls.contextStates().some(item => item.context === 'Carol' && item.configured && item.watching && !item.paused && !item.resident), 'status distinguishes configured and watching state')
 
   console.log('# runtime watch commands')
   const explicit = await controls.handle('watch', 'Agent Mode', { isRoom: false, agentName: 'wechat-team', mode: 'assistant' })
@@ -72,15 +72,15 @@ async function main() {
   await controls.handle('watch', 'Eve', { isRoom: false })
   const firstWatch = await controls.handle('watch', 'Eve', { isRoom: false })
   ok(firstWatch.changed === false, 'watch is idempotent')
-  await controls.handle('pause', 'Eve')
-  const secondPause = await controls.handle('pause', 'Eve')
+  await controls.handle('pause', 'Eve', { state: 'on' })
+  const secondPause = await controls.handle('pause', 'Eve', { state: 'on' })
   ok(secondPause.changed === false, 'pause is idempotent')
   ok(controls.isWatched('Eve') && controls.isPaused('Eve'), 'pause remains watched but blocks runtime')
   ok(!controls.canDispatch('Eve', 'start'), 'paused context cannot start a worker')
-  await controls.handle('unpause', 'Eve')
-  const secondUnpause = await controls.handle('unpause', 'Eve')
-  ok(secondUnpause.changed === false, 'unpause is idempotent')
-  ok(controls.canDispatch('Eve', 'start'), 'unpause restores dispatch')
+  await controls.handle('pause', 'Eve', { state: 'off' })
+  const secondResume = await controls.handle('pause', 'Eve', { state: 'off' })
+  ok(secondResume.changed === false, 'pause off is idempotent')
+  ok(controls.canDispatch('Eve', 'start'), 'pause off restores dispatch')
   const unwatch = await controls.handle('unwatch', 'Eve')
   const secondUnwatch = await controls.handle('unwatch', 'Eve')
   ok(unwatch.changed === true && secondUnwatch.changed === false, 'unwatch is idempotent')
@@ -225,7 +225,7 @@ async function main() {
       }
     })
   })
-  client.send(JSON.stringify({ cmd: 'pause', context: 'Alice', id: 'cli-cmd' }))
+  client.send(JSON.stringify({ cmd: 'pause', context: 'Alice', state: 'on', id: 'cli-cmd' }))
   const clientResult = await clientResponse
   const workerAck = await relayResponse
   ok(clientResult.ok && clientResult.data.state === 'paused', 'daemon relay delivers an orchestrator control result')

@@ -98,7 +98,7 @@ function create(opts = {}) {
 
       // The orchestrator is a separate WebSocket client, so management
       // controls are broadcast to it and its response is matched by ID.
-      const orchestratorActions = new Set(['watch', 'unwatch', 'pause', 'unpause', 'status'])
+      const orchestratorActions = new Set(['watch', 'unwatch', 'pause', 'resident', 'status'])
       if (orchestratorActions.has(cmd)) {
         const context = cmd === 'status' ? null : (req.context || req.name || req.to || '')
         if (cmd !== 'status' && !context) {
@@ -115,7 +115,7 @@ function create(opts = {}) {
         pendingOrchestratorRequests.set(requestId, { ws, id, timer })
         broadcast({
           event: 'orchestrator-request',
-          data: { requestId, request: { cmd, ...(context ? { context } : {}), ...(req.agent ? { agent: req.agent } : {}), ...(req.mode ? { mode: req.mode } : {}) } },
+          data: { requestId, request: { cmd, ...(context ? { context } : {}), ...(req.agent ? { agent: req.agent } : {}), ...(req.mode ? { mode: req.mode } : {}), ...(req.state ? { state: req.state } : {}) } },
           ts: Date.now(),
         })
         return
