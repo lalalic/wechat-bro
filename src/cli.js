@@ -635,10 +635,15 @@ Commands:
                                Marpit/mermaid code blocks are auto-rendered.
   host --to <name> --prompt <rich context>
                                Ask the running orchestrator to host a discussion.
-  watch <context>              Persistently watch and immediately route a chat.
-  unwatch <context>            Persistently unwatch and immediately stop routing.
-  pause <context>              Runtime-only pause; restart clears it.
-  unpause <context>            Runtime-only resume.
+  watch <contact-or-room-name> [--agent <agent-name>] [--mode maintainer|assistant]
+                               Persistently watch an exact WeChat contact/room name.
+                               --agent is optional; otherwise reuse/select the routed agent.
+                               --mode is optional; default: maintainer.
+  unwatch <contact-or-room-name>
+                               Persistently unwatch and immediately stop routing.
+  pause <contact-or-room-name> Runtime-only pause; restart clears it.
+  unpause <contact-or-room-name>
+                               Runtime-only resume.
   send-image --to <name> --path <file> [--filename <name>]
   send-file  --to <name> --path <file> --filename <name>
   send-voice --to <name> --path <file>   (transcribe + send as text)
