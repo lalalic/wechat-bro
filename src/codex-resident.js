@@ -13,18 +13,20 @@ function textFrom(value) {
 }
 
 class CodexResidentAdapter {
-  constructor({ command = 'codex', args = ['app-server', '--stdio'], spawnProcess = spawn, env = process.env, timeoutMs = 900000 } = {}) {
+  constructor({ command = 'codex', args = ['app-server', '--stdio'], spawnProcess = spawn, env = process.env, timeoutMs = 900000, requestTimeoutMs = 30000 } = {}) {
     this.command = command
     this.args = args
     this.spawnProcess = spawnProcess
     this.env = env
     this.timeoutMs = timeoutMs
+    this.requestTimeoutMs = requestTimeoutMs
     this.child = null
     this.buffer = ''
     this.nextId = 1
     this.pending = new Map()
     this.threads = new Map()
     this.turns = new Map()
+    this.bufferedEvents = new Map()
     this.initialized = null
   }
 
@@ -34,13 +36,13 @@ class CodexResidentAdapter {
       const child = this.spawnProcess(this.command, this.args, { stdio: ['pipe', 'pipe', 'pipe'], env: this.env })
       this.child = child
       const fail = error => {
-        for (const pending of this.pending.values()) pending.reject(error)
+        for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(error) }
         this.pending.clear()
         reject(error)
       }
       child.on('error', fail)
       child.on('exit', code => {
-        if (code && this.initialized) fail(new Error(`codex app-server exited with code ${code}`))
+        if (this.initialized) fail(new Error(`codex app-server exited with code ${code == null ? 'unknown' : code}`))
       })
       child.stdout.on('data', chunk => this.#read(chunk))
       child.stderr.on('data', () => {})
@@ -62,9 +64,10 @@ class CodexResidentAdapter {
       if (!line) continue
       let message
       try { message = JSON.parse(line) } catch { continue }
-      if (message.id != null && this.pending.has(message.id)) {
+      if (!message.method && message.id != null && this.pending.has(message.id)) {
         const pending = this.pending.get(message.id)
         this.pending.delete(message.id)
+        clearTimeout(pending.timer)
         if (message.error) pending.reject(new Error(message.error.message || 'codex app-server request failed'))
         else pending.resolve(message.result || {})
         continue
@@ -77,15 +80,22 @@ class CodexResidentAdapter {
     const params = message.params || message.result || {}
     const turnId = params.turnId || params.turn_id || params.turn?.id
     const turn = turnId && this.turns.get(turnId)
-    if (!turn) return
+    if (!turn) {
+      if (turnId) this.bufferedEvents.set(turnId, [...(this.bufferedEvents.get(turnId) || []), message])
+      return
+    }
     const method = message.method || ''
-    const delta = textFrom(params.delta || params.item || params)
-    if (delta) turn.stdout += delta
+    if (method === 'item/completed' && params.item?.type === 'agentMessage') {
+      const text = textFrom(params.item)
+      if (text) turn.stdout += (turn.stdout ? '\n' : '') + text
+    }
     if (method === 'turn/completed' || method === 'turn/complete' || method === 'turn/failed' || method === 'turn/error') {
       this.turns.delete(turnId)
+      if (turn.key) this.turns.delete(`${turn.key}:${turnId}`)
       clearTimeout(turn.timer)
-      if (method.includes('failed') || method.includes('error')) turn.resolve({ code: 1, stdout: turn.stdout })
-      else turn.resolve({ code: 0, stdout: turn.stdout })
+      const status = params.turn?.status || ''
+      const failed = method.includes('failed') || method.includes('error') || status === 'failed' || !!params.turn?.error
+      turn.resolve({ code: failed ? 1 : 0, stdout: turn.stdout })
     }
   }
 
@@ -93,7 +103,11 @@ class CodexResidentAdapter {
     if (!this.child || !this.child.stdin) return Promise.reject(new Error('codex app-server is not running'))
     const id = this.nextId++
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return
+        reject(new Error(`codex app-server request timed out: ${method}`))
+      }, this.requestTimeoutMs)
+      this.pending.set(id, { resolve, reject, timer })
       this.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
     })
   }
@@ -105,7 +119,7 @@ class CodexResidentAdapter {
   async thread(key, cwd) {
     await this.start()
     if (this.threads.has(key)) return this.threads.get(key)
-    const result = await this.request('thread/start', { cwd })
+    const result = await this.request('thread/start', { cwd, sandbox: 'danger-full-access', approvalPolicy: 'never' })
     const id = result.threadId || (result.thread && result.thread.id) || result.id
     if (!id) throw new Error('codex app-server did not return a thread id')
     this.threads.set(key, id)
@@ -118,12 +132,15 @@ class CodexResidentAdapter {
     const turnId = result.turnId || (result.turn && result.turn.id) || result.id
     if (!turnId) return { code: 0, stdout: textFrom(result) }
     return new Promise(resolve => {
-      const turn = { threadId, stdout: '', resolve, timer: setTimeout(() => {
+      const turn = { key, threadId, stdout: '', resolve, timer: setTimeout(() => {
         this.cancel(key).catch(() => {})
         resolve({ code: 1, stdout: turn.stdout })
       }, timeoutMs) }
       this.turns.set(turnId, turn)
       this.turns.set(`${key}:${turnId}`, turn)
+      const buffered = this.bufferedEvents.get(turnId) || []
+      this.bufferedEvents.delete(turnId)
+      for (const message of buffered) this.#event(message)
     })
   }
 
@@ -145,7 +162,7 @@ class CodexResidentAdapter {
 
   async closeAll() {
     for (const key of [...this.threads.keys()]) await this.close(key)
-    for (const pending of this.pending.values()) pending.reject(new Error('codex resident adapter closed'))
+    for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(new Error('codex resident adapter closed')) }
     this.pending.clear()
     if (this.child) { try { this.child.kill('SIGTERM') } catch {} }
     this.child = null

@@ -4,7 +4,8 @@ const assert = require('assert')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
-const { WatchControlManager, makeDispatcher } = require('../src/orchestrator')
+const { PassThrough, Writable } = require('stream')
+const { WatchControlManager, makeDispatcher, CodexResidentAdapter } = require('../src/orchestrator')
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-bro-resident-'))
 const agentPath = path.join(tmp, 'agent.md')
@@ -58,6 +59,45 @@ async function main() {
   await dispatcher.teardownResident('Alice')
   assert.strictEqual(cancelCalls, 1)
   assert.strictEqual(closeCalls, 1)
+
+  const writes = []
+  const stdout = new PassThrough()
+  const fakeChild = new PassThrough()
+  fakeChild.stdin = new Writable({
+    write(chunk, encoding, callback) {
+      const request = JSON.parse(chunk.toString())
+      writes.push(request)
+      if (request.id === 1) stdout.write(JSON.stringify({ id: 1, result: {} }) + '\n')
+      if (request.method === 'thread/start') stdout.write(JSON.stringify({ id: request.id, result: { threadId: 'thread-1' } }) + '\n')
+      if (request.method === 'turn/start') {
+        stdout.write(JSON.stringify({ id: request.id, result: { turnId: 'turn-1' } }) + '\n')
+        stdout.write(JSON.stringify({ method: 'item/completed', params: { turnId: 'turn-1', item: { type: 'userMessage', content: [{ text: 'do not collect' }] } } }) + '\n')
+        stdout.write(JSON.stringify({ method: 'item/completed', params: { turnId: 'turn-1', item: { type: 'agentMessage', text: '{"status":"addressed"}' } } }) + '\n')
+        stdout.write(JSON.stringify({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'failed', error: 'provider failed' } } }) + '\n')
+      }
+      callback()
+    },
+  })
+  fakeChild.stdout = stdout
+  fakeChild.stderr = new PassThrough()
+  const adapter = new CodexResidentAdapter({ spawnProcess: () => fakeChild, timeoutMs: 1000, requestTimeoutMs: 100 })
+  const failedTurn = await adapter.run('Alice', { cwd: tmp, prompt: 'hello' })
+  assert.strictEqual(failedTurn.code, 1)
+  assert.strictEqual(failedTurn.stdout, '{"status":"addressed"}')
+  assert.deepStrictEqual(writes.find(request => request.method === 'thread/start').params, {
+    cwd: tmp,
+    sandbox: 'danger-full-access',
+    approvalPolicy: 'never',
+  })
+  assert.strictEqual(adapter.turns.size, 0)
+  await adapter.closeAll()
+
+  const timeoutChild = new PassThrough()
+  timeoutChild.stdin = new Writable({ write(chunk, encoding, callback) { callback() } })
+  timeoutChild.stdout = new PassThrough()
+  timeoutChild.stderr = new PassThrough()
+  const timeoutAdapter = new CodexResidentAdapter({ spawnProcess: () => timeoutChild, requestTimeoutMs: 10 })
+  await assert.rejects(() => timeoutAdapter.start(), /request timed out: initialize/)
 
   console.log('resident tests passed')
 }
