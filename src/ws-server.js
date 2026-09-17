@@ -21,6 +21,10 @@
 
 const WebSocket = require('ws')
 
+const OUTBOUND_SEND_COMMANDS = new Set([
+  'send', 'send-text', 'send-image', 'send-video', 'send-file', 'send-voice',
+])
+
 function makeId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
 }
@@ -57,6 +61,17 @@ function create(opts = {}) {
   const clients = new Map()
   const pendingHosts = new Map()
   const pendingOrchestratorRequests = new Map()
+  let sendQueue = Promise.resolve()
+
+  // Keep outbound sends in request-arrival order without serializing unrelated
+  // commands. The tail is always released, including when a send rejects.
+  function dispatchCommand(cmd, args) {
+    if (!OUTBOUND_SEND_COMMANDS.has(cmd)) return dispatch(cmd, args)
+    const previous = sendQueue
+    let release
+    sendQueue = new Promise(resolve => { release = resolve })
+    return previous.then(() => dispatch(cmd, args)).finally(release)
+  }
 
   const server = new WebSocket.Server({ port })
 
@@ -166,7 +181,7 @@ function create(opts = {}) {
 
       // Dispatch command
       try {
-        const result = await dispatch(cmd, req)
+        const result = await dispatchCommand(cmd, req)
         ws.send(JSON.stringify({ ok: true, id, data: result }))
       } catch (e) {
         ws.send(JSON.stringify({ ok: false, id, error: e.message || String(e) }))
