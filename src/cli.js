@@ -49,9 +49,10 @@ const qrcode = require('qrcode-terminal')
 // clean JSON lines for agents.
 const WebSocket = require('ws')
 const { transcribeVoice, transcribeFile } = require('./transcribe')
-const { sendImage, sendVideo, sendFile } = require('./upload')
+const { sendImage, sendVideoFile, sendFile } = require('./upload')
 const wsServer = require('./ws-server')
 const { DaemonLifecycle, isAuthCommand } = require('./daemon-lifecycle')
+const WECHAT_BRO_VERSION = require('../package.json').version
 
 // Overridable for tests so unit suites never touch the real ~/.wechat-bro
 const DATA_DIR = process.env.WECHAT_BRO_DATA_DIR || path.join(os.homedir(), '.wechat-bro')
@@ -490,11 +491,12 @@ async function sendCommandViaWs(ws, request) {
   })
 
   // Safety timeout
+  const timeoutMs = request.cmd === 'send-video' ? 90000 : 30000
   setTimeout(() => {
     process.stdout.write(JSON.stringify({ ok: false, error: 'timeout', id }) + '\n')
     ws.close()
     process.exit(1)
-  }, 30000)
+  }, timeoutMs)
 
   ws.send(JSON.stringify(request))
 }
@@ -1150,8 +1152,10 @@ async function dispatch(cmd, args, page) {
       if (!args.to) throw new Error('Missing --to')
       if (!args.path) throw new Error('Missing --path (local video file)')
       if (!fs.existsSync(args.path)) throw new Error(`File not found: ${args.path}`)
-      await sendVideo(page, args.to, fs.readFileSync(args.path), args.filename || path.basename(args.path))
-      return { sent: true, to: args.to, file: args.filename || path.basename(args.path) }
+      {
+        const result = await sendVideoFile(page, args.to, args.path, args.filename || path.basename(args.path))
+        return { ...result, to: args.to, file: args.filename || path.basename(args.path) }
+      }
 
     case 'send-file':
       if (!args.to) throw new Error('Missing --to')
@@ -1182,7 +1186,7 @@ async function dispatch(cmd, args, page) {
         lastMsgTime: window.WechatyBro._lastMsgTime || 0,
         initState: !!window.WechatyBro.vars.initState,
         account: window.WechatyBro.getAccount()
-      })).then(data => ({ ...data, lifecycle: _lifecycle ? _lifecycle.state : 'page_lost/recovering' }))
+      })).then(data => ({ version: WECHAT_BRO_VERSION, ...data, lifecycle: _lifecycle ? _lifecycle.state : 'page_lost/recovering' }))
 
     case 'emojis':
     case 'supported-emojis':   // backward-compat alias

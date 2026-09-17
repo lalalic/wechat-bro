@@ -64,6 +64,7 @@ const os = require('os')
 const { spawn } = require('child_process')
 const WebSocket = require('ws')
 const { CodexResidentAdapter } = require('./codex-resident')
+const WECHAT_BRO_VERSION = require('../package.json').version
 
 const DATA_DIR = process.env.WECHAT_BRO_DATA_DIR || path.join(os.homedir(), '.wechat-bro')
 // The ONE user agents dir. The skill's bundled agents/ (inside the installed
@@ -1237,7 +1238,9 @@ async function runOrchestrator({ port = 9231 } = {}) {
       daemon.healthy = false
     }
     return {
+      version: WECHAT_BRO_VERSION,
       orchestrator: {
+        version: WECHAT_BRO_VERSION,
         healthy: !closed,
         startedAt: new Date(controls.startedAt).toISOString(),
         uptimeSeconds: Math.round((Date.now() - controls.startedAt) / 1000),

@@ -70,7 +70,7 @@ async function uploadMedia(page, to, fileBuffer, filename, mediaKind) {
     TotalLen: fileBuffer.length,
     StartPos: 0,
     DataLen: fileBuffer.length,
-    MediaType: 4,
+    MediaType: mediaKind === 'video' ? 2 : 4,
     FromUserName: params.fromUserName,
     ToUserName: params.toUserName,
     FileMd5: '',
@@ -130,17 +130,151 @@ async function sendImage(page, to, imageBuffer, filename) {
 
 
 /**
- * Send a native video message to a contact.
+ * Send a native video message through WeChat Web's own WebUploader.
+ * The generic curl uploader is unreliable for videos on current wx.qq.com:
+ * it can return an empty body even though the browser uploader works.
+ * This path waits for both MediaId assignment and server-side send success.
+ *
  * @param {import('puppeteer').Page} page
  * @param {string} to - name or UserName
- * @param {Buffer} videoBuffer - video file contents
+ * @param {string} filePath - local video path
  * @param {string} [filename='video.mp4']
- * @returns {Promise<boolean>}
+ * @param {number} [timeoutMs=60000]
+ * @returns {Promise<{sent:boolean,msgId:string,localId:string}>}
+ */
+async function sendVideoFile(page, to, filePath, filename, timeoutMs = 60000) {
+  if (!filename) filename = path.basename(filePath) || 'video.mp4'
+  if (!fs.existsSync(filePath)) throw new Error(`File not found: ${filePath}`)
+
+  let uploadPath = filePath
+  let tempDir = null
+  if (path.basename(filePath) !== filename) {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wx_video_'))
+    uploadPath = path.join(tempDir, filename)
+    fs.copyFileSync(filePath, uploadPath)
+  }
+
+  try {
+    const baseline = await page.evaluate((target) => {
+      const injector = angular.element(document).injector()
+      const chatFactory = injector.get('chatFactory')
+      const contactFactory = injector.get('contactFactory')
+      const rootScope = injector.get('$rootScope')
+      const userName = WechatyBro._requireUserName(target)
+      const contact = contactFactory.getContact(userName)
+      if (!contact) throw new Error(`contact not found: ${target}`)
+      contactFactory.setCurrentContact(contact)
+      chatFactory.setCurrentUserName(userName)
+      try { rootScope.$evalAsync() } catch (e) {}
+      const existing = (chatFactory.getChatMessage(userName) || []).map((m) => String(m.LocalID || m.ClientMsgId || m.MsgId || ''))
+      return { userName, existing }
+    }, to)
+
+    await new Promise(resolve => setTimeout(resolve, 150))
+    const input = await page.$('input[type=file]')
+    if (!input) throw new Error('WeChat Web file input not found')
+    await input.uploadFile(uploadPath)
+
+    const deadline = Date.now() + timeoutMs
+    let localId = null
+    while (Date.now() < deadline) {
+      const state = await page.evaluate(({ userName, existing, expectedName }) => {
+        const injector = angular.element(document).injector()
+        const chatFactory = injector.get('chatFactory')
+        const confFactory = injector.get('confFactory')
+        const success = confFactory.MSG_SEND_STATUS_SUCC
+        const fail = confFactory.MSG_SEND_STATUS_FAIL
+        const messages = chatFactory.getChatMessage(userName) || []
+        const msg = [...messages].reverse().find((m) => {
+          const id = String(m.LocalID || m.ClientMsgId || m.MsgId || '')
+          return m.MsgType === confFactory.MSGTYPE_VIDEO && !existing.includes(id) && (!expectedName || !m.FileName || m.FileName === expectedName)
+        })
+        if (!msg) return { found: false, success, fail }
+        return {
+          found: true,
+          localId: String(msg.LocalID || msg.ClientMsgId || ''),
+          msgId: String(msg.MsgId || ''),
+          mediaId: msg.MediaId || '',
+          status: msg.MMStatus,
+          success,
+          fail,
+        }
+      }, { ...baseline, expectedName: filename })
+
+      if (state.found) {
+        localId = state.localId
+        if (state.status === state.success && state.msgId) {
+          return { sent: true, msgId: state.msgId, localId }
+        }
+        if (state.mediaId) break
+        if (state.status === state.fail) throw new Error('WeChat rejected video upload before MediaId was assigned')
+      }
+      await new Promise(resolve => setTimeout(resolve, 250))
+    }
+
+    if (!localId) throw new Error('video upload timed out before WeChat created a local message')
+
+    const sendLocalId = await page.evaluate(({ userName, uploadLocalId }) => {
+      const injector = angular.element(document).injector()
+      const chatFactory = injector.get('chatFactory')
+      const confFactory = injector.get('confFactory')
+      const uploaded = (chatFactory.getChatMessage(userName) || []).find((m) => String(m.LocalID || m.ClientMsgId || '') === uploadLocalId)
+      if (!uploaded) throw new Error('uploaded video message disappeared before send')
+      if (!uploaded.MediaId) throw new Error('uploaded video has no MediaId')
+      const msg = chatFactory.createMessage({
+        ToUserName: userName,
+        MsgType: confFactory.MSGTYPE_VIDEO || 43,
+        MediaId: uploaded.MediaId,
+        Content: '',
+      })
+      chatFactory.appendMessage(msg)
+      chatFactory.postVideoMessage(msg)
+      return String(msg.LocalID || msg.ClientMsgId || '')
+    }, { userName: baseline.userName, uploadLocalId: localId })
+    if (!sendLocalId) throw new Error('failed to start video send')
+
+    while (Date.now() < deadline) {
+      const state = await page.evaluate(({ userName, sendLocalId }) => {
+        const injector = angular.element(document).injector()
+        const chatFactory = injector.get('chatFactory')
+        const confFactory = injector.get('confFactory')
+        const msg = (chatFactory.getChatMessage(userName) || []).find((m) => String(m.LocalID || m.ClientMsgId || '') === sendLocalId)
+        if (!msg) return { found: false }
+        return {
+          found: true,
+          status: msg.MMStatus,
+          success: confFactory.MSG_SEND_STATUS_SUCC,
+          fail: confFactory.MSG_SEND_STATUS_FAIL,
+          msgId: String(msg.MsgId || ''),
+        }
+      }, { userName: baseline.userName, sendLocalId })
+      if (state.found && state.status === state.success && state.msgId) {
+        return { sent: true, msgId: state.msgId, localId: sendLocalId }
+      }
+      if (state.found && state.status === state.fail) throw new Error('WeChat rejected video message')
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+    throw new Error('video send confirmation timed out')
+  } finally {
+    if (tempDir) {
+      try { fs.rmSync(tempDir, { recursive: true, force: true }) } catch {}
+    }
+  }
+}
+
+/**
+ * Buffer-compatible wrapper used by programmatic callers.
  */
 async function sendVideo(page, to, videoBuffer, filename) {
   if (!filename) filename = 'video.mp4'
-  const mediaId = await uploadMedia(page, to, videoBuffer, filename, 'video')
-  return page.evaluate((t, id) => WechatyBro.sendVideoWithMediaId(t, id), to, mediaId)
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wx_video_buffer_'))
+  const tempFile = path.join(tempDir, filename)
+  fs.writeFileSync(tempFile, videoBuffer)
+  try {
+    return await sendVideoFile(page, to, tempFile, filename)
+  } finally {
+    try { fs.rmSync(tempDir, { recursive: true, force: true }) } catch {}
+  }
 }
 
 /**
@@ -160,4 +294,4 @@ async function sendFile(page, to, fileBuffer, filename) {
   )
 }
 
-module.exports = { uploadMedia, sendImage, sendVideo, sendFile }
+module.exports = { uploadMedia, sendImage, sendVideo, sendVideoFile, sendFile }

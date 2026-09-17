@@ -892,26 +892,45 @@
      */
     sendVideoWithMediaId: function (to, mediaId) {
       var userName = WechatyBro._requireUserName(to)
-      try {
-        var injector = angular.element(document).injector()
-        var chatFactory = injector.get('chatFactory')
-        var confFactory = injector.get('confFactory')
+      return new Promise(function (resolve) {
+        try {
+          var injector = angular.element(document).injector()
+          var chatFactory = injector.get('chatFactory')
+          var confFactory = injector.get('confFactory')
 
-        var m = chatFactory.createMessage({
-          ToUserName: userName,
-          MsgType: confFactory.MSGTYPE_VIDEO || 43,
-          MediaId: mediaId,
-          Content: '',
-        })
-        chatFactory.appendMessage(m)
-        chatFactory.sendMessage(m)
-        WechatyBro._trackSentMsg(m)
-        log('sendVideoWithMediaId success to ' + to)
-        return true
-      } catch (e) {
-        log('sendVideoWithMediaId error:', e.message)
-        return false
-      }
+          var m = chatFactory.createMessage({
+            ToUserName: userName,
+            MsgType: confFactory.MSGTYPE_VIDEO || 43,
+            MediaId: mediaId,
+            Content: '',
+          })
+          chatFactory.appendMessage(m)
+          chatFactory.postVideoMessage(m)
+
+          var startedAt = Date.now()
+          var timer = setInterval(function () {
+            if (m.MMStatus === confFactory.MSG_SEND_STATUS_SUCC) {
+              clearInterval(timer)
+              WechatyBro._trackSentMsg(m)
+              log('sendVideoWithMediaId success to ' + to)
+              resolve({ sent: true, msgId: m.MsgId, localId: m.LocalID })
+              return
+            }
+            if (m.MMStatus === confFactory.MSG_SEND_STATUS_FAIL) {
+              clearInterval(timer)
+              resolve({ sent: false, error: 'WeChat rejected video message' })
+              return
+            }
+            if (Date.now() - startedAt >= 15000) {
+              clearInterval(timer)
+              resolve({ sent: false, error: 'video send confirmation timed out' })
+            }
+          }, 100)
+        } catch (e) {
+          log('sendVideoWithMediaId error:', e.message)
+          resolve({ sent: false, error: e.message })
+        }
+      })
     },
 
     /**

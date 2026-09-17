@@ -264,6 +264,8 @@ mismatch、active/queued task、pending wake 和 pending escalation。
 
 账号未登录时，`barcode` 会把当前登录二维码直接渲染到终端，适合 SSH 或系统浏览器未能打开二维码的情况。
 
+`status` 会返回当前 `wechat-bro` 版本；当 orchestrator 正在运行时，结果同时包含顶层 `version`、`orchestrator.version` 和 `daemon.version`，便于 agent 判断自己连接的是哪一版运行时。`send-video` 只有在微信服务端确认视频消息发送成功后才返回 `sent: true`，并返回服务端 `msgId`。
+
 agent action 常用 stdin JSON：
 
 ```bash
