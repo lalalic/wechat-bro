@@ -271,6 +271,17 @@ async function main() {
   ok(emojis.includes('[微笑]'), 'contains [微笑]')
   ok(emojis.includes('[Smile]'), 'contains [Smile]')
 
+  const videoApi = await page.evaluate(() => {
+    const injector = angular.element(document).injector()
+    const confFactory = injector.get('confFactory')
+    return {
+      hasSendVideo: typeof window.WechatyBro.sendVideoWithMediaId === 'function',
+      msgTypeVideo: confFactory.MSGTYPE_VIDEO,
+    }
+  })
+  ok(videoApi.hasSendVideo, 'sendVideoWithMediaId() is exposed')
+  ok(videoApi.msgTypeVideo === 43, `MSGTYPE_VIDEO is 43 (got ${videoApi.msgTypeVideo})`)
+
   // getContact — pick a contact from the list
   const firstContact = await page.evaluate(() => {
     const list = window.WechatyBro.contactList()

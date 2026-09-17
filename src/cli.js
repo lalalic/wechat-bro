@@ -25,6 +25,7 @@
  *   get-contact       → {name, isRoomContact, ...}   (args: --name <contact|room>)
  *   send-text         → {sent: true, to}              (args: --to, --content)
  *   send-image        → {sent: true, to, file}        (args: --to, --path, [--filename])
+ *   send-video        → {sent: true, to, file}        (args: --to, --path, [--filename])
  *   send-file         → {sent: true, to, file}        (args: --to, --path, --filename)
  *   send-voice        → {sent, to, transcription}     (args: --to, --path)
  *   status            → orchestrator watch/runtime state + daemon health
@@ -48,7 +49,7 @@ const qrcode = require('qrcode-terminal')
 // clean JSON lines for agents.
 const WebSocket = require('ws')
 const { transcribeVoice, transcribeFile } = require('./transcribe')
-const { sendImage, sendFile } = require('./upload')
+const { sendImage, sendVideo, sendFile } = require('./upload')
 const wsServer = require('./ws-server')
 const { DaemonLifecycle, isAuthCommand } = require('./daemon-lifecycle')
 
@@ -649,6 +650,7 @@ Commands:
   resident <contact-or-room-name> <on|off>
                                Runtime-only Codex app-server resident mode.
   send-image --to <name> --path <file> [--filename <name>]
+  send-video --to <name> --path <file> [--filename <name>]
   send-file  --to <name> --path <file> --filename <name>
   send-voice --to <name> --path <file>   (transcribe + send as text)
   barcode                      Render the current login QR in this terminal
@@ -1142,6 +1144,13 @@ async function dispatch(cmd, args, page) {
       if (!args.path) throw new Error('Missing --path (local file path)')
       if (!fs.existsSync(args.path)) throw new Error(`File not found: ${args.path}`)
       await sendImage(page, args.to, fs.readFileSync(args.path), args.filename || path.basename(args.path))
+      return { sent: true, to: args.to, file: args.filename || path.basename(args.path) }
+
+    case 'send-video':
+      if (!args.to) throw new Error('Missing --to')
+      if (!args.path) throw new Error('Missing --path (local video file)')
+      if (!fs.existsSync(args.path)) throw new Error(`File not found: ${args.path}`)
+      await sendVideo(page, args.to, fs.readFileSync(args.path), args.filename || path.basename(args.path))
       return { sent: true, to: args.to, file: args.filename || path.basename(args.path) }
 
     case 'send-file':

@@ -210,6 +210,7 @@ contact
 | 列出群成员 | `room-members` |
 | 发送文本 | `send-text` |
 | 发送本地图片 | `send-image` |
+| 发送本地视频（原生视频消息） | `send-video` |
 | 发送任意文件 | `send-file` |
 | 转写本地音频并发送文本 | `send-voice` |
 | 在终端显示登录二维码 | `barcode` |
@@ -269,6 +270,8 @@ agent action 常用 stdin JSON：
 echo '{"cmd":"send-text","to":"Alice","content":"hello"}' | npx wechat-bro
 
 echo '{"cmd":"send-image","to":"Alice","path":"/tmp/photo.jpg"}' | npx wechat-bro
+
+echo '{"cmd":"send-video","to":"Alice","path":"/tmp/demo.mp4"}' | npx wechat-bro
 
 echo '{"cmd":"send-file","to":"Alice","path":"/tmp/report.pdf","filename":"report.pdf"}' | npx wechat-bro
 ```

@@ -47,6 +47,7 @@ Context-only task 不发送任何 WeChat 回复，最后返回 ignored。
 echo '{"cmd":"send-text","to":"<群名>","content":"@\"<成员名>\" <回复>"}' | npx wechat-bro
 
 echo '{"cmd":"send-image","to":"<群名>","path":"<本地文件>"}' | npx wechat-bro
+echo '{"cmd":"send-video","to":"<群名>","path":"<本地视频.mp4>"}' | npx wechat-bro
 
 echo '{"cmd":"send-file","to":"<群名>","path":"<本地文件>","filename":"<展示名>"}' | npx wechat-bro
 ```

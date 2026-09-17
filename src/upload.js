@@ -2,8 +2,9 @@
  * WeChat Media Upload — Node.js-side upload via curl + inject-side send
  *
  * Usage:
- *   const { sendImage, sendFile } = require('./upload')
+ *   const { sendImage, sendVideo, sendFile } = require('./upload')
  *   await sendImage(page, 'contactName', fs.readFileSync('photo.jpg'), 'photo.jpg')
+ *   await sendVideo(page, 'contactName', fs.readFileSync('clip.mp4'), 'clip.mp4')
  *   await sendFile(page, 'contactName', Buffer.from('hello'), 'note.txt')
  */
 
@@ -46,7 +47,7 @@ function isImage(mimeType) {
  * Upload a file to file.wx.qq.com via curl (IPv6).
  * Returns the MediaId string, or throws on failure.
  */
-async function uploadMedia(page, to, fileBuffer, filename) {
+async function uploadMedia(page, to, fileBuffer, filename, mediaKind) {
   const params = await page.evaluate((t) => WechatyBro.getUploadParams(t), to)
   if (!params) throw new Error('getUploadParams returned null — is the contact valid?')
 
@@ -54,7 +55,7 @@ async function uploadMedia(page, to, fileBuffer, filename) {
   const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ')
 
   const mimeType = guessMime(filename)
-  const mediaType = isImage(mimeType) ? 'pic' : 'doc'
+  const mediaType = mediaKind || (isImage(mimeType) ? 'pic' : 'doc')
   const clientMediaId = Date.now().toString() + Math.random().toString(36).substring(2, 8)
 
   const uploadReq = JSON.stringify({
@@ -123,8 +124,23 @@ async function uploadMedia(page, to, fileBuffer, filename) {
  */
 async function sendImage(page, to, imageBuffer, filename) {
   if (!filename) filename = 'image.png'
-  const mediaId = await uploadMedia(page, to, imageBuffer, filename)
+  const mediaId = await uploadMedia(page, to, imageBuffer, filename, 'pic')
   return page.evaluate((t, id) => WechatyBro.sendImageWithMediaId(t, id), to, mediaId)
+}
+
+
+/**
+ * Send a native video message to a contact.
+ * @param {import('puppeteer').Page} page
+ * @param {string} to - name or UserName
+ * @param {Buffer} videoBuffer - video file contents
+ * @param {string} [filename='video.mp4']
+ * @returns {Promise<boolean>}
+ */
+async function sendVideo(page, to, videoBuffer, filename) {
+  if (!filename) filename = 'video.mp4'
+  const mediaId = await uploadMedia(page, to, videoBuffer, filename, 'video')
+  return page.evaluate((t, id) => WechatyBro.sendVideoWithMediaId(t, id), to, mediaId)
 }
 
 /**
@@ -137,11 +153,11 @@ async function sendImage(page, to, imageBuffer, filename) {
  */
 async function sendFile(page, to, fileBuffer, filename) {
   if (!filename) throw new Error('filename is required for sendFile')
-  const mediaId = await uploadMedia(page, to, fileBuffer, filename)
+  const mediaId = await uploadMedia(page, to, fileBuffer, filename, 'doc')
   return page.evaluate(
     (t, id, fn, sz) => WechatyBro.sendFileWithMediaId(t, id, fn, sz),
     to, mediaId, filename, fileBuffer.length
   )
 }
 
-module.exports = { sendImage, sendFile }
+module.exports = { uploadMedia, sendImage, sendVideo, sendFile }

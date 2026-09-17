@@ -24,7 +24,7 @@ AI multi-agent interface for WeChat Web. Injects into [wx.qq.com](https://wx.qq.
 | `src/wechat-bro.js` | Browser-side script. Injects `window.WechatyBro` into wx.qq.com. |
 | `src/cli.js` | WebSocket server (port 9231) + stdin interface for AI agents. |
 | `src/ws-server.js` | WebSocket server module with multi-agent broadcast. |
-| `src/upload.js` | Media upload via `curl -6`. Exports `sendImage()`, `sendFile()`. |
+| `src/upload.js` | Media upload via `curl -6`. Exports `sendImage()`, `sendVideo()`, `sendFile()`. |
 | `src/transcribe.js` | Voice transcription via Whisper STT. |
 | `test/test-inject.js` | 102 integration tests with real Chrome + WeChat account. |
 | `SKILL.md` | Agent skill documentation (commands, protocol, events). |
@@ -87,7 +87,7 @@ is stripped. Text messages keep the raw `Content` field.
 ```js
 const puppeteer = require('puppeteer')
 const fs = require('fs')
-const { sendImage, sendFile } = require('./src/upload')
+const { sendImage, sendVideo, sendFile } = require('./src/upload')
 
 const INJECT = fs.readFileSync('./src/wechat-bro.js', 'utf-8')
 
@@ -123,6 +123,10 @@ await page.evaluate(() => WechatyBro.send('Alice', 'Hello! [Smile][Rose]'))
 // Send image (upload happens in Node.js, send happens in browser)
 const imgBuf = fs.readFileSync('photo.jpg')
 await sendImage(page, 'Alice', imgBuf, 'photo.jpg')
+
+// Send native video
+const videoBuf = fs.readFileSync('clip.mp4')
+await sendVideo(page, 'Alice', videoBuf, 'clip.mp4')
 
 // Send file
 const pdfBuf = fs.readFileSync('report.pdf')
@@ -630,12 +634,17 @@ Supported: `**bold**`, `*italic*`, `***bold italic***`, `` `monospace` ``, `~~st
 ### Media Upload (Node.js side)
 
 ```js
-const { sendImage, sendFile } = require('./src/upload')
+const { sendImage, sendVideo, sendFile } = require('./src/upload')
 ```
 
 **`sendImage(page, to, buffer, filename)`** — Upload and send an image.
 ```js
 await sendImage(page, 'alice', fs.readFileSync('photo.jpg'), 'photo.jpg')
+```
+
+**`sendVideo(page, to, buffer, filename)`** — Upload and send a native video message.
+```js
+await sendVideo(page, 'alice', fs.readFileSync('clip.mp4'), 'clip.mp4')
 ```
 
 **`sendFile(page, to, buffer, filename)`** — Upload and send a file.
@@ -669,6 +678,8 @@ const params = await page.evaluate(() => WechatyBro.getUploadParams('alice'))
 Use these params to build the multipart upload request in any language. The upload endpoint requires IPv6 (`file.wx.qq.com` hangs on IPv4). The `uploadmediarequest` form field must contain a JSON object with `BaseRequest` at the top level (NOT double-wrapped).
 
 **`sendImageWithMediaId(to, mediaId)`** — Send a pre-uploaded image (browser-side).
+
+**`sendVideoWithMediaId(to, mediaId)`** — Send a pre-uploaded native video message (browser-side).
 
 **`sendFileWithMediaId(to, mediaId, filename, fileSize)`** — Send a pre-uploaded file (browser-side).
 
