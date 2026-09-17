@@ -139,7 +139,7 @@ async function sendImage(page, to, imageBuffer, filename) {
  * @param {string} to - name or UserName
  * @param {string} filePath - local video path
  * @param {string} [filename='video.mp4']
- * @param {number} [timeoutMs=60000]
+ * @param {number} [timeoutMs=60000] - fail only after this long without upload progress
  * @returns {Promise<{sent:boolean,msgId:string,localId:string}>}
  */
 async function sendVideoFile(page, to, filePath, filename, timeoutMs = 60000) {
@@ -175,9 +175,10 @@ async function sendVideoFile(page, to, filePath, filename, timeoutMs = 60000) {
     if (!input) throw new Error('WeChat Web file input not found')
     await input.uploadFile(uploadPath)
 
-    const deadline = Date.now() + timeoutMs
     let localId = null
-    while (Date.now() < deadline) {
+    let lastProgress = -1
+    let lastProgressAt = Date.now()
+    while (Date.now() - lastProgressAt < timeoutMs) {
       const state = await page.evaluate(({ userName, existing, expectedName }) => {
         const injector = angular.element(document).injector()
         const chatFactory = injector.get('chatFactory')
@@ -196,6 +197,7 @@ async function sendVideoFile(page, to, filePath, filename, timeoutMs = 60000) {
           msgId: String(msg.MsgId || ''),
           mediaId: msg.MediaId || '',
           status: msg.MMStatus,
+          progress: Number(msg.MMUploadProgress || 0),
           success,
           fail,
         }
@@ -203,6 +205,10 @@ async function sendVideoFile(page, to, filePath, filename, timeoutMs = 60000) {
 
       if (state.found) {
         localId = state.localId
+        if (state.progress > lastProgress) {
+          lastProgress = state.progress
+          lastProgressAt = Date.now()
+        }
         if (state.status === state.success && state.msgId) {
           return { sent: true, msgId: state.msgId, localId }
         }
@@ -212,7 +218,8 @@ async function sendVideoFile(page, to, filePath, filename, timeoutMs = 60000) {
       await new Promise(resolve => setTimeout(resolve, 250))
     }
 
-    if (!localId) throw new Error('video upload timed out before WeChat created a local message')
+    if (!localId) throw new Error('video upload stalled before WeChat created a local message')
+    if (Date.now() - lastProgressAt >= timeoutMs) throw new Error(`video upload stalled at ${lastProgress}%`)
 
     const sendLocalId = await page.evaluate(({ userName, uploadLocalId }) => {
       const injector = angular.element(document).injector()
@@ -233,7 +240,8 @@ async function sendVideoFile(page, to, filePath, filename, timeoutMs = 60000) {
     }, { userName: baseline.userName, uploadLocalId: localId })
     if (!sendLocalId) throw new Error('failed to start video send')
 
-    while (Date.now() < deadline) {
+    const sendDeadline = Date.now() + timeoutMs
+    while (Date.now() < sendDeadline) {
       const state = await page.evaluate(({ userName, sendLocalId }) => {
         const injector = angular.element(document).injector()
         const chatFactory = injector.get('chatFactory')
