@@ -235,6 +235,9 @@ async function sendVideoFile(page, to, filePath, filename, timeoutMs = 60000) {
         Content: '',
       })
       chatFactory.appendMessage(msg)
+      // This path creates the message itself; register it before WeChat can
+      // echo a server-side MsgId different from the local one.
+      WechatyBro._trackSentMsg(msg)
       chatFactory.postVideoMessage(msg)
       return String(msg.LocalID || msg.ClientMsgId || '')
     }, { userName: baseline.userName, uploadLocalId: localId })
