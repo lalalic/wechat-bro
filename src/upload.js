@@ -173,6 +173,12 @@ async function sendVideoFile(page, to, filePath, filename, timeoutMs = 60000) {
     await new Promise(resolve => setTimeout(resolve, 150))
     const input = await page.$('input[type=file]')
     if (!input) throw new Error('WeChat Web file input not found')
+    // WebUploader can append its local upload message before sendVideoFile
+    // can discover its LocalID. Reserve only this active self-video upload;
+    // the marker is consumed by its early Angular echo or cleared below.
+    await page.evaluate(({ userName, filename }) => {
+      WechatyBro._trackPendingSentMsg({ ToUserName: userName, MsgType: 43, FileName: filename })
+    }, { userName: baseline.userName, filename })
     await input.uploadFile(uploadPath)
 
     let localId = null
@@ -234,10 +240,13 @@ async function sendVideoFile(page, to, filePath, filename, timeoutMs = 60000) {
         MediaId: uploaded.MediaId,
         Content: '',
       })
-      chatFactory.appendMessage(msg)
       // This path creates the message itself; register it before WeChat can
-      // echo a server-side MsgId different from the local one.
+      // emit Angular's synchronous message:add:success event. The first
+      // echo identifies the message by LocalID; the eventual send response
+      // may replace that with a different server MsgId.
       WechatyBro._trackSentMsg(msg)
+      WechatyBro._clearPendingSentMsg(msg)
+      chatFactory.appendMessage(msg)
       chatFactory.postVideoMessage(msg)
       return String(msg.LocalID || msg.ClientMsgId || '')
     }, { userName: baseline.userName, uploadLocalId: localId })

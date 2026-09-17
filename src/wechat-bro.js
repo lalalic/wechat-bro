@@ -258,6 +258,7 @@
     // Media echoes can have a different server MsgId than the local send.
     _sentMsgIds: {},
     _sentMessages: [],
+    _pendingSentMessages: [],
     _SENT_MSG_TTL: 60 * 60 * 1000,  // 1 hour
     _SENT_MEDIA_TTL: 5 * 60 * 1000,
     _SENT_MSG_MAX: 1000,
@@ -283,6 +284,26 @@
       }
       var messageCutoff = now - WechatyBro._SENT_MEDIA_TTL
       WechatyBro._sentMessages = WechatyBro._sentMessages.filter(function (entry) { return entry.at >= messageCutoff })
+      WechatyBro._pendingSentMessages = WechatyBro._pendingSentMessages.filter(function (entry) { return entry.at >= messageCutoff })
+    },
+
+    _trackPendingSentMsg: function (msg) {
+      if (!msg) return
+      WechatyBro._pendingSentMessages.push({
+        at: Date.now(), to: msg.ToUserName, type: msg.MsgType,
+        fileName: msg.FileName || '',
+      })
+    },
+
+    _clearPendingSentMsg: function (msg) {
+      if (!msg) return
+      for (var i = WechatyBro._pendingSentMessages.length - 1; i >= 0; i--) {
+        var entry = WechatyBro._pendingSentMessages[i]
+        if (entry.to === msg.ToUserName && entry.type === msg.MsgType) {
+          WechatyBro._pendingSentMessages.splice(i, 1)
+          return
+        }
+      }
     },
 
     _isSentByUs: function (msgId) {
@@ -307,9 +328,19 @@
           (!entry.fileSize || !msg.FileSize || entry.fileSize === msg.FileSize)) score = 2
         if (score > matchScore) { match = i; matchScore = score }
       }
-      if (match < 0 || !matchScore) return false
-      WechatyBro._sentMessages.splice(match, 1)
-      return true
+      if (match >= 0 && matchScore) {
+        WechatyBro._sentMessages.splice(match, 1)
+        return true
+      }
+      for (var pi = 0; pi < WechatyBro._pendingSentMessages.length; pi++) {
+        var pending = WechatyBro._pendingSentMessages[pi]
+        if (now - pending.at <= WechatyBro._SENT_MEDIA_TTL && pending.to === msg.ToUserName && pending.type === msg.MsgType &&
+          (!pending.fileName || !msg.FileName || pending.fileName === msg.FileName)) {
+          WechatyBro._pendingSentMessages.splice(pi, 1)
+          return true
+        }
+      }
+      return false
     },
 
     _shouldEmitMessage: function (msg) {
@@ -913,8 +944,8 @@
           MediaId: mediaId,
           Content: '',
         })
-        chatFactory.appendMessage(m)
         WechatyBro._trackSentMsg(m)
+        chatFactory.appendMessage(m)
         chatFactory.sendMessage(m)
         log('sendImageWithMediaId success to ' + to)
         return true
@@ -944,8 +975,8 @@
             MediaId: mediaId,
             Content: '',
           })
-          chatFactory.appendMessage(m)
           WechatyBro._trackSentMsg(m)
+          chatFactory.appendMessage(m)
           chatFactory.postVideoMessage(m)
 
           var startedAt = Date.now()
@@ -998,8 +1029,8 @@
           FileSize: fileSize,
           Signature: '',
         })
-        chatFactory.appendMessage(m)
         WechatyBro._trackSentMsg(m)
+        chatFactory.appendMessage(m)
         chatFactory.sendMessage(m)
         log('sendFileWithMediaId success to ' + to + ': ' + filename)
         return true
@@ -1685,6 +1716,7 @@
     WechatyBro._userNameToName = {}
     WechatyBro._sentMsgIds = {}
     WechatyBro._sentMessages = []
+    WechatyBro._pendingSentMessages = []
     if (WechatyBro.vars.loginConfirmTimer) {
       clearTimeout(WechatyBro.vars.loginConfirmTimer)
       WechatyBro.vars.loginConfirmTimer = null

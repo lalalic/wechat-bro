@@ -31,6 +31,18 @@ assert.strictEqual(match(
   { MsgType: 43, FromUserName: '@self', ToUserName: '@alice', MediaId: 'video-media', MsgId: 'server-video' },
 ), false, 'changed video MsgId is suppressed by MediaId')
 assert.strictEqual(match(
+  { MsgType: 43, ToUserName: 'filehelper', LocalID: '17896200892540129', MsgId: '370373787320504921' },
+  { MsgType: 43, FromUserName: '@self', ToUserName: 'filehelper', MsgId: '17896200892540129' },
+), false, 'video echo emitted during append is suppressed by LocalID before server MsgId')
+bridge._sentMsgIds = {}
+bridge._sentMessages = []
+bridge._pendingSentMessages = []
+bridge._trackPendingSentMsg({ ToUserName: 'filehelper', MsgType: 43, FileName: 'neo-build-log-001-wechat.mp4' })
+assert.strictEqual(bridge._shouldEmitMessage({
+  MsgType: 43, FromUserName: '@self', ToUserName: 'filehelper', MsgId: '17896212286300717',
+}), false, 'WebUploader local video echo is suppressed while its upload is pending')
+assert.strictEqual(bridge._pendingSentMessages.length, 0, 'pending upload marker is consumed by its local echo')
+assert.strictEqual(match(
   { MsgType: 49, ToUserName: '@alice', FileName: 'report.pdf', FileSize: 1234, MsgId: 'local-file' },
   { MsgType: 49, FromUserName: '@self', ToUserName: '@alice', FileName: 'report.pdf', FileSize: 1234, MsgId: 'server-file' },
 ), false, 'changed file MsgId is suppressed by filename/filesize')
