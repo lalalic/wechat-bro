@@ -491,7 +491,7 @@ async function sendCommandViaWs(ws, request) {
   })
 
   // Safety timeout
-  const timeoutMs = request.cmd === 'send-video' ? 90000 : 30000
+  const timeoutMs = request.cmd === 'send-video' ? 1800000 : 30000
   setTimeout(() => {
     process.stdout.write(JSON.stringify({ ok: false, error: 'timeout', id }) + '\n')
     ws.close()
@@ -578,7 +578,8 @@ async function runClientMode(ws) {
       req.id = id
 
       const response = await new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error('timeout')), 30000)
+        const timeoutMs = req.cmd === 'send-video' ? 1800000 : 30000
+        const timeout = setTimeout(() => reject(new Error('timeout')), timeoutMs)
         pending.set(id, { resolve, reject, timeout })
         ws.send(JSON.stringify(req))
       })
