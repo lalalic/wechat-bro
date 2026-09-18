@@ -46,7 +46,7 @@ function isImage(mimeType) {
  * Upload a file to file.wx.qq.com via curl (IPv6).
  * Returns the MediaId string, or throws on failure.
  */
-async function uploadMedia(page, to, fileBuffer, filename) {
+async function uploadMedia(page, to, fileBuffer, filename, kind) {
   const params = await page.evaluate((t) => WechatyBro.getUploadParams(t), to)
   if (!params) throw new Error('getUploadParams returned null — is the contact valid?')
 
@@ -54,7 +54,7 @@ async function uploadMedia(page, to, fileBuffer, filename) {
   const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ')
 
   const mimeType = guessMime(filename)
-  const mediaType = isImage(mimeType) ? 'pic' : 'doc'
+  const mediaType = kind === 'video' ? 'video' : (isImage(mimeType) ? 'pic' : 'doc')
   const clientMediaId = Date.now().toString() + Math.random().toString(36).substring(2, 8)
 
   const uploadReq = JSON.stringify({
@@ -69,7 +69,7 @@ async function uploadMedia(page, to, fileBuffer, filename) {
     TotalLen: fileBuffer.length,
     StartPos: 0,
     DataLen: fileBuffer.length,
-    MediaType: 4,
+    MediaType: kind === 'video' ? 2 : 4,
     FromUserName: params.fromUserName,
     ToUserName: params.toUserName,
     FileMd5: '',
@@ -144,4 +144,10 @@ async function sendFile(page, to, fileBuffer, filename) {
   )
 }
 
-module.exports = { sendImage, sendFile }
+async function sendVideo(page, to, fileBuffer, filename) {
+  if (!filename) filename = 'video.mp4'
+  const mediaId = await uploadMedia(page, to, fileBuffer, filename, 'video')
+  return page.evaluate((t, id) => WechatyBro.sendVideoWithMediaId(t, id), to, mediaId)
+}
+
+module.exports = { sendImage, sendFile, sendVideo }

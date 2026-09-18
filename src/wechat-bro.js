@@ -892,6 +892,29 @@
      * @param {number} fileSize - file size in bytes
      * @returns {boolean}
      */
+    sendVideoWithMediaId: function (to, mediaId) {
+      var userName = WechatyBro._requireUserName(to)
+      try {
+        var injector = angular.element(document).injector()
+        var chatFactory = injector.get('chatFactory')
+        var confFactory = injector.get('confFactory')
+        var m = chatFactory.createMessage({
+          ToUserName: userName,
+          MsgType: confFactory.MSGTYPE_VIDEO,
+          MediaId: mediaId,
+          Content: '',
+        })
+        chatFactory.appendMessage(m)
+        chatFactory.postVideoMessage(m)
+        WechatyBro._trackSentMsg(m)
+        log('sendVideoWithMediaId success to ' + to)
+        return true
+      } catch (e) {
+        log('sendVideoWithMediaId error:', e.message)
+        return false
+      }
+    },
+
     sendFileWithMediaId: function (to, mediaId, filename, fileSize) {
       var userName = WechatyBro._requireUserName(to)
       try {

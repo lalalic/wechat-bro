@@ -13,7 +13,7 @@ const STATES = Object.freeze({
 
 const AUTH_COMMANDS = new Set([
   'contacts', 'rooms', 'room-members', 'get-contact',
-  'send-text', 'send', 'send-image', 'send-file', 'send-voice',
+  'send-text', 'send', 'send-image', 'send-video', 'send-file', 'send-voice',
   'emojis', 'supported-emojis', 'config',
 ])
 

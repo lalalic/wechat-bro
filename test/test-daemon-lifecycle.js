@@ -97,6 +97,7 @@ async function run() {
   console.log('  ok - bounded recovery/backoff')
 
   assert.strictEqual(isAuthCommand('send-text'), true)
+  assert.strictEqual(isAuthCommand('send-video'), true)
   assert.strictEqual(isAuthCommand('status'), false)
   const child = new EventEmitter()
   child.stderr = new EventEmitter()
