@@ -255,28 +255,99 @@
     _nameToUserNames: {},  // '李诚' → ['@hash...']   (>1 = ambiguous)
     _userNameToName: {},   // '@hash...' → '李诚'
 
-    // Sent message tracking for AI detection (MsgId → timestamp)
+    // Media echoes can have a different server MsgId than the local send.
     _sentMsgIds: {},
+    _sentMessages: [],
+    _pendingSentMessages: [],
     _SENT_MSG_TTL: 60 * 60 * 1000,  // 1 hour
+    _SENT_MEDIA_TTL: 5 * 60 * 1000,
     _SENT_MSG_MAX: 1000,
 
     _trackSentMsg: function (msg) {
       var id = msg && (msg.MsgId || msg.ClientMsgId || msg.MsgSvrID)
-      if (!id) return
-      WechatyBro._sentMsgIds[id] = Date.now()
+      var now = Date.now()
+      if (id) WechatyBro._sentMsgIds[id] = now
+      if (msg && msg.MsgType !== 1) {
+        WechatyBro._sentMessages.push({
+          at: now, to: msg.ToUserName, type: msg.MsgType,
+          mediaId: msg.MediaId || '', fileName: msg.FileName || '', fileSize: msg.FileSize || 0,
+          ids: [msg.MsgId, msg.ClientMsgId, msg.MsgSvrID, msg.LocalID].filter(Boolean),
+        })
+      }
       // Purge if over limit
       var keys = Object.keys(WechatyBro._sentMsgIds)
       if (keys.length > WechatyBro._SENT_MSG_MAX) {
-        var cutoff = Date.now() - WechatyBro._SENT_MSG_TTL
+        var cutoff = now - WechatyBro._SENT_MSG_TTL
         keys.forEach(function (k) {
           if (WechatyBro._sentMsgIds[k] < cutoff) delete WechatyBro._sentMsgIds[k]
         })
+      }
+      var messageCutoff = now - WechatyBro._SENT_MEDIA_TTL
+      WechatyBro._sentMessages = WechatyBro._sentMessages.filter(function (entry) { return entry.at >= messageCutoff })
+      WechatyBro._pendingSentMessages = WechatyBro._pendingSentMessages.filter(function (entry) { return entry.at >= messageCutoff })
+    },
+
+    _trackPendingSentMsg: function (msg) {
+      if (!msg) return
+      WechatyBro._pendingSentMessages.push({
+        at: Date.now(), to: msg.ToUserName, type: msg.MsgType,
+        fileName: msg.FileName || '',
+      })
+    },
+
+    _clearPendingSentMsg: function (msg) {
+      if (!msg) return
+      for (var i = WechatyBro._pendingSentMessages.length - 1; i >= 0; i--) {
+        var entry = WechatyBro._pendingSentMessages[i]
+        if (entry.to === msg.ToUserName && entry.type === msg.MsgType) {
+          WechatyBro._pendingSentMessages.splice(i, 1)
+          return
+        }
       }
     },
 
     _isSentByUs: function (msgId) {
       if (!msgId) return false
       return !!WechatyBro._sentMsgIds[msgId]
+    },
+
+    _isSentByUsMessage: function (msg) {
+      if (!msg || msg.MsgType === 1) return false
+      var self = getUserName()
+      if (!self || msg.FromUserName !== self) return false
+      var now = Date.now()
+      var match = -1
+      var matchScore = 0
+      for (var i = 0; i < WechatyBro._sentMessages.length; i++) {
+        var entry = WechatyBro._sentMessages[i]
+        if (now - entry.at > WechatyBro._SENT_MEDIA_TTL || entry.to !== msg.ToUserName || entry.type !== msg.MsgType) continue
+        var score = 0
+        if (entry.ids.indexOf(msg.MsgId) !== -1 || entry.ids.indexOf(msg.ClientMsgId) !== -1 || entry.ids.indexOf(msg.MsgSvrID) !== -1 || entry.ids.indexOf(msg.LocalID) !== -1) score = 4
+        else if (entry.mediaId && msg.MediaId && entry.mediaId === msg.MediaId) score = 3
+        else if (entry.fileName && msg.FileName && entry.fileName === msg.FileName &&
+          (!entry.fileSize || !msg.FileSize || entry.fileSize === msg.FileSize)) score = 2
+        if (score > matchScore) { match = i; matchScore = score }
+      }
+      if (match >= 0 && matchScore) {
+        WechatyBro._sentMessages.splice(match, 1)
+        return true
+      }
+      for (var pi = 0; pi < WechatyBro._pendingSentMessages.length; pi++) {
+        var pending = WechatyBro._pendingSentMessages[pi]
+        if (now - pending.at <= WechatyBro._SENT_MEDIA_TTL && pending.to === msg.ToUserName && pending.type === msg.MsgType &&
+          (!pending.fileName || !msg.FileName || pending.fileName === msg.FileName)) {
+          WechatyBro._pendingSentMessages.splice(pi, 1)
+          return true
+        }
+      }
+      return false
+    },
+
+    _shouldEmitMessage: function (msg) {
+      if (!msg || msg.MsgType === 10000 || msg.MsgType === 10002) return false
+      if (msg.MsgType !== 1 && WechatyBro._isSentByUsMessage(msg)) return false
+      if (msg.MsgType === 49) return false
+      return true
     },
 
     // Dedup: track seen MsgIds to suppress replayed messages (e.g. after relogin)
@@ -873,9 +944,9 @@
           MediaId: mediaId,
           Content: '',
         })
+        WechatyBro._trackSentMsg(m)
         chatFactory.appendMessage(m)
         chatFactory.sendMessage(m)
-        WechatyBro._trackSentMsg(m)
         log('sendImageWithMediaId success to ' + to)
         return true
       } catch (e) {
@@ -904,6 +975,7 @@
             MediaId: mediaId,
             Content: '',
           })
+          WechatyBro._trackSentMsg(m)
           chatFactory.appendMessage(m)
           chatFactory.postVideoMessage(m)
 
@@ -911,7 +983,6 @@
           var timer = setInterval(function () {
             if (m.MMStatus === confFactory.MSG_SEND_STATUS_SUCC) {
               clearInterval(timer)
-              WechatyBro._trackSentMsg(m)
               log('sendVideoWithMediaId success to ' + to)
               resolve({ sent: true, msgId: m.MsgId, localId: m.LocalID })
               return
@@ -958,9 +1029,9 @@
           FileSize: fileSize,
           Signature: '',
         })
+        WechatyBro._trackSentMsg(m)
         chatFactory.appendMessage(m)
         chatFactory.sendMessage(m)
-        WechatyBro._trackSentMsg(m)
         log('sendFileWithMediaId success to ' + to + ': ' + filename)
         return true
       } catch (e) {
@@ -1644,6 +1715,8 @@
     WechatyBro._nameToUserNames = {}
     WechatyBro._userNameToName = {}
     WechatyBro._sentMsgIds = {}
+    WechatyBro._sentMessages = []
+    WechatyBro._pendingSentMessages = []
     if (WechatyBro.vars.loginConfirmTimer) {
       clearTimeout(WechatyBro.vars.loginConfirmTimer)
       WechatyBro.vars.loginConfirmTimer = null
@@ -1700,11 +1773,6 @@
         })
       }
     }
-    // Suppress events for messages we sent ourselves
-    if (WechatyBro._isSentByUs(data.MsgId)) {
-      delete WechatyBro._sentMsgIds[data.MsgId] // clean up
-      return
-    }
     if (data.MsgType === 1 && data.Content && data.Content.indexOf(AI_WATERMARK) !== -1) {
       return
     }
@@ -1724,9 +1792,9 @@
     }
 
     var off = rootScope.$on('message:add:success', function (event, data) {
-      // Suppress app (49), system (10000) and recalled (10002) messages —
-      // XML wire noise agents never need: no download, no event.
-      if (data.MsgType === 49 || data.MsgType === 10000 || data.MsgType === 10002) return
+      // Suppress ordinary app/system/recalled wire noise and tracked AI media
+      // before downloads or event emission can reach Node.
+      if (!WechatyBro._shouldEmitMessage(data)) return
       data.from = WechatyBro._eventContactName(data.FromUserName)
       data.to = WechatyBro._eventContactName(data.ToUserName)
 

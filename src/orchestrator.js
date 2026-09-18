@@ -1346,7 +1346,6 @@ async function runOrchestrator({ port = 9231 } = {}) {
     // own timestamp).
     const msgTs = data.ts ? (data.ts < 1e12 ? data.ts * 1000 : data.ts) : msg.ts
     if (msgTs && msgTs < startedAt) return log('  dropped: replayed (older than startup)')
-
     // Account owner's messages: → filehelper is ALWAYS answered in assistant
     // mode (a pending escalation routes the reply into that contact's
     // session). → any other watched chat: assistant-managed contacts require
