@@ -71,38 +71,13 @@ const LOGIN_TIMEOUT = 300_000
 
 // ── Chrome detection ──────────────────────────────────────────────────────
 async function findChrome() {
-  const { platform } = process
-  const isWin = platform === 'win32'
-  const candidates = [
-    // macOS
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    '/Applications/Chromium.app/Contents/MacOS/Chromium',
-    // Linux
-    '/usr/bin/google-chrome', '/usr/bin/chromium-browser',
-    '/usr/bin/google-chrome-stable',
-    // Windows
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-    path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'Application', 'chrome.exe'),
-  ]
-  for (const p of candidates) if (fs.existsSync(p)) return p
-  try {
-    const whichCmd = isWin ? 'where' : 'which'
-    const nullDev = isWin ? 'nul' : '/dev/null'
-    return execSync(`${whichCmd} google-chrome chrome chromium chromium-browser 2>${nullDev}`, { encoding: 'utf-8', shell: true }).trim().split(/\r?\n/)[0]
-  } catch {}
-  // Fallback: puppeteer's bundled Chromium (auto-downloaded to ~/.wechat-bro/chromium/)
-  try {
-    const p = typeof puppeteer.executablePath === 'function' ? await puppeteer.executablePath() : puppeteer.executablePath()
-    if (p && fs.existsSync(p)) return p
-  } catch {}
-  log('Chromium not found — downloading (this may take a while)...')
   const browserDir = path.join(DATA_DIR, 'chromium')
   fs.mkdirSync(browserDir, { recursive: true })
-  execSync(`npx @puppeteer/browsers install chrome@stable --path "${browserDir}"`, { timeout: 300000, stdio: 'inherit' })
-  const p = typeof puppeteer.executablePath === 'function' ? await puppeteer.executablePath() : puppeteer.executablePath()
-  if (p && fs.existsSync(p)) return p
-  throw new Error('Chromium download failed. Set CHROME_PATH env var.')
+  const { Browser, BrowserTag, detectBrowserPlatform, install, resolveBuildId } = require('@puppeteer/browsers')
+  const platform = detectBrowserPlatform()
+  const buildId = await resolveBuildId(Browser.CHROME, platform, BrowserTag.STABLE)
+  const installed = await install({ browser: Browser.CHROME, buildId, cacheDir: browserDir, platform })
+  return installed.executablePath
 }
 
 function toLoginUrl(qrUrl) {

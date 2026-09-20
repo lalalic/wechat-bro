@@ -35,7 +35,7 @@ AI multi-agent interface for WeChat Web. Injects into [wx.qq.com](https://wx.qq.
 npm install
 ```
 
-Auto-detects system Chrome/Chromium on macOS, Linux, and Windows. If none is found, downloads Chromium automatically to `~/.wechat-bro/chromium/`.
+Downloads and reuses a managed Chrome for Testing under `~/.wechat-bro/chromium/`. Set `CHROME_PATH` only when you explicitly want to override that browser.
 
 ## Quick Start
 
