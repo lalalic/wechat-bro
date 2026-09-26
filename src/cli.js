@@ -60,6 +60,7 @@ const DATA_DIR = process.env.WECHAT_BRO_DATA_DIR || path.join(os.homedir(), '.we
 process.env.PUPPETEER_CACHE_DIR = path.join(DATA_DIR, 'chromium')
 
 const COOKIE_FILE = path.join(DATA_DIR, 'cookies.json')
+const BROWSER_PROFILE_DIR = path.join(DATA_DIR, 'browser-profile')
 const MESSAGES_FILE = path.join(DATA_DIR, 'messages.jsonl')
 const CONTACTS_DIR = path.join(DATA_DIR, 'contacts')
 
@@ -83,6 +84,25 @@ async function findChrome() {
 function toLoginUrl(qrUrl) {
   if (!qrUrl || typeof qrUrl !== 'string') return null
   return qrUrl.replace('/qrcode/', '/l/')
+}
+
+function getBrowserLaunchOptions(executablePath = chromePath) {
+  return {
+    executablePath,
+    headless: !HEADED,
+    userDataDir: BROWSER_PROFILE_DIR,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-web-security', '--disable-features=IsolateOrigins,site-per-process'],
+    defaultViewport: { width: 1280, height: 900 },
+  }
+}
+
+async function loadCookieBackup(nextPage, file = COOKIE_FILE) {
+  if (!fs.existsSync(file)) return
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, 'utf-8'))
+    const cookies = Array.isArray(raw) ? raw : (raw.cookies || [])
+    if (cookies.length) await nextPage.setCookie(...cookies)
+  } catch (e) { log('Cookie load:', e.message) }
 }
 
 let lastQrUrl = null
@@ -737,12 +757,7 @@ async function main() {
     process.exit(1)
   }
 
-  let browser = await puppeteer.launch({
-    executablePath: chromePath,
-    headless: !HEADED,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-web-security', '--disable-features=IsolateOrigins,site-per-process'],
-    defaultViewport: { width: 1280, height: 900 },
-  })
+  let browser = await puppeteer.launch(getBrowserLaunchOptions())
   let page = (await browser.pages())[0]
   let msgFd
   try { msgFd = fs.openSync(MESSAGES_FILE, 'a') } catch {}
@@ -811,15 +826,6 @@ async function main() {
     await nextPage.exposeFunction('sendToPuppeteer', handlePuppeteerEvent)
   }
 
-  async function loadCookies(nextPage) {
-    if (!fs.existsSync(COOKIE_FILE)) return
-    try {
-      const raw = JSON.parse(fs.readFileSync(COOKIE_FILE, 'utf-8'))
-      const arr = Array.isArray(raw) ? raw : (raw.cookies || [])
-      if (arr.length) await nextPage.setCookie(...arr)
-    } catch (e) { log('Cookie load:', e.message) }
-  }
-
   async function reconnectBrowser(reason) {
     const oldBrowser = browser
     const oldPage = page
@@ -832,17 +838,12 @@ async function main() {
       if (processHandle && !processHandle.killed) processHandle.kill('SIGTERM')
     } catch {}
 
-    browser = await puppeteer.launch({
-      executablePath: chromePath,
-      headless: !HEADED,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-web-security', '--disable-features=IsolateOrigins,site-per-process'],
-      defaultViewport: { width: 1280, height: 900 },
-    })
+    browser = await puppeteer.launch(getBrowserLaunchOptions())
     page = (await browser.pages())[0]
     lifecycle.setPage(page)
     wireBrowser(browser)
     await wirePage(page)
-    await loadCookies(page)
+    await loadCookieBackup(page)
     await page.goto(WX_URL, { waitUntil: 'domcontentloaded', timeout: 30000 })
     await page.waitForFunction(() => typeof angular !== 'undefined' && angular.element(document).injector(), { timeout: 30000 })
     await page.evaluate(INJECT_SCRIPT)
@@ -856,7 +857,7 @@ async function main() {
   await wirePage(page)
 
   // Load cookies
-  await loadCookies(page)
+  await loadCookieBackup(page)
 
   await page.goto(WX_URL, { waitUntil: 'domcontentloaded', timeout: 30000 })
   await page.waitForFunction(() => typeof angular !== 'undefined' && angular.element(document).injector(), { timeout: 30000 })
@@ -1187,4 +1188,12 @@ if (require.main === module) {
 }
 
 // Exported for unit tests
-module.exports = { parseSegments, saveBinaryContent, simplifyMessageEvent, saveCookies, saveCookiesOnExit }
+module.exports = {
+  getBrowserLaunchOptions,
+  loadCookieBackup,
+  parseSegments,
+  saveBinaryContent,
+  simplifyMessageEvent,
+  saveCookies,
+  saveCookiesOnExit,
+}
