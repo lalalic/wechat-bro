@@ -6,6 +6,8 @@ on:
 
 permissions:
   contents: read
+  issues: write
+  pull-requests: read
   id-token: write
 
 concurrency:
@@ -25,6 +27,7 @@ jobs:
           package-manager-cache: false
 
       - name: Choose next version
+        id: publication
         shell: bash
         run: |
           set -euo pipefail
@@ -50,7 +53,23 @@ jobs:
           NODE
           )
           echo "Publishing $NAME@$NEXT (repo=$LOCAL, registry=$REMOTE)"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$NEXT" >> "$GITHUB_OUTPUT"
           npm version "$NEXT" --no-git-tag-version --allow-same-version
 
       - name: Publish
         run: npm publish --access public
+      - name: Report verified publication
+        uses: lalalic/agents-relay/.github/actions/report-publication@publication-v1
+        with:
+          token: ${{ github.token }}
+          artifact: ${{ steps.publication.outputs.name }}
+          version: ${{ steps.publication.outputs.version }}
+          channel: https://registry.npmjs.org
+      - name: Report release failure
+        if: ${{ failure() }}
+        continue-on-error: true
+        uses: lalalic/agents-relay/.github/actions/report-publication-failure@publication-v1
+        with:
+          token: ${{ github.token }}
+          stage: npm publish workflow
