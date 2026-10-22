@@ -1,6 +1,9 @@
 ---
 name: wechat-bro
 description: 让 AI harness 操作和定制微信：启动内置 orchestrator、管理关注联系人和行为、处理 escalation、调用微信命令，或构建自定义 listener/orchestrator。
+requires:
+  skills:
+    - daemon-service-manage
 ---
 
 # wechat-bro — 微信 Agent Skill
@@ -449,3 +452,7 @@ harness: codex exec resume {session-id} < {task-path}
 - 需要长期 personal WeChat agent、watch list、per-contact session/rules、escalation → **内置 orchestrator**。
 - 只做一次发送消息、发送文件、查联系人等动作 → **direct commands**。
 - 需要自己实现 listener、orchestrator 或业务自动化 → **WebSocket protocol**。
+
+## Persistent service bootstrap
+
+This Skill owns `wechat-bro/daemon`, `wechat-bro/orchestrator`. The `daemon-service-manage` Skill is required. Run `node skills/wechat-bro/bin/services.mjs setup` for idempotent registration through `serviceman`; run `status` to inspect or `doctor` to fail if a service is not online. Existing process configuration is preserved. Do not create unqualified legacy PM2 names.
