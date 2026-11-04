@@ -52,6 +52,8 @@ const { transcribeVoiceAsync, transcribeFileAsync } = require('./transcribe')
 const { sendImage, sendVideoFile, sendFile } = require('./upload')
 const wsServer = require('./ws-server')
 const { DaemonLifecycle, isAuthCommand } = require('./daemon-lifecycle')
+const { createUiController } = require('./ui-control')
+const { createManagementBridge } = require('./ui-bridge')
 const WECHAT_BRO_VERSION = require('../package.json').version
 
 // Overridable for tests so unit suites never touch the real ~/.wechat-bro
@@ -61,6 +63,7 @@ const CONTACTS_DIR = path.join(DATA_DIR, 'contacts')
 
 const WX_URL = 'https://wx.qq.com'
 const INJECT_SCRIPT = fs.readFileSync(path.join(__dirname, 'wechat-bro.js'), 'utf-8')
+const INJECT_UI_SCRIPT = fs.readFileSync(path.join(__dirname, 'wechat-ui.js'), 'utf8')
 const HEADED = process.argv.includes('--headed')
 const QUIET = process.argv.includes('--quiet') || !process.stdin.isTTY
 const LOGIN_TIMEOUT = 300_000
@@ -721,6 +724,7 @@ async function main() {
   let bootstrapping = true
   let daemonStopping = false
   _markDaemonStopping = () => { daemonStopping = true }
+  const uiController = createUiController({dataDir: DATA_DIR, port: WS_PORT})
   let msgFd
   try { msgFd = fs.openSync(MESSAGES_FILE, 'a') } catch {}
 
@@ -763,7 +767,23 @@ async function main() {
     })
   }
 
+  const managementUi = createManagementBridge({
+    controller: uiController,
+    source: INJECT_UI_SCRIPT,
+    isActive: target => !daemonStopping && target === page,
+    log,
+  })
+
+  async function mountManagementUi(nextPage) {
+    // Management UI is an optional surface: a rendering or browser CSP
+    // failure must never prevent normal messaging and agent dispatch.
+    try { await managementUi.mount(nextPage) }
+    catch (error) { log('Management UI mount unavailable:', error.message) }
+  }
+
   async function wirePage(nextPage) {
+    try { await managementUi.attach(nextPage) }
+    catch (error) { log('Management UI bridge unavailable:', error.message) }
     nextPage.on('dialog', async (dialog) => { log('Dialog:', dialog.message()); await dialog.accept() })
     nextPage.on('framenavigated', async (frame) => {
       if (daemonStopping || bootstrapping || nextPage !== page || frame !== nextPage.mainFrame() || !frame.url().includes('wx.qq.com')) return
@@ -775,6 +795,7 @@ async function main() {
         await nextPage.evaluate(() => { if (window.WechatyBro && !window.WechatyBro.vars.initState) return window.WechatyBro.init(); return { code: 304 } })
         await nextPage.evaluate(() => { if (window.WechatyBro) window.WechatyBro._loadLastMsgTime() })
         await lifecycle.revalidate('page re-injected')
+        await mountManagementUi(nextPage)
       } catch (e) { log('Re-inject failed:', e.message) }
     })
     nextPage.on('error', (error) => {
@@ -804,6 +825,7 @@ async function main() {
     await page.evaluate(INJECT_SCRIPT)
     await page.evaluate(() => { if (window.WechatyBro && !window.WechatyBro.vars.initState) return window.WechatyBro.init(); return { code: 304 } })
     await page.evaluate(() => { if (window.WechatyBro) window.WechatyBro._loadLastMsgTime() })
+    await mountManagementUi(page)
     bootstrapping = false
     log('Browser/page recovered after', reason)
     return page
@@ -830,6 +852,7 @@ async function main() {
     log('Already logged in')
     try { await page.waitForFunction(() => window.WechatyBro && window.WechatyBro.vars.contactsReady === true, { timeout: 120_000 }) } catch {}
   } else { log('login_required: user has not signed in') }
+  await mountManagementUi(page)
   bootstrapping = false
   await lifecycle.revalidate('startup ready')
 

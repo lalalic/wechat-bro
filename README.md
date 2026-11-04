@@ -50,6 +50,32 @@ attempt to sign in. After manual sign-in, the existing orchestrator takes over.
 For custom clients, use the unchanged WebSocket interface:
 `ws://localhost:9231`.
 
+## Management inside WeChat Web
+
+With the daemon running, open its managed WeChat tab in WebHelm. The
+floating AI launcher at upper-right opens three settings tabs:
+
+- Chats: select a contact/room, assign a routable Agent, set maintainer or
+  assistant mode, watch/unwatch or pause/resume. Watch uses the existing
+  Orchestrator and persists; Pause applies only until service restart.
+- Agents: read and edit description/prompt Markdown. Bundled Agent files
+  are never edited; Save creates an override. Routing and harness metadata
+  use the established management workflow.
+- Rules/Memory: edit global or contact-specific Markdown with explicit
+  Load/Save and stale-write conflict protection.
+
+The panel is injected through the daemon-owned CDP page and disappears when
+the WeChat Group exits. No separate dashboard, WebHelm Extension or new
+network port is installed. The local Node controller owns all file writes.
+UI commands are allowlisted and require a per-page private nonce; administrative
+buttons reject untrusted synthetic clicks.
+
+The panel is available only on desktop WeChat Web. On an iPhone, manage
+the bot by chatting with filehelper instead.
+
+Test with npm test (offline) and npm run test:live:ui (real WebHelm Chrome
+with mocked settings; no messages sent).
+
 ## Agent management through WeChat
 
 Use filehelper in the WeChat Web UI to list Agents, inspect and edit their
