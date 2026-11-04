@@ -161,12 +161,17 @@ ok(m.flagValue(['orchestrator', '--port', '9500'], '--port') === '9500', 'flagVa
 ok(m.flagValue(['orchestrator'], '--port') === null, 'flagValue: missing → null')
 
 // ── parseTaskResult (task JSON contract) ──────────────────────────────────
+const workerPath = m.ensureWorkerCli()
+const workerLauncher = path.join(workerPath, 'wechat-bro')
+ok(fs.existsSync(workerLauncher) && fs.statSync(workerLauncher).mode & 0o111, 'local same-version worker CLI launcher is executable')
+ok(fs.readFileSync(workerLauncher, 'utf8').includes('src/cli.js'), 'launcher targets local package, not public npx')
 console.log('# parseTaskResult')
 ok(m.parseTaskResult('reply sent\n{"status":"addressed"}\n').status === 'addressed', 'result: addressed on last line')
 ok(m.parseTaskResult('{"status":"addressed"}\nnoise after\n{"status":"escalated","question":"q?"}\n').status === 'escalated', 'result: scans back to last valid JSON')
 ok(m.parseTaskResult('some chatter\nno json here') === null, 'result: no JSON → null (defaults addressed)')
 ok(m.parseTaskResult('{"status":"bogus"}') === null, 'result: unknown status → null')
 ok(m.parseTaskResult('') === null, 'result: empty stdout → null')
+ok(m.parseTaskResult('{"status":"failed","error":"send rejected"}').status === 'failed', 'result: failed is explicit and not addressed')
 ok(m.parseTaskResult('done\n{bad json}\n{"status":"ignored"}').status === 'ignored', 'result: skips malformed line')
 
 // ── harness templates (defaultHarness / harnessVars / renderHarness) ─────

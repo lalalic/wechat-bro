@@ -9,7 +9,7 @@
  *   webhelm session start  -> { session_id, target_id }
  *   ws://<chrome>/devtools/page/<target_id>   (realtime events + commands)
  *   webhelm session heartbeat  (every 45s, keeps the 5-minute idle reaper off)
- *   webhelm session stop       (on close / process exit)
+ *   webhelm workspace-delete --force WeChat (on daemon exit)
  *
  * CdpPage duck-types the small puppeteer Page surface wechat-bro uses, so the
  * injected bridge (wechat-bro.js) and its callers stay unchanged.
@@ -26,6 +26,7 @@ const WebSocket = require('ws')
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:9222'
 const HEARTBEAT_MS = 45_000
 const SESSION_FILE = 'webhelm-session.json'
+const WECHAT_WORKSPACE = 'WeChat'
 const COOKIE_FIELDS = ['name', 'value', 'url', 'domain', 'path', 'secure', 'httpOnly', 'sameSite', 'expires', 'priority']
 
 // ── webhelm CLI ───────────────────────────────────────────────────────────
@@ -97,25 +98,73 @@ async function resolveEndpoint() {
 
 function wsBase(endpoint) { return endpoint.replace(/^http/, 'ws').replace(/\/+$/, '') }
 
-/** Stop the Session a previous (crashed) daemon left behind, so two wx.qq.com
- *  tabs never sync the same account at once. Only our own recorded id. */
+/**
+ * A daemon exclusively owns the named WeChat workspace. Never touch another
+ * group's leases. Deletion closes the WeChat tabs directly, avoiding the
+ * Page.navigate-to-idle hang seen in real logged-in WeChat sessions.
+ *
+ * Workspace deletion closes the Chrome tabs first; then we stop any remaining
+ * Session records after their CDP targets disappear. This works with existing
+ * WebHelm Runtime versions, without modifying or restarting the daemon.
+ */
+async function destroyWechatWorkspace({ sessionId = null, dataDir = null } = {}) {
+  const state = await requestRuntime({ op: 'list' })
+  const owned = (state.sessions || []).filter(s => s.workspace === WECHAT_WORKSPACE)
+  if (owned.some(s => !sessionId || s.session_id !== sessionId)) {
+    throw new Error('WeChat workspace contains a Session owned by a different daemon')
+  }
+  const result = await requestRuntime({
+    op: 'workspace-delete', name: WECHAT_WORKSPACE, force: true,
+  }, 45000)
+  if (!result.deleted) throw new Error('WebHelm did not confirm WeChat Group deletion')
+  // Existing WebHelm releases keep the Session record after deleting its
+  // group, but Target.targetDestroyed removes the now-closed target. Calling
+  // Session stop *after* that event releases the in-memory lease without the
+  // problematic Page.navigate-to-idle. Future runtimes may revoke the record
+  // during group deletion; either behavior is supported.
+  for (const session of owned) {
+    let current = null
+    for (let attempt = 0; attempt < 60; attempt++) {
+      const listing = await requestRuntime({ op: 'list' })
+      current = (listing.sessions || []).find(s => s.session_id === session.session_id)
+      if (!current || !current.target_id) break
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+    if (current && current.target_id) {
+      throw new Error('WeChat Group was deleted but Chrome target did not close; Session not safe to recycle')
+    }
+    if (current) {
+      try { await requestRuntime({ op: 'stop', session_id: session.session_id }, 20000) }
+      catch (error) {
+        if (!/unknown session_id/i.test(String(error.message))) throw error
+      }
+    }
+  }
+  const after = await requestRuntime({ op: 'list' })
+  if ((after.sessions || []).some(s => s.workspace === WECHAT_WORKSPACE)) {
+    throw new Error('WebHelm deleted WeChat Group but failed to revoke its Session leases')
+  }
+  if (dataDir) {
+    try { fs.unlinkSync(path.join(dataDir, SESSION_FILE)) } catch (error) {
+      if (error.code !== 'ENOENT') throw error
+    }
+  }
+  return result
+}
+
+/** Reclaim only our own recorded Session from a previously crashed daemon. */
 async function reapStaleSession(dataDir) {
   if (!dataDir) return
   const file = path.join(dataDir, SESSION_FILE)
   if (!fs.existsSync(file)) return
   let stored
   try { stored = JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return }
-  // A live owner is not stale. Do not steal another running daemon's tab.
   if (stored.pid && stored.pid !== process.pid) {
     try { process.kill(stored.pid, 0); throw new Error('WeChat WebHelm Session is owned by another live process: ' + stored.pid) }
     catch (error) { if (error.code !== 'ESRCH') throw error }
   }
-  if (stored.sessionId) {
-    const listed = await requestRuntime({ op: 'list' })
-    const owned = (listed.sessions || []).find((x) => x.session_id === stored.sessionId && x.workspace === 'WeChat')
-    if (owned) await requestRuntime({ op: 'stop', session_id: stored.sessionId })
-  }
-  fs.unlinkSync(file)
+  if (!stored.sessionId) throw new Error('stale WeChat Session receipt has no sessionId')
+  await destroyWechatWorkspace({ sessionId: stored.sessionId, dataDir })
 }
 
 // ── CDP connection ────────────────────────────────────────────────────────
@@ -421,8 +470,8 @@ class WebHelmBrowser extends EventEmitter {
   static async open({ url = 'about:blank', headed = false, dataDir, viewport } = {}) {
     const endpoint = await resolveEndpoint()
     await reapStaleSession(dataDir)
-    await requestRuntime({ op: 'workspace-create', name: 'WeChat', pool_size: 1 })
-    const started = await requestRuntime({ op: 'start', workspace: 'WeChat', url })
+    await requestRuntime({ op: 'workspace-create', name: WECHAT_WORKSPACE, pool_size: 1 })
+    const started = await requestRuntime({ op: 'start', workspace: WECHAT_WORKSPACE, url })
     if (!started.session_id || !started.target_id) throw new Error('webhelm session start returned no session_id/target_id')
     let conn
     try {
@@ -437,28 +486,26 @@ class WebHelmBrowser extends EventEmitter {
       return browser
     } catch (e) {
       try { if (conn) conn.close() } catch {}
-      await requestRuntime({ op: 'stop', session_id: started.session_id }).catch(() => {})
+      try { await destroyWechatWorkspace({ sessionId: started.session_id, dataDir }) }
+      catch (cleanupError) { e.cleanupError = cleanupError }
       throw e
     }
   }
 
   async pages() { return [this.page] }
 
-  /** Releases our Session (closes our tab only). The shared Chrome keeps running. */
+  /** Destroys this daemon's WeChat Tab Group and revokes its Session. */
   async close() {
     if (this.closed) return
     this.closed = true
     clearInterval(this._hb)
-    try { this.page.close() } catch {}
     try {
-      await requestRuntime({ op: 'stop', session_id: this.sessionId })
-    } catch (error) {
-      // Expired or restarted runtimes may already have released this lease.
-      if (!/unknown session_id/i.test(String(error.message))) throw error
+      return await destroyWechatWorkspace({ sessionId: this.sessionId, dataDir: this.dataDir })
     } finally {
-      if (this.dataDir) { try { fs.unlinkSync(path.join(this.dataDir, SESSION_FILE)) } catch {} }
+      try { this.page.close() } catch {}
     }
   }
+
 }
 
 /** System Chrome for external renderers (mermaid / marp). No download. */
@@ -472,4 +519,4 @@ function findSystemChrome() {
   return candidates.find((p) => fs.existsSync(p)) || null
 }
 
-module.exports = { WebHelmBrowser, CdpPage, CdpConnection, findSystemChrome, serializeArgs, requestRuntime }
+module.exports = { WebHelmBrowser, CdpPage, CdpConnection, findSystemChrome, serializeArgs, requestRuntime, destroyWechatWorkspace }

@@ -13,10 +13,11 @@
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
-const { execSync } = require('child_process')
+const { execSync, execFile } = require('child_process')
 
 const UVX_CMD = process.env.UVX_CMD || 'uvx'
 const WHISPER_TIMEOUT = parseInt(process.env.WHISPER_TIMEOUT || '120000', 10)
+const WHISPER_MODEL = process.env.WHISPER_MODEL || null
 
 /**
  * Transcribe a base64-encoded voice message.
@@ -113,4 +114,48 @@ function transcribeFile(filePath) {
   }
 }
 
-module.exports = { transcribeVoice, transcribeFile }
+
+// Asynchronous transcription avoids blocking WebSocket commands and WebHelm
+// heartbeat while Whisper runs. Each job has its own output directory to
+// prevent parallel voice messages overwriting each other's transcripts.
+function runWhisperAsync(inputPath) {
+  return new Promise((resolve) => {
+    const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-whisper-'))
+    const args = ['--from', 'openai-whisper', 'whisper', inputPath,
+      '--output_dir', outDir, '--output_format', 'txt', '--language', 'zh',
+      ...(WHISPER_MODEL ? ['--model', WHISPER_MODEL] : [])]
+    execFile(UVX_CMD, args, { timeout: WHISPER_TIMEOUT, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
+      try {
+        if (err) return resolve(null)
+        const basename = path.basename(inputPath).replace(/\.[^.]+$/, '')
+        const output = path.join(outDir, basename + '.txt')
+        const text = fs.existsSync(output) ? fs.readFileSync(output,'utf8').trim() : String(stdout || '').trim()
+        resolve(text || null)
+      } catch { resolve(null) }
+      finally { try { fs.rmSync(outDir, { recursive: true, force: true }) } catch {} }
+    })
+  })
+}
+
+async function transcribeFileAsync(filePath) {
+  return runWhisperAsync(filePath)
+}
+
+async function transcribeVoiceAsync(data) {
+  if (!data || typeof data.voiceBase64 !== 'string') return false
+  let content
+  try { content = Buffer.from(data.voiceBase64, 'base64') } catch { return false }
+  if (content.length < 64) return false
+  const base = path.join(os.tmpdir(), 'wechat-voice-' + Date.now() + '-' + Math.random().toString(36).slice(2,10))
+  const filename = base + guessAudioExt(content)
+  try {
+    fs.writeFileSync(filename, content)
+    const text = await runWhisperAsync(filename)
+    if (text) data.voiceText = text
+  } finally {
+    try { fs.unlinkSync(filename) } catch {}
+  }
+  return true
+}
+
+module.exports = { transcribeVoice, transcribeFile, transcribeFileAsync, transcribeVoiceAsync }

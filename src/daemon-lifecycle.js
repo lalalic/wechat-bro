@@ -246,7 +246,8 @@ class DaemonLifecycle {
   }
 
   handleBridgeEvent(event) {
-    if (event !== 'login' && event !== 'logout' && event !== 'scan') return
+    // Contacts arrive after login on real WeChat Web; revalidate auth then.
+    if (!['login', 'logout', 'scan', 'contacts-ready'].includes(event)) return
     if (event === 'logout' || event === 'scan') this.transition(STATES.RESUMING, `bridge ${event}`)
     this.revalidate(`bridge ${event}`).catch(e => this.log('lifecycle revalidation:', e.message))
   }

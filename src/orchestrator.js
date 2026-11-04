@@ -316,6 +316,7 @@ function renderTask(msg, extra, opts = {}) {
   if (opts.host) {
     const update = !!superseded
     return [
+      WORKER_CLI_CONTRACT,
       `# Host ${update ? 'guidance update' : 'discussion'} — ${new Date().toISOString()}`,
       '',
       update ? 'HOST GUIDANCE UPDATE' : `HOST DISCUSSION — open a discussion in **${msg.to}** now.`,
@@ -343,6 +344,7 @@ function renderTask(msg, extra, opts = {}) {
     ].join('\n')
   }
   const lines = [
+    WORKER_CLI_CONTRACT,
     `# WeChat task — ${new Date().toISOString()}`,
     '',
     `Message from **${msg.from}**${msg.to && msg.to !== msg.from ? ` (chat: ${msg.to})` : ''}${msg.sender ? ` — sender: ${msg.sender}` : ''}.`,
@@ -389,9 +391,10 @@ function renderTask(msg, extra, opts = {}) {
  *  is OPTIONAL: omitting it returns the agent to passive, event-driven mode. */
 function resultContractLines() {
   return [
-    '- `{"status":"addressed"}` — handled (replied, or deliberately silent per rules)',
-    '- `{"status":"ignored"}` — no reply was needed',
+    '- `{"status":"addressed"}` — confirmed successful outbound action',
+    '- `{"status":"ignored"}` — no outbound action was required',
     '- `{"status":"escalated","question":"<what the owner must decide, with context>"}` — needs the account owner\'s decision',
+    '- `{"status":"failed","error":"<failure details>"}` — action failed or outcome uncertain',
     '- optional `"next_action":{"type":"wake","after_seconds":<seconds>,"reason":"<why>","context":"<handoff>"}` — ask the orchestrator to run you again later (omit it to stop continuing)',
   ]
 }
@@ -404,6 +407,7 @@ function resultContractLines() {
  */
 function renderWakeTask(entry) {
   const lines = [
+    WORKER_CLI_CONTRACT,
     `# Scheduled wakeup — ${new Date().toISOString()}`,
     '',
     'SCHEDULED WAKEUP — no new user message triggered this task.',
@@ -438,6 +442,26 @@ function shellQuote(s) {
   s = String(s)
   return /^[A-Za-z0-9_@%+=:,./-]+$/.test(s) ? s : `'` + s.replace(/'/g, `'\\''`) + `'`
 }
+
+// Workers must use exactly this orchestrator's CLI version, never an npm fetch.
+function ensureWorkerCli() {
+  const dir = path.join(DATA_DIR, '.bin')
+  const launcher = path.join(dir, 'wechat-bro')
+  const content = '#!/bin/sh\nexec ' + shellQuote(process.execPath) + ' ' + shellQuote(CLI) + ' "$@"\n'
+  fs.mkdirSync(dir, { recursive: true })
+  let current = null
+  try { current = fs.readFileSync(launcher, 'utf8') } catch {}
+  if (current !== content) {
+    const tmp = launcher + '.' + process.pid + '.tmp'
+    fs.writeFileSync(tmp, content, { mode: 0o755 })
+    fs.renameSync(tmp, launcher)
+  }
+  fs.chmodSync(launcher, 0o755)
+  return dir
+}
+
+const WORKER_CLI_CONTRACT =
+  'Use the local wechat-bro executable on PATH for WeChat commands; NEVER use npx wechat-bro or fetch a published npm version. Verify JSON: ok:true with data:true or data.sent:true means successful dispatch; ok:false, data:false, timeout, or data.sent:false is a failure. Only report addressed after a successful outbound action. On failed or uncertain sends, report status failed with concise error; do not blindly retry.'
 
 /** Built-in harness templates, one per supported CLI, expressed as shell
  *  command lines: each CLI's own headless/approval/session flags are baked
@@ -492,7 +516,7 @@ function renderHarness(template, vars) {
  * with a known `status`; anything else (no JSON, harness noise, timeout)
  * degrades to `addressed` so the loop never stalls on a chatty agent.
  */
-const RESULT_STATUS = new Set(['addressed', 'ignored', 'escalated'])
+const RESULT_STATUS = new Set(['addressed', 'ignored', 'escalated', 'failed'])
 function parseTaskResult(stdout) {
   const lines = String(stdout || '').trim().split('\n')
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -975,7 +999,11 @@ function makeDispatcher({ wsSend, onEscalation, wakes = null, canDispatch = null
 
         const spawnTask = () => new Promise((resolve) => {
           let stdout = ''
-          const child = spawn('/bin/sh', ['-c', cmdline], { cwd: base, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] })
+          const child = spawn('/bin/sh', ['-c', cmdline], {
+            cwd: base,
+            env: { ...process.env, PATH: ensureWorkerCli() + path.delimiter + (process.env.PATH || '') },
+            stdio: ['ignore', 'pipe', 'pipe'],
+          })
           const timer = setTimeout(() => { log('timeout', label); child.kill('SIGKILL') }, timeoutMs)
           child.stdout.on('data', c => { stdout += c })
           child.stderr.on('data', c => { stdout += c })
@@ -1022,9 +1050,16 @@ function makeDispatcher({ wsSend, onEscalation, wakes = null, canDispatch = null
           await wsSend({ cmd: 'send-text', to: 'filehelper', content: `⚠️ ${d.name} task failed (exit ${code}) for ${name}:\n${tail.slice(0, 800)}` })
         } else {
           const result = parseTaskResult(stdout)
-          log('result', label, JSON.stringify(result || { status: 'addressed (no JSON)' }))
+          log('result', label, JSON.stringify(result || { status: 'unknown (no JSON result)' }))
           if (result && result.status === 'escalated' && !isOrch) {
             onEscalation(name, String(result.question || '(no question given)'))
+          }
+          if (result && result.status === 'failed') {
+            log('worker reported failed:', label, String(result.error || 'unspecified').slice(0,250))
+            await wsSend({
+              cmd: 'send-text', to: 'filehelper',
+              content: '⚠️ ' + d.name + ' failed for ' + name + ': ' + String(result.error || 'unknown').slice(0,500),
+            })
           }
           // Each completed turn IS the authoritative plan for what happens
           // next: a valid wake replaces the schedule, anything else clears it.
@@ -1124,6 +1159,7 @@ function flagValue(argv, flag) {
 
 async function runOrchestrator({ port = 9231 } = {}) {
   const argv = process.argv.slice(2)
+  process.env.PATH = ensureWorkerCli() + path.delimiter + (process.env.PATH || '')
   const cliHarness = flagValue(argv, '--harness')
   const daemonFlag = argv.includes('--daemon')
 
@@ -1513,7 +1549,7 @@ module.exports = {
   parseTaskResult, shellQuote, defaultHarness, HARNESS_TEMPLATES,
   harnessVars, renderHarness, runOrchestrator, flagValue, DATA_DIR, AGENTS_DIR,
   validateNextAction, clampDelay, WakeScheduler, renderWakeTask, wakeFile,
-  ContactQueue, makeDispatcher,
+  ContactQueue, makeDispatcher, ensureWorkerCli,
   CodexResidentAdapter,
   WAKE_MIN_SECONDS, WAKE_MAX_SECONDS, WAKE_MAX_OVERDUE_SECONDS, WAKES_FILE,
 }

@@ -48,7 +48,7 @@ const qrcode = require('qrcode-terminal')
 // or paste the URL into any browser to scan. This keeps terminal output
 // clean JSON lines for agents.
 const WebSocket = require('ws')
-const { transcribeVoice, transcribeFile } = require('./transcribe')
+const { transcribeVoiceAsync, transcribeFileAsync } = require('./transcribe')
 const { sendImage, sendVideoFile, sendFile } = require('./upload')
 const wsServer = require('./ws-server')
 const { DaemonLifecycle, isAuthCommand } = require('./daemon-lifecycle')
@@ -305,20 +305,31 @@ let _wsServer = null  // set by main()
 let _exitSave = null  // set by main(): flush cookies to disk before exit
 let _lifecycle = null  // daemon-owned auth/lifecycle state
 let _releaseBrowser = null
+let _markDaemonStopping = null
 
+let _shutdownPromise = null
 function shutdown() {
+  if (_shutdownPromise) return _shutdownPromise
+  if (_markDaemonStopping) _markDaemonStopping()
   log('Shutting down...')
   if (_lifecycle) { try { _lifecycle.stop() } catch {} }
   if (_exitSave) { try { _exitSave() } catch {} }
-  if (_releaseBrowser) { try { Promise.resolve(_releaseBrowser()).catch(e => log('Session release:', e.message)) } catch {} }
-  if (_wsServer) {
-    try { _wsServer.close() } catch {}
-  }
+  if (_wsServer) { try { _wsServer.close() } catch {} }
+  // The asynchronous Group delete must finish BEFORE process exit. A fixed
+  // short process.exit timer leaked the Workspace while CDP was busy.
+  _shutdownPromise = _releaseBrowser
+    ? Promise.resolve().then(() => _releaseBrowser())
+    : Promise.resolve()
+  return _shutdownPromise
 }
-
-// Defer exit so the async cookie flush in shutdown() can finish (~2s race).
-process.on('SIGINT', () => { shutdown(); setTimeout(() => process.exit(0), 2500) })
-process.on('SIGTERM', () => { shutdown(); setTimeout(() => process.exit(0), 2500) })
+function onShutdownSignal() {
+  shutdown().then(() => process.exit(0)).catch(error => {
+    log('WeChat Group cleanup failed:', error.message)
+    process.exit(1)
+  })
+}
+process.on('SIGINT', onShutdownSignal)
+process.on('SIGTERM', onShutdownSignal)
 
 // WebHelm persists its own Chrome profile. Never export login cookies here.
 async function saveCookies() {}
@@ -423,7 +434,7 @@ async function sendCommandViaWs(ws, request) {
   })
 
   // Safety timeout
-  const timeoutMs = request.cmd === 'send-video' ? 1800000 : 30000
+  const timeoutMs = request.cmd === 'send-video' ? 1800000 : request.cmd === 'send-voice' ? (parseInt(process.env.WHISPER_TIMEOUT || '120000', 10) + 60000) : 30000
   setTimeout(() => {
     process.stdout.write(JSON.stringify({ ok: false, error: 'timeout', id }) + '\n')
     ws.close()
@@ -698,6 +709,8 @@ async function main() {
   let page = (await browser.pages())[0]
   _releaseBrowser = () => browser.close()
   let bootstrapping = true
+  let daemonStopping = false
+  _markDaemonStopping = () => { daemonStopping = true }
   let msgFd
   try { msgFd = fs.openSync(MESSAGES_FILE, 'a') } catch {}
 
@@ -716,7 +729,7 @@ async function main() {
   async function handleBrowserEvent(event, data) {
     lifecycle.handleBridgeEvent(event)
     if (data && data.voiceBase64 && (event === 'message:voice' || (event === 'message' && data.MsgType === 34))) {
-      transcribeVoice(data)
+      await transcribeVoiceAsync(data)
     }
     saveBinaryContent(data)
     if (!simplifyMessageEvent(event, data)) return
@@ -736,14 +749,14 @@ async function main() {
   function wireBrowser(nextBrowser) {
     nextBrowser.on('heartbeat-error', (error) => log('WebHelm heartbeat:', error.message))
     nextBrowser.on('disconnected', () => {
-      if (nextBrowser === browser) lifecycle.pageLost('browser disconnected')
+      if (!daemonStopping && nextBrowser === browser) lifecycle.pageLost('browser disconnected')
     })
   }
 
   async function wirePage(nextPage) {
     nextPage.on('dialog', async (dialog) => { log('Dialog:', dialog.message()); await dialog.accept() })
     nextPage.on('framenavigated', async (frame) => {
-      if (bootstrapping || nextPage !== page || frame !== nextPage.mainFrame() || !frame.url().includes('wx.qq.com')) return
+      if (daemonStopping || bootstrapping || nextPage !== page || frame !== nextPage.mainFrame() || !frame.url().includes('wx.qq.com')) return
       lifecycle.pageReplaced(nextPage, 'page navigation')
       log('Page navigated — re-injecting')
       try {
@@ -755,10 +768,10 @@ async function main() {
       } catch (e) { log('Re-inject failed:', e.message) }
     })
     nextPage.on('error', (error) => {
-      if (nextPage === page) lifecycle.pageLost('page error', { error: error.message })
+      if (!daemonStopping && nextPage === page) lifecycle.pageLost('page error', { error: error.message })
     })
     nextPage.on('close', () => {
-      if (nextPage === page) lifecycle.pageLost('page closed')
+      if (!daemonStopping && nextPage === page) lifecycle.pageLost('page closed')
     })
     await nextPage.exposeFunction('sendToWebHelm', handleBrowserEvent)
   }
@@ -819,10 +832,11 @@ async function main() {
       // Return a result so ws-server flushes {ok:true} back to the requesting
       // client, then tear down the browser + process on the next tick
       // (cookie flush + browser.close() give the socket time to flush the reply).
+      daemonStopping = true
+      lifecycle.stop()
       setImmediate(async () => {
-        await saveCookiesOnExit(page)
-        try { await browser.close() } catch {}
-        process.exit(0)
+        try { await browser.close(); process.exit(0) }
+        catch (error) { log('WeChat Group deletion failed:', error.message); process.exit(1) }
       })
       return { shuttingDown: true }
     }
@@ -910,6 +924,13 @@ function parseSegments(content) {
 
 // ── Command dispatcher ────────────────────────────────────────────────────
 async function dispatch(cmd, args, page) {
+  // Optional live-test safety boundary. Normal production has no allowlist.
+  const allowed = process.env.WECHAT_BRO_ALLOWED_RECIPIENTS
+  const outbound = new Set(['send', 'send-text', 'send-image', 'send-video', 'send-file', 'send-voice'])
+  if (allowed && outbound.has(cmd)) {
+    const whitelist = new Set(allowed.split(',').map(x => x.trim()).filter(Boolean))
+    if (!whitelist.has(String(args.to || ''))) throw new Error('test_recipient_not_allowed')
+  }
   switch (cmd) {
     case 'barcode':
     case 'qr':
@@ -955,7 +976,8 @@ async function dispatch(cmd, args, page) {
 
       if (renderable.length === 0) {
         // Plain text — no blocks to render
-        return sendText(page, args.to, args.content)
+        if (!await sendText(page, args.to, args.content)) throw new Error('WeChat send-text was not accepted')
+        return true
       }
 
       // ── Render each block, collect text segments ─────────────────────
@@ -988,7 +1010,7 @@ async function dispatch(cmd, args, page) {
               env: { ...process.env, PUPPETEER_EXECUTABLE_PATH: chromePath, CHROME_PATH: chromePath },
             })
             const pdfBuf = fs.readFileSync(outFile)
-            await sendFile(page, args.to, pdfBuf, fname)
+            if (!await sendFile(page, args.to, pdfBuf, fname)) throw new Error('WeChat document send not accepted')
             files.push({ file: fname, type: 'marpit' })
           } catch (e) {
             throw new Error(`marpit render failed: ${e.message}`)
@@ -1010,7 +1032,7 @@ async function dispatch(cmd, args, page) {
               env: { ...process.env, PUPPETEER_EXECUTABLE_PATH: chromePath },
             })
             const pngBuf = fs.readFileSync(pngFile)
-            await sendImage(page, args.to, pngBuf, fname)
+            if (!await sendImage(page, args.to, pngBuf, fname)) throw new Error('WeChat image send not accepted')
             files.push({ file: fname, type: 'mermaid' })
           } catch (e) {
             throw new Error(`mermaid render failed: ${e.message}`)
@@ -1023,7 +1045,7 @@ async function dispatch(cmd, args, page) {
 
       // ── Send remaining text ──────────────────────────────────────────
       const caption = captionParts.join('\n\n')
-      if (caption) await sendText(page, args.to, caption)
+      if (caption && !await sendText(page, args.to, caption)) throw new Error('WeChat caption send not accepted')
 
       return { sent: true, to: args.to, files, caption: caption || undefined }
 
@@ -1031,7 +1053,7 @@ async function dispatch(cmd, args, page) {
       if (!args.to) throw new Error('Missing --to')
       if (!args.path) throw new Error('Missing --path (local file path)')
       if (!fs.existsSync(args.path)) throw new Error(`File not found: ${args.path}`)
-      await sendImage(page, args.to, fs.readFileSync(args.path), args.filename || path.basename(args.path))
+      if (!await sendImage(page, args.to, fs.readFileSync(args.path), args.filename || path.basename(args.path))) throw new Error('WeChat send-image was not accepted')
       return { sent: true, to: args.to, file: args.filename || path.basename(args.path) }
 
     case 'send-video':
@@ -1048,7 +1070,7 @@ async function dispatch(cmd, args, page) {
       if (!args.path) throw new Error('Missing --path (local file path)')
       if (!args.filename) throw new Error('Missing --filename (shown to recipient)')
       if (!fs.existsSync(args.path)) throw new Error(`File not found: ${args.path}`)
-      await sendFile(page, args.to, fs.readFileSync(args.path), args.filename)
+      if (!await sendFile(page, args.to, fs.readFileSync(args.path), args.filename)) throw new Error('WeChat send-file was not accepted')
       return { sent: true, to: args.to, file: args.filename }
 
     case 'send-voice':
@@ -1056,13 +1078,15 @@ async function dispatch(cmd, args, page) {
       if (!args.path) throw new Error('Missing --path (local audio file)')
       if (!fs.existsSync(args.path)) throw new Error(`File not found: ${args.path}`)
       log('Transcribing:', args.path)
-      const text = transcribeFile(args.path)
+      const text = await transcribeFileAsync(args.path)
       if (!text) throw new Error('Transcription returned empty result')
       log('Transcribed:', text.slice(0, 80))
-      return page.evaluate((to, content) => {
+      const voiceReply = await page.evaluate((to, content) => {
         const ok = window.WechatyBro.send(to, content, true)
         return { sent: ok, to, transcription: content }
       }, args.to, text)
+      if (!voiceReply.sent) throw new Error('WeChat transcribed voice text was not accepted')
+      return voiceReply
 
     case 'status':
     case 'daemon-status': // orchestrator-internal health probe; CLI status is orchestrator-rich

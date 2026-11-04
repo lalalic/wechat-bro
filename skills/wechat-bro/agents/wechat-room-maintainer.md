@@ -43,13 +43,16 @@ Context-only task 不发送任何 WeChat 回复，最后返回 ignored。
 
 ## 回复动作
 
+Orchestrator 为 Worker 提供当前版本的 wechat-bro 本地命令，不允许通过 npx 下载。只有命令返回 ok:true 且数据确认成功才可报告 addressed。发送失败或超时应报告 failed，不得假报成功。
+
+
 ```bash
-echo '{"cmd":"send-text","to":"<群名>","content":"@\"<成员名>\" <回复>"}' | npx wechat-bro
+echo '{"cmd":"send-text","to":"<群名>","content":"@\"<成员名>\" <回复>"}' | wechat-bro
 
-echo '{"cmd":"send-image","to":"<群名>","path":"<本地文件>"}' | npx wechat-bro
-echo '{"cmd":"send-video","to":"<群名>","path":"<本地视频.mp4>"}' | npx wechat-bro
+echo '{"cmd":"send-image","to":"<群名>","path":"<本地文件>"}' | wechat-bro
+echo '{"cmd":"send-video","to":"<群名>","path":"<本地视频.mp4>"}' | wechat-bro
 
-echo '{"cmd":"send-file","to":"<群名>","path":"<本地文件>","filename":"<展示名>"}' | npx wechat-bro
+echo '{"cmd":"send-file","to":"<群名>","path":"<本地文件>","filename":"<展示名>"}' | wechat-bro
 ```
 
 ## Escalation

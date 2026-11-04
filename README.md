@@ -9,7 +9,7 @@ AI multi-agent interface for WeChat Web, using WebHelm-managed Chrome.
 - src/wechat-bro.js keeps the AngularJS message hooks and delivers events through Runtime.addBinding.
 - src/cli.js preserves the existing WebSocket protocol on port 9231.
 - src/orchestrator.js preserves contact-specific Agents, routing, memory and escalation.
-- The Session heartbeats every 45 seconds and remains leased while the daemon runs.
+- The Session heartbeats every 45 seconds and remains leased while the daemon runs. On exit, the dedicated WeChat Group and its Session leases are destroyed (other Groups remain intact).
 
 There is no Puppeteer dependency, separate Chrome process, login-cookie export, or custom browser pool.
 
@@ -177,27 +177,135 @@ const isAI = await page.evaluate((text) => WechatyBro.isFromAI(text), someConten
 
 **Cross-login replay suppression**: Every time you log into WeChat Web, the server replays recent history messages. These are automatically suppressed using a **CreateTime high-water mark**:
 - `wechat-bro.js` stores the highest `data.CreateTime` seen in a `wx_last_msg_time` cookie on `wx.qq.com`
-- WebHelm manages the browser profile and retains this replay cookie across daemon restarts
 - On next login, `wechat-bro.js` reads the cookie, and any message with `CreateTime ≤ lastMsgTime` is silently dropped
 - Same-session dedup (duplicate Angular events) still uses `_seenMsgIds` (MsgId-based, 2h TTL, max 2000 entries)
 
 ### Testing
 
-```bash
-npm test
-WEBHELM_E2E=1 node test/test-cdp.js
-npm run test:live
+**`simulateMessage(from, content, sender?, msgType?)`** — Simulate an incoming message for testing. Emits directly (bypasses Angular — safe for use alongside real WeChat). Accepts stable IDs.
+```js
+// Direct message
+await page.evaluate(() => WechatyBro.simulateMessage('alice', 'hello'))
+
+// Room message with sender
+await page.evaluate(() => WechatyBro.simulateMessage('mygroup', 'hey everyone', 'alice'))
+
+// Room message with @mention
+await page.evaluate(() => WechatyBro.simulateMessage(
+  'mygroup', '@Me\u2005 check this', 'alice'
+))
+// Emits: { from: room, sender: alice, mentions: ['me'], mentionMe: true, Content: '@Me\u2005 check this' }
 ```
 
-The offline tests do not need WeChat login. The WebHelm CDP test uses a
-temporary owned Session and sends no messages. The account integration suite
-requires manual login. Do not run live Session tests while the long-lived
-WeChat daemon already owns the single Tab Group lease.
+### Markdown Styling
+
+`send()` auto-converts markdown to Unicode mathematical symbols:
+
+```js
+await page.evaluate(() => WechatyBro.send('filehelper', `# Report
+**Bold** and *italic* with \`code\`.
+- Bullet 1
+- Bullet 2
+> Blockquote
+---
+~~old~~ replaced with **new**`))
+```
+
+Supported: `**bold**`, `*italic*`, `***bold italic***`, `` `monospace` ``, `~~strikethrough~~`,
+`# ## ###` headers, `- *` bullets, `1. 2. 3.` numbered lists (①②③), `> ` blockquotes, `---` rules, ` ``` ` code blocks.
+
+### Media Upload (Node.js side)
+
+```js
+const { sendImage, sendVideo, sendFile } = require('./src/upload')
+```
+
+**`sendImage(page, to, buffer, filename)`** — Upload and send an image.
+```js
+await sendImage(page, 'alice', fs.readFileSync('photo.jpg'), 'photo.jpg')
+```
+
+**`sendVideo(page, to, buffer, filename)`** — Upload and send a native video message.
+```js
+await sendVideo(page, 'alice', fs.readFileSync('clip.mp4'), 'clip.mp4')
+```
+
+**`sendFile(page, to, buffer, filename)`** — Upload and send a file.
+```js
+await sendFile(page, 'alice', fs.readFileSync('doc.pdf'), 'doc.pdf')
+```
+
+**`uploadMedia(page, to, buffer, filename)`** — Upload only, returns MediaId.
+```js
+const mediaId = await uploadMedia(page, 'alice', imgBuf, 'img.png')
+// Then send manually:
+await page.evaluate((to, id) => WechatyBro.sendImageWithMediaId(to, id), 'alice', mediaId)
+```
+
+### Low-Level Upload (for non-Node.js environments)
+
+**`getUploadParams(to)`** — Get all parameters needed to upload media (browser-side).
+```js
+const params = await page.evaluate(() => WechatyBro.getUploadParams('alice'))
+// {
+//   uploadUrl: "https://file.wx.qq.com/cgi-bin/mmwebwx-bin/webwxuploadmedia",
+//   baseRequest: { Uin, Sid, Skey, DeviceID },
+//   passTicket: "...",
+//   fromUserName: "@self...",
+//   toUserName: "@target...",
+//   webwxDataTicket: "...",
+//   skey: "@crypt_..."
+// }
+```
+
+Use these params to build the multipart upload request in any language. The upload endpoint requires IPv6 (`file.wx.qq.com` hangs on IPv4). The `uploadmediarequest` form field must contain a JSON object with `BaseRequest` at the top level (NOT double-wrapped).
+
+**`sendImageWithMediaId(to, mediaId)`** — Send a pre-uploaded image (browser-side).
+
+**`sendVideoWithMediaId(to, mediaId)`** — Send a pre-uploaded native video message (browser-side).
+
+**`sendFileWithMediaId(to, mediaId, filename, fileSize)`** — Send a pre-uploaded file (browser-side).
+
+### Contact Identification
+
+**Outside wechat-bro, contacts are identified by `name` only.** The `name` is the
+contact's display name (`RemarkName`/`NickName` — what users actually call them),
+normalized by `cleanName` (emoji HTML → Unicode, tags stripped). The account
+owner always has the constant name `"me"`. WeChat's internal `@hash UserName` and
+any romanized ids are never exposed to callers.
+
+All methods (`send`, `getContact`, `sendImage`, etc.) accept a contact **name**:
+- Display name: `'Alice'`, `'李诚'`, `'Dev Team'`
+- Self: `'me'`
+- System accounts: `'filehelper'`, `'weixin'`
+
+**Ambiguity is an error.** If a name matches more than one contact, actions
+(`send`, `send-image`, …) return an error instead of guessing. Room members are
+also addressed by contact name (their room-specific alias is handled internally);
+a stranger in a room has no contact name and can only be @mentioned, not DM'd.
+
+## Auto-Reinject
+
+The daemon detects WeChat navigation through CDP and re-injects AngularJS
+hooks once the page is ready. Runtime.addBinding survives new document loads.
+A missing login is reported as login_required without starting an unsolicited
+login flow.
+
+## Testing
+
+- npm test: offline protocol, routing, media and STT regression suites
+- WEBHELM_E2E=1 node test/test-cdp.js: real managed Chrome Session/CDP tests, no login
+- npm run test:live: integration test using manually authenticated WeChat
+- npm run test:live:exit: real daemon exit/restart/SIGTERM Group destruction tests (no messages sent)
+
+The WeChat Group holds one long-lived Session and is destroyed on daemon exit; do not run live browser tests
+while the production daemon holds that group lease. Real account tests must
+restrict outgoing contacts explicitly.
 
 ## Technical Notes
 
-- **IPv6 required for uploads**: `file.wx.qq.com` hangs on IPv4. The upload module uses `curl -6`.
-- **BaseRequest format**: `accountFactory.getBaseRequest()` returns `{BaseRequest: {...}}`. Must unwrap before use in upload requests — double-wrapping causes the server to silently hang.
-- **Cookie association login**: When cookies exist, WeChat shows a "Log in" button instead of QR. The bridge auto-clicks it.
-- **QR expiry**: Causes a full page reload. Auto-reinject handles this transparently.
-- **Contact readiness**: Uses `Object.defineProperty` trap on `contactFactory.contactChangeFlag` for reactive detection, with timer fallback.
+- Media uploads use curl -6 because file.wx.qq.com can require IPv6.
+- accountFactory.getBaseRequest() returns a wrapped BaseRequest property.
+- WebHelm manages the persistent Chrome profile and all authentication cookies.
+- QR expiry/reload triggers controlled CDP reinjection.
+- Contact readiness uses AngularJS events and a timer fallback.

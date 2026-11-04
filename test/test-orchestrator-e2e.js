@@ -185,6 +185,15 @@ cwd: ${path.join(tmpDir, 'contacts', '三人组')}
 
 const sent = []
 const sleep = (ms) => new Promise(r => setTimeout(r, ms))
+async function waitFor(predicate, timeoutMs = 5000) {
+  const until = Date.now() + timeoutMs
+  while (Date.now() < until) {
+    try { if (predicate()) return true } catch {}
+    await sleep(100)
+  }
+  return false
+}
+
 const runCli = (args) => new Promise((resolve) => {
   const p = spawn(process.execPath, [ORCH, ...args], { env: process.env, stdio: ['ignore', 'pipe', 'pipe'] })
   let stdout = '', stderr = ''
@@ -314,7 +323,10 @@ broadcast('message', { from: 'Alice', to: 'me', type: 'text', Content: '你能�
   ok(recordNotifies === 0, 'e2e: notify NOT sent for context-only (no response needed)')
   // 7b. ?! ping → ASSISTANT MODE
   broadcast('message', { from: 'Carol', to: 'me', type: 'text', Content: '?!帮我查下明天天气', ts: Date.now() })
-  await sleep(1500)
+  // Previous Carol task already created out4; wait for the next queued
+  // asynchronous worker to overwrite it, rather than reading stale content.
+  await waitFor(() => fs.existsSync(out4) && fs.readFileSync(out4, 'utf8').includes('ASSISTANT MODE') &&
+    !fs.readFileSync(out4, 'utf8').includes('CONTEXT-ONLY MESSAGE'), 5000)
   if (fs.existsSync(out4)) {
     const t = fs.readFileSync(out4, 'utf8')
     ok(t.includes('ASSISTANT MODE') && !t.includes('CONTEXT-ONLY MESSAGE'), 'e2e: assistant-managed contact, ?! ping → assistant mode')

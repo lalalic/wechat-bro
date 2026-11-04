@@ -70,6 +70,22 @@ async function run() {
   assert.strictEqual(replacement.readyData(true).loggedIn, false, 'ready state is current, not the pre-login snapshot')
   assert.throws(() => replacement.requireAuthenticated(), /login_required/)
   console.log('  ok - navigation/reinjection preserves prior auth and surfaces login_required')
+  let lateSignals = { pageReady: true, isLogin: false, bridgeLogin: false, contactsReady: false,
+    loginUi: true, chatUi: true, url: 'https://wx.qq.com/' }
+  const lateLifecycle = new DaemonLifecycle({
+    maxAttempts: 0, observer: { start(){}, stop(){} },
+    probe: async () => lateSignals,
+  }).setPage({})
+  await lateLifecycle.revalidate('initial')
+  assert.strictEqual(lateLifecycle.state, STATES.LOGIN_REQUIRED)
+  lateSignals = {...lateSignals, bridgeLogin: true, userName: '@me'}
+  lateLifecycle.handleBridgeEvent('login')
+  await new Promise(r=>setTimeout(r,10))
+  lateSignals = {...lateSignals, contactsReady: true}
+  lateLifecycle.handleBridgeEvent('contacts-ready')
+  await new Promise(r=>setTimeout(r,10))
+  assert.strictEqual(lateLifecycle.state, STATES.AUTHENTICATED)
+  lateLifecycle.stop()
 
   const oldPage = { generation: 1 }
   const newPage = { generation: 2 }

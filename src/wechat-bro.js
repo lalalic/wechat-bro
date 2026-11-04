@@ -872,7 +872,8 @@
           // filehelper/self are bot-private channels — prefix a visible icon so
           // the entry is identifiable as bot-authored at a glance.
           var selfUserName = getUserName()
-          if (userName === 'filehelper' || (selfUserName && userName === selfUserName)) {
+          if ((userName === 'filehelper' || (selfUserName && userName === selfUserName)) &&
+              !styled.trimStart().startsWith(BOT_ICON)) {
             styled = BOT_ICON + ' ' + styled
           }
           styled = AI_WATERMARK + styled

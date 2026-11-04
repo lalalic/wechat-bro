@@ -67,10 +67,13 @@ orchestrator 会把请示通过 `filehelper` 交给主人。主人对待处理�
 
 ### 5. 响应主人
 
+Orchestrator 为 Worker 提供当前版本的 wechat-bro 本地命令，不允许通过 npx 下载。只有命令返回 ok:true 且数据确认成功才可报告 addressed。发送失败或超时应报告 failed，不得假报成功。
+
+
 每条 `filehelper` 来信都要回复。执行类指令在真正完成对应文件/配置修改后再确认结果；问题直接给答案；只有歧义会导致错误修改时才先确认。
 
 ```bash
-echo '{"cmd":"send-text","to":"filehelper","content":"🤖 <回复>"}' | npx wechat-bro
+echo '{"cmd":"send-text","to":"filehelper","content":"🤖 <回复>"}' | wechat-bro
 ```
 
 回复保持简短。不要直接替 contact agent 回复联系人；联系人消息由对应 contact/room agent 处理。

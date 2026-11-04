@@ -77,6 +77,8 @@ async function live() {
       await browser.close()
       const state = await requestRuntime({ op: 'list' })
       assert(!state.sessions.some((s) => s.session_id === sid), 'Session must release its lease')
+      const capacity = await requestRuntime({ op: 'capacity', workspace: 'WeChat' })
+      assert.equal(capacity.poolSize, null, 'WeChat Group must be destroyed after Session close')
     }
     fs.rmSync(tmp, { recursive: true, force: true })
   }
