@@ -1,466 +1,51 @@
 # wechat-bro
 
-AI multi-agent interface for WeChat Web. Injects into [wx.qq.com](https://wx.qq.com) and exposes a WebSocket protocol for multi-agent automation.
-
-**Works with**: Any WebSocket client (agent frameworks, Copilot extensions, custom scripts).
+AI multi-agent interface for WeChat Web, using WebHelm-managed Chrome.
 
 ## Architecture
 
-```
-                    ┌──────────────────┐
- Agent A ──ws──────→│                  │
- Agent B ──ws──────→│  src/cli.js      │──→ wx.qq.com
- Agent C ──ws──────→│  (long‑lived)    │──→ Chrome
-                    └──────────────────┘
-                           │
-                           ▼ stdout (events + backward compat stdin)
-                           ▼ ~/.wechat-bro/messages.jsonl
-```
+- WebHelm owns Chrome, the persistent profile, the WeChat Tab Group, and one leased Session.
+- src/cdp.js uses the existing ws dependency to connect to the leased page over CDP.
+- src/wechat-bro.js keeps the AngularJS message hooks and delivers events through Runtime.addBinding.
+- src/cli.js preserves the existing WebSocket protocol on port 9231.
+- src/orchestrator.js preserves contact-specific Agents, routing, memory and escalation.
+- The Session heartbeats every 45 seconds and remains leased while the daemon runs.
 
-**Files:**
-
-| Path | Role |
-|---|---|
-| `src/wechat-bro.js` | Browser-side script. Injects `window.WechatyBro` into wx.qq.com. |
-| `src/cli.js` | WebSocket server (port 9231) + stdin interface for AI agents. |
-| `src/ws-server.js` | WebSocket server module with multi-agent broadcast. |
-| `src/upload.js` | Media upload via `curl -6`. Exports `sendImage()`, `sendVideo()`, `sendFile()`. |
-| `src/transcribe.js` | Voice transcription via Whisper STT. |
-| `test/test-inject.js` | 102 integration tests with real Chrome + WeChat account. |
-| `SKILL.md` | Agent skill documentation (commands, protocol, events). |
+There is no Puppeteer dependency, separate Chrome process, login-cookie export, or custom browser pool.
 
 ## Install
 
+Install WebHelm first and prepare its managed Chrome. Then install wechat-bro.
+
 ```bash
+webhelm setup
 npm install
+webhelm status
 ```
 
-Downloads and reuses a managed Chrome for Testing under `~/.wechat-bro/chromium/`. Set `CHROME_PATH` only when you explicitly want to override that browser.
-
-## Quick Start
+## Quick start
 
 ```bash
-# First run (will show QR code for login):
-wechat-bro --headed
-
-# Subsequent runs — headless with saved cookies:
-wechat-bro
-
-# Render the current login QR directly in this terminal (also works over SSH):
-wechat-bro barcode
-
-# Connect agents via WebSocket:
-ws://localhost:9231
+wechat-bro --daemon     # start with managed WeChat tab, without signing in
+wechat-bro --headed     # bring that tab forward when launching the daemon
+wechat-bro barcode      # inspect current login QR only when requested
+wechat-bro orchestrator --harness codex
 ```
 
-Events stream as JSON lines to stdout:
-```jsonl
-{"event":"scan","data":{"code":0,"url":"https://login.weixin.qq.com/qrcode/...","loginUrl":"https://login.weixin.qq.com/l/..."}}
-{"event":"scan","data":{"code":201,"userAvatar":"/Users/<you>/.wechat-bro/userAvatar.png"}}
-{"event":"login","data":{"name":"me","NickName":"李诚"}}
-{"event":"contacts-ready","data":{"total":248,"elapsedMs":25001}}
-{"event":"message","data":{"MsgType":1,"Content":"hello","from":"Alice","to":"me"}}
-{"event":"message","data":{"MsgType":1,"Content":"hey all","from":"Dev Team","sender":"Alice","mentionMe":false}}
-{"event":"message:text","data":{"MsgType":1,"Content":"hello"}}
-{"event":"message:image","data":{"MsgType":3,"content":"/Users/<you>/.wechat-bro/contacts/Alice/download/photo_459159189914210930.jpg","type":"image","from":"Alice","to":"me"}}
-{"event":"logout","data":"..."}
-```
-
-Message events are **simplified**: `content` is a local file path for media
-(image/voice/video — binaries are downloaded to the chat contact's own
-folder: `~/.wechat-bro/contacts/<contact name>/download/<filename>_<MsgId>.<ext>`)
-or extracted text/url otherwise. All raw wire-format noise (XML `Content`,
-`RecommendInfo`, `MMActual*`, …) and every empty field (`null`/`""`/`[]`)
-is stripped. Text messages keep the raw `Content` field.
-
-**Never emitted**: `app` (49, incl. file attachments & shared articles),
-`system` (10000), `recalled` (10002) — XML wire noise agents don't need.
-
-> **Login QR**: on a `scan` event, headless mode opens the QR URL in the
-> default browser. If that browser is unavailable (for example over SSH), run
-> `wechat-bro barcode` to render the current QR directly in the terminal.
-> When scanned (code 201), `userAvatar` is a **file path** to the downloaded
-> avatar at `~/.wechat-bro/userAvatar.png`.
-
-### Option 2: With Puppeteer
-
-```js
-const puppeteer = require('puppeteer')
-const fs = require('fs')
-const { sendImage, sendVideo, sendFile } = require('./src/upload')
-
-const INJECT = fs.readFileSync('./src/wechat-bro.js', 'utf-8')
-
-const browser = await puppeteer.launch({
-  executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  headless: false,
-})
-const page = await browser.newPage()
-
-// Expose the event bridge BEFORE injection
-await page.exposeFunction('sendToPuppeteer', (event, data) => {
-  console.log('EVENT:', event, data)
-})
-
-await page.goto('https://wx.qq.com', { waitUntil: 'domcontentloaded' })
-
-// Wait for Angular to bootstrap
-await page.waitForFunction(
-  () => typeof angular !== 'undefined' && angular.element(document).injector(),
-  { timeout: 30000 }
-)
-
-// Inject the bridge
-await page.evaluate(INJECT)
-await page.evaluate(() => WechatyBro.init())
-
-// --- After login + contacts-ready event ---
-
-// Send text — `to` is a contact NAME (e.g. "Alice", "李诚", "me", "filehelper";
-// "文件传输助手" also resolves to FileHelper automatically)
-await page.evaluate(() => WechatyBro.send('Alice', 'Hello! [Smile][Rose]'))
-
-// Send image (upload happens in Node.js, send happens in browser)
-const imgBuf = fs.readFileSync('photo.jpg')
-await sendImage(page, 'Alice', imgBuf, 'photo.jpg')
-
-// Send native video
-const videoBuf = fs.readFileSync('clip.mp4')
-await sendVideo(page, 'Alice', videoBuf, 'clip.mp4')
-
-// Send file
-const pdfBuf = fs.readFileSync('report.pdf')
-await sendFile(page, 'Alice', pdfBuf, 'report.pdf')
-```
-
-### Option 3: With Playwright
-
-```js
-const { chromium } = require('playwright')
-const fs = require('fs')
-
-const INJECT = fs.readFileSync('./src/wechat-bro.js', 'utf-8')
-
-const browser = await chromium.launch({ headless: false })
-const page = await browser.newPage()
-
-// Playwright equivalent of exposeFunction
-await page.exposeFunction('sendToPuppeteer', (event, data) => {
-  console.log('EVENT:', event, data)
-})
-
-await page.goto('https://wx.qq.com', { waitUntil: 'domcontentloaded' })
-await page.waitForFunction(
-  () => typeof angular !== 'undefined' && angular.element(document).injector()
-)
-
-await page.evaluate(INJECT)
-await page.evaluate(() => WechatyBro.init())
-```
-
-> **Note**: `src/upload.js` uses Puppeteer's `page.cookies()` and `page.evaluate()` APIs. For Playwright, you'll need to adapt the cookie extraction: `await context.cookies()`.
-
-### Option 4: In Electron
-
-```js
-// main.js
-const { BrowserWindow } = require('electron')
-const fs = require('fs')
-const INJECT = fs.readFileSync('./src/wechat-bro.js', 'utf-8')
-
-const win = new BrowserWindow({
-  webPreferences: { contextIsolation: false, nodeIntegration: false },
-})
-
-// Expose the event bridge
-win.webContents.executeJavaScript(`
-  window.sendToPuppeteer = function(event, data) {
-    require('electron').ipcRenderer.send('wechat-event', event, data)
-  }
-`)
-
-// Listen for events in main process
-const { ipcMain } = require('electron')
-ipcMain.on('wechat-event', (e, event, data) => {
-  console.log('WeChat event:', event, data)
-})
-
-win.loadURL('https://wx.qq.com')
-
-// After page load + Angular ready
-win.webContents.executeJavaScript(INJECT)
-win.webContents.executeJavaScript('WechatyBro.init()')
-```
-
-> **Note**: With `contextIsolation: true` (default in modern Electron), use `contextBridge.exposeInMainWorld` in a preload script instead.
-
-### Option 5: In iOS WebKit (WKWebView)
-
-WKWebView doesn't have Puppeteer's `exposeFunction` or `page.evaluate`. Communication uses `WKScriptMessageHandler` for events (browser → native) and `evaluateJavaScript` for API calls (native → browser).
-
-#### Setup
-
-```swift
-import WebKit
-
-class WeChatBridge: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
-    var webView: WKWebView!
-    let injectScript: String  // Contents of wechat-bro.js
-
-    func setup() {
-        let config = WKWebViewConfiguration()
-
-        // 1. Register native event handler
-        config.userContentController.add(self, name: "wechatEvent")
-
-        // 2. Define the event bridge BEFORE page loads (via user script)
-        let bridgeScript = WKUserScript(source: """
-            window.sendToPuppeteer = function(event, data) {
-                window.webkit.messageHandlers.wechatEvent.postMessage({
-                    event: event,
-                    data: data
-                });
-            };
-        """, injectionTime: .atDocumentStart, forMainFrameOnly: true)
-        config.userContentController.addUserScript(bridgeScript)
-
-        webView = WKWebView(frame: .zero, configuration: config)
-        webView.navigationDelegate = self
-        webView.load(URLRequest(url: URL(string: "https://wx.qq.com")!))
-    }
-
-    // 3. Inject after Angular is ready
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        waitForAngularAndInject()
-    }
-
-    func waitForAngularAndInject() {
-        webView.evaluateJavaScript("""
-            (typeof angular !== 'undefined' && angular.element(document).injector()) ? true : false
-        """) { result, _ in
-            if result as? Bool == true {
-                self.inject()
-            } else {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    self.waitForAngularAndInject()
-                }
-            }
-        }
-    }
-
-    func inject() {
-        webView.evaluateJavaScript(injectScript) { _, _ in
-            self.webView.evaluateJavaScript("WechatyBro.init()")
-        }
-    }
-
-    // 4. Receive events
-    func userContentController(_ controller: WKUserContentController,
-                               didReceive message: WKScriptMessage) {
-        guard let body = message.body as? [String: Any],
-              let event = body["event"] as? String else { return }
-        let data = body["data"]
-
-        switch event {
-        case "scan":
-            // Show QR code
-            if let d = data as? [String: Any], let url = d["loginUrl"] as? String {
-                print("Scan: \(url)")
-            }
-        case "login":
-            print("Logged in")
-        case "contacts-ready":
-            print("Contacts loaded")
-        case "message":
-            if let d = data as? [String: Any], let content = d["Content"] as? String {
-                print("Message: \(content)")
-            }
-        case "logout":
-            print("Logged out")
-            // Re-inject on next page load
-        default:
-            break
-        }
-    }
-}
-```
-
-#### Calling API Methods
-
-Since there's no `page.evaluate` in WKWebView, wrap API calls in `evaluateJavaScript`:
-
-```swift
-// Send text message
-func sendText(to: String, content: String) {
-    let escaped = content.replacingOccurrences(of: "'", with: "\\'")
-    webView.evaluateJavaScript("WechatyBro.send('\(to)', '\(escaped)')")
-}
-
-// Get contact list (async)
-func getContacts(completion: @escaping ([[String: Any]]) -> Void) {
-    webView.evaluateJavaScript("JSON.stringify(WechatyBro.contactList())") { result, _ in
-        guard let json = result as? String,
-              let data = json.data(using: .utf8),
-              let contacts = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
-        else { return completion([]) }
-        completion(contacts)
-    }
-}
-
-// Get a single contact
-func getContact(id: String, completion: @escaping ([String: Any]?) -> Void) {
-    webView.evaluateJavaScript("JSON.stringify(WechatyBro.getContact('\(id)'))") { result, _ in
-        guard let json = result as? String,
-              let data = json.data(using: .utf8),
-              let contact = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return completion(nil) }
-        completion(contact)
-    }
-}
-
-// Get supported emoji list
-func getEmojis(completion: @escaping ([String]) -> Void) {
-    webView.evaluateJavaScript("JSON.stringify(WechatyBro.getSupportedEmojis())") { result, _ in
-        guard let json = result as? String,
-              let data = json.data(using: .utf8),
-              let emojis = try? JSONSerialization.jsonObject(with: data) as? [String]
-        else { return completion([]) }
-        completion(emojis)
-    }
-}
-
-// Get contact avatar
-func getAvatar(id: String, completion: @escaping (String?) -> Void) {
-    webView.evaluateJavaScript("""
-        new Promise(function(resolve) {
-            WechatyBro.getContactImage('\(id)', resolve);
-        })
-    """) { result, _ in
-        completion(result as? String)
-    }
-}
-```
-
-#### Uploading Media from iOS
-
-`src/upload.js` is Node.js-only. For iOS, get upload params from wechat-bro.js and upload natively:
-
-```swift
-func sendImage(to: String, imageData: Data, filename: String) {
-    // 1. Get upload params from inject
-    webView.evaluateJavaScript("JSON.stringify(WechatyBro.getUploadParams('\(to)'))") { result, _ in
-        guard let json = result as? String,
-              let data = json.data(using: .utf8),
-              let params = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let uploadUrl = params["uploadUrl"] as? String,
-              let baseRequest = params["baseRequest"] as? [String: Any]
-        else { return }
-
-        // 2. Build multipart upload (MUST use IPv6 for file.wx.qq.com)
-        let boundary = "----WKBoundary\(UUID().uuidString)"
-        var body = Data()
-
-        let fields: [(String, String)] = [
-            ("id", "WU_FILE_0"),
-            ("name", filename),
-            ("type", "image/jpeg"),
-            ("size", "\(imageData.count)"),
-            ("mediatype", "pic"),
-            ("uploadmediarequest", self.buildUploadRequest(baseRequest: baseRequest,
-                params: params, fileSize: imageData.count)),
-            ("webwx_data_ticket", params["webwxDataTicket"] as? String ?? ""),
-            ("pass_ticket", params["passTicket"] as? String ?? ""),
-        ]
-
-        for (key, value) in fields {
-            body.append("--\(boundary)\r\n".data(using: .utf8)!)
-            body.append("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n".data(using: .utf8)!)
-            body.append("\(value)\r\n".data(using: .utf8)!)
-        }
-
-        // File field
-        body.append("--\(boundary)\r\n".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"filename\"; filename=\"\(filename)\"\r\n".data(using: .utf8)!)
-        body.append("Content-Type: image/jpeg\r\n\r\n".data(using: .utf8)!)
-        body.append(imageData)
-        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
-
-        // 3. Upload via URLSession
-        var request = URLRequest(url: URL(string: "\(uploadUrl)?f=json")!)
-        request.httpMethod = "POST"
-        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        request.httpBody = body
-
-        URLSession.shared.dataTask(with: request) { data, _, _ in
-            guard let data = data,
-                  let resp = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let mediaId = resp["MediaId"] as? String, !mediaId.isEmpty
-            else { return }
-
-            // 4. Send the uploaded image
-            DispatchQueue.main.async {
-                self.webView.evaluateJavaScript(
-                    "WechatyBro.sendImageWithMediaId('\(to)', '\(mediaId)')"
-                )
-            }
-        }.resume()
-    }
-}
-
-func buildUploadRequest(baseRequest: [String: Any], params: [String: Any], fileSize: Int) -> String {
-    let req: [String: Any] = [
-        "UploadType": 2,
-        "BaseRequest": baseRequest,  // Already unwrapped — do NOT double-wrap
-        "ClientMediaId": "\(Int(Date().timeIntervalSince1970 * 1000))",
-        "TotalLen": fileSize,
-        "StartPos": 0,
-        "DataLen": fileSize,
-        "MediaType": 4,
-        "FromUserName": params["fromUserName"] as? String ?? "",
-        "ToUserName": params["toUserName"] as? String ?? "",
-        "FileMd5": "",
-    ]
-    let data = try! JSONSerialization.data(withJSONObject: req)
-    return String(data: data, encoding: .utf8)!
-}
-```
-
-> **Important**: `file.wx.qq.com` hangs on IPv4 connections. On iOS, `URLSession` typically handles IPv6 correctly via Happy Eyeballs. If uploads hang, force IPv6 by resolving `file.wx.qq.com` to its AAAA record first.
-
-For **Appium** iOS testing with Safari:
-
-```js
-// Appium + WebDriverIO — poll-based event bridge
-const INJECT = fs.readFileSync('./src/wechat-bro.js', 'utf-8')
-
-await browser.url('https://wx.qq.com')
-await browser.waitUntil(async () => {
-  return browser.execute(() => typeof angular !== 'undefined' && !!angular.element(document).injector())
-}, { timeout: 30000 })
-
-await browser.execute(`
-  window._wechatEvents = [];
-  window.sendToPuppeteer = function(event, data) {
-    window._wechatEvents.push({event: event, data: data, ts: Date.now()});
-  };
-`)
-await browser.execute(INJECT)
-await browser.execute(() => WechatyBro.init())
-
-// Poll for events
-const events = await browser.execute(() => window._wechatEvents.splice(0))
-```
-
-### Option 6: Connect to existing Chrome via CDP
-
-```bash
-# Start Chrome with remote debugging
-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-  --remote-debugging-port=9222
-
-# Open wx.qq.com in that Chrome, then run:
-node test-inject.js
-```
+Without an authenticated WeChat account, the daemon stays alive and commands
+requiring login return login_required. It does not automatically open QR links or
+attempt to sign in. After manual sign-in, the existing orchestrator takes over.
+
+For custom clients, use the unchanged WebSocket interface:
+`ws://localhost:9231`.
+
+## Agent management through WeChat
+
+Use filehelper in the WeChat Web UI to list Agents, inspect and edit their
+Markdown definitions, configure watched contacts, switch modes, set rules and
+memory, and resolve escalations. The orchestrator stores overrides under
+`~/.wechat-bro/agents/` and reloads them on the next message. No separate
+Agent management dashboard is required.
 
 ## Events
 
@@ -592,145 +177,22 @@ const isAI = await page.evaluate((text) => WechatyBro.isFromAI(text), someConten
 
 **Cross-login replay suppression**: Every time you log into WeChat Web, the server replays recent history messages. These are automatically suppressed using a **CreateTime high-water mark**:
 - `wechat-bro.js` stores the highest `data.CreateTime` seen in a `wx_last_msg_time` cookie on `wx.qq.com`
-- The CLI (`src/cli.js`) saves/loads this cookie transparently alongside other cookies — no special logic needed
+- WebHelm manages the browser profile and retains this replay cookie across daemon restarts
 - On next login, `wechat-bro.js` reads the cookie, and any message with `CreateTime ≤ lastMsgTime` is silently dropped
-- The cookie survives process restarts (saved to `~/.wechat-bro/cookies.json` via `page.cookies()` / `page.setCookie()`)
 - Same-session dedup (duplicate Angular events) still uses `_seenMsgIds` (MsgId-based, 2h TTL, max 2000 entries)
 
 ### Testing
 
-**`simulateMessage(from, content, sender?, msgType?)`** — Simulate an incoming message for testing. Emits directly (bypasses Angular — safe for use alongside real WeChat). Accepts stable IDs.
-```js
-// Direct message
-await page.evaluate(() => WechatyBro.simulateMessage('alice', 'hello'))
-
-// Room message with sender
-await page.evaluate(() => WechatyBro.simulateMessage('mygroup', 'hey everyone', 'alice'))
-
-// Room message with @mention
-await page.evaluate(() => WechatyBro.simulateMessage(
-  'mygroup', '@Me\u2005 check this', 'alice'
-))
-// Emits: { from: room, sender: alice, mentions: ['me'], mentionMe: true, Content: '@Me\u2005 check this' }
-```
-
-### Markdown Styling
-
-`send()` auto-converts markdown to Unicode mathematical symbols:
-
-```js
-await page.evaluate(() => WechatyBro.send('filehelper', `# Report
-**Bold** and *italic* with \`code\`.
-- Bullet 1
-- Bullet 2
-> Blockquote
----
-~~old~~ replaced with **new**`))
-```
-
-Supported: `**bold**`, `*italic*`, `***bold italic***`, `` `monospace` ``, `~~strikethrough~~`,
-`# ## ###` headers, `- *` bullets, `1. 2. 3.` numbered lists (①②③), `> ` blockquotes, `---` rules, ` ``` ` code blocks.
-
-### Media Upload (Node.js side)
-
-```js
-const { sendImage, sendVideo, sendFile } = require('./src/upload')
-```
-
-**`sendImage(page, to, buffer, filename)`** — Upload and send an image.
-```js
-await sendImage(page, 'alice', fs.readFileSync('photo.jpg'), 'photo.jpg')
-```
-
-**`sendVideo(page, to, buffer, filename)`** — Upload and send a native video message.
-```js
-await sendVideo(page, 'alice', fs.readFileSync('clip.mp4'), 'clip.mp4')
-```
-
-**`sendFile(page, to, buffer, filename)`** — Upload and send a file.
-```js
-await sendFile(page, 'alice', fs.readFileSync('doc.pdf'), 'doc.pdf')
-```
-
-**`uploadMedia(page, to, buffer, filename)`** — Upload only, returns MediaId.
-```js
-const mediaId = await uploadMedia(page, 'alice', imgBuf, 'img.png')
-// Then send manually:
-await page.evaluate((to, id) => WechatyBro.sendImageWithMediaId(to, id), 'alice', mediaId)
-```
-
-### Low-Level Upload (for non-Node.js environments)
-
-**`getUploadParams(to)`** — Get all parameters needed to upload media (browser-side).
-```js
-const params = await page.evaluate(() => WechatyBro.getUploadParams('alice'))
-// {
-//   uploadUrl: "https://file.wx.qq.com/cgi-bin/mmwebwx-bin/webwxuploadmedia",
-//   baseRequest: { Uin, Sid, Skey, DeviceID },
-//   passTicket: "...",
-//   fromUserName: "@self...",
-//   toUserName: "@target...",
-//   webwxDataTicket: "...",
-//   skey: "@crypt_..."
-// }
-```
-
-Use these params to build the multipart upload request in any language. The upload endpoint requires IPv6 (`file.wx.qq.com` hangs on IPv4). The `uploadmediarequest` form field must contain a JSON object with `BaseRequest` at the top level (NOT double-wrapped).
-
-**`sendImageWithMediaId(to, mediaId)`** — Send a pre-uploaded image (browser-side).
-
-**`sendVideoWithMediaId(to, mediaId)`** — Send a pre-uploaded native video message (browser-side).
-
-**`sendFileWithMediaId(to, mediaId, filename, fileSize)`** — Send a pre-uploaded file (browser-side).
-
-### Contact Identification
-
-**Outside wechat-bro, contacts are identified by `name` only.** The `name` is the
-contact's display name (`RemarkName`/`NickName` — what users actually call them),
-normalized by `cleanName` (emoji HTML → Unicode, tags stripped). The account
-owner always has the constant name `"me"`. WeChat's internal `@hash UserName` and
-any romanized ids are never exposed to callers.
-
-All methods (`send`, `getContact`, `sendImage`, etc.) accept a contact **name**:
-- Display name: `'Alice'`, `'李诚'`, `'Dev Team'`
-- Self: `'me'`
-- System accounts: `'filehelper'`, `'weixin'`
-
-**Ambiguity is an error.** If a name matches more than one contact, actions
-(`send`, `send-image`, …) return an error instead of guessing. Room members are
-also addressed by contact name (their room-specific alias is handled internally);
-a stranger in a room has no contact name and can only be @mentioned, not DM'd.
-
-## Auto-Reinject
-
-The bridge automatically re-injects after page reloads (QR expiry, phone-initiated logout, etc.). When using Puppeteer/Playwright, set up a `framenavigated` listener:
-
-```js
-page.on('framenavigated', async (frame) => {
-  if (frame !== page.mainFrame()) return
-  if (!frame.url().includes('wx.qq.com')) return
-  
-  await page.waitForFunction(
-    () => typeof angular !== 'undefined' && angular.element(document).injector(),
-    { timeout: 15000 }
-  )
-  await page.evaluate(INJECT)
-  await page.evaluate(() => WechatyBro.init())
-})
-```
-
-## Testing
-
 ```bash
-# All tests (headless, uses saved cookies if available)
-node test/test-inject.js
-
-# Show browser window during tests
-node test/test-inject.js --headed
-
-# Force QR re-login (ignores saved cookies)
-node test/test-inject.js --first-login
+npm test
+WEBHELM_E2E=1 node test/test-cdp.js
+npm run test:live
 ```
+
+The offline tests do not need WeChat login. The WebHelm CDP test uses a
+temporary owned Session and sends no messages. The account integration suite
+requires manual login. Do not run live Session tests while the long-lived
+WeChat daemon already owns the single Tab Group lease.
 
 ## Technical Notes
 

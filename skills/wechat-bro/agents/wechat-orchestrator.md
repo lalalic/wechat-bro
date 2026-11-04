@@ -23,6 +23,17 @@ watch list 来自 `~/.wechat-bro/agents/*.md` frontmatter 中所有 `contacts:` 
 
 修改配置时保持 agent definition 有效；不要破坏该联系人原有 custom instructions。若联系人是否为群聊会影响 agent type 且无法确定，先用 wechat-bro 查询联系人详情。
 
+### 1A. 管理 Agent Markdown（通过 WeChat filehelper）
+
+主人可以直接用微信聊天作为管理界面，不需要额外的 Web 页面：
+
+- 列出所有 Agent → 调用当前 Agent loader 读取有效 Agent（用户覆盖优先于 package defaults），返回名称、type、关注联系人和 harness；
+- 查看某 Agent 内容 → 返回该 Agent 完整 frontmatter 和 prompt body。内容太长时分段回复，不要截断后声称完整；
+- 修改 Agent 内容、角色说明、路由或其他字段 → 精确编辑被点名的 Agent，保留其他字段和正文。若目标是 package default，先复制到用户 Agent 目录建立 override，不修改 npm 安装文件；
+- 修改后重新解析 frontmatter，检查 name/type/路由语义有效，再向主人确认；下一次 dispatch 会加载新定义。
+
+不要把不相干 Agent、联系人或全局规则一起改写。不得因请求“查看”而执行写操作。
+
 ### 2. 维护 rules 和 memory
 
 - global behavior rules → `~/.wechat-bro/rules.md`

@@ -4,20 +4,19 @@
  *
  * Bootstraps the REAL pipeline: Angular `message:add:success` broadcast →
  * hookMessageEvents (browser-side download + XML parse) → emit →
- * sendToPuppeteer → cli.js saveBinaryContent + simplifyMessageEvent.
+ * sendToWebHelm → cli.js saveBinaryContent + simplifyMessageEvent.
  * Simulated messages are broadcast exactly like real incoming messages.
  */
 'use strict'
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
-const puppeteer = require('puppeteer')
+const { WebHelmBrowser } = require('../src/cdp')
 
 const DATA_DIR = path.join(os.homedir(), '.wechat-bro')
-const COOKIE_FILE = path.join(DATA_DIR, 'cookies.json')
 const WX_URL = 'https://wx.qq.com'
 const INJECT_SCRIPT = fs.readFileSync(path.join(__dirname, '..', 'src', 'wechat-bro.js'), 'utf8')
-const { saveBinaryContent, simplifyMessageEvent } = require('/Users/lir/Workspace/free2/wechat-bro/src/cli.js')
+const { saveBinaryContent, simplifyMessageEvent } = require('../src/cli.js')
 
 const results = []
 function record(event, data) {
@@ -26,33 +25,13 @@ function record(event, data) {
   console.log('\n=== EVENT:', event, '===\n' + JSON.stringify(line))
 }
 
-function findChrome() {
-  const candidates = [
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    '/Applications/Chromium.app/Contents/MacOS/Chromium',
-  ]
-  for (const p of candidates) if (fs.existsSync(p)) return p
-  return puppeteer.executablePath()
-}
-
-;(async () => {
-  const browser = await puppeteer.launch({
-    executablePath: findChrome(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-web-security', '--disable-features=IsolateOrigins,site-per-process'],
-    defaultViewport: { width: 1280, height: 900 },
-  })
-  const page = (await browser.pages())[0]
+ ;(async () => {
+  const browser = await WebHelmBrowser.open({ url: 'about:blank', dataDir: DATA_DIR })
+  const page = browser.page
   page.on('console', m => { const t = m.text(); console.log('[page]', t.slice(0, 220)) })
   page.on('pageerror', e => console.log('[pageerror]', e.message))
 
-  if (fs.existsSync(COOKIE_FILE)) {
-    const raw = JSON.parse(fs.readFileSync(COOKIE_FILE, 'utf-8'))
-    const arr = Array.isArray(raw) ? raw : (raw.cookies || [])
-    if (arr.length) await page.setCookie(...arr)
-  }
-
-  await page.exposeFunction('sendToPuppeteer', (event, data) => {
+  await page.exposeFunction('sendToWebHelm', (event, data) => {
     // EXACT daemon pipeline (transcribe skipped: no real voiceBase64 in sims)
     try {
       saveBinaryContent(data)
@@ -65,6 +44,10 @@ function findChrome() {
 
   await page.goto(WX_URL, { waitUntil: 'domcontentloaded', timeout: 30000 })
   await page.waitForFunction(() => typeof angular !== 'undefined' && angular.element(document).injector(), { timeout: 30000 })
+  if (!await page.evaluate(() => !!(window.MMCgi && window.MMCgi.isLogin))) {
+    await browser.close()
+    throw new Error('login_required: manually log into WeChat before live E2E')
+  }
   await page.evaluate(INJECT_SCRIPT)
   await page.evaluate(() => {
     // Instrument: log every WechatyBro emit

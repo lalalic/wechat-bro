@@ -2,7 +2,7 @@
  * WeChat Web Bridge — Event-Driven Edition
  *
  * Hooks into AngularJS internals to detect login/logout/QR events reactively
- * (no polling). Communicates with main process via window.sendToPuppeteer().
+ * (no polling). Communicates with main process via window.sendToWebHelm().
  *
  * Event detection strategy:
  *   QR barcode:  $watch on loginScope.qrcodeUrl + MutationObserver fallback
@@ -524,8 +524,8 @@
 
     emit: function (event, data) {
       log('emit:', event, typeof data === 'object' ? JSON.stringify(data).substring(0, 120) : data)
-      if (typeof window.sendToPuppeteer === 'function') {
-        window.sendToPuppeteer(event, data)
+      if (typeof window.sendToWebHelm === 'function') {
+        window.sendToWebHelm(event, data)
       }
     },
 

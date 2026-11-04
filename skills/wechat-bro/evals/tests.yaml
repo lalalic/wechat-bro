@@ -237,3 +237,33 @@
   assert:
   - type: llm-rubric
     value: Should recommend the bundled orchestrator because these requirements match its managed watch/session/rules/escalation workflow.
+
+- description: 主人在 filehelper 列出所有 Agent
+  metadata:
+    category: agent-content-management
+  vars:
+    skill: file://../agents/wechat-orchestrator.md
+    input: 主人在 filehelper 问：列出我现在所有的 Agent，包括每个 Agent 的职责和关注的聊天。
+  assert:
+  - type: llm-rubric
+    value: 应通过当前 agent loader 读取有效定义并列出 name、type、关注联系人和 harness，用户 override 优先；不能只根据记忆猜测或因读取就修改文件。
+
+- description: 主人查看某个 Agent 的完整 Markdown
+  metadata:
+    category: agent-content-management
+  vars:
+    skill: file://../agents/wechat-orchestrator.md
+    input: 主人在 filehelper 说：把 room-maintainer Agent 的完整内容发给我，包含 frontmatter 和 body。
+  assert:
+  - type: llm-rubric
+    value: 应读取当前实际有效 agent 文件并完整反馈 frontmatter 与 prompt body；内容过长就分段，不得把截断内容冒充完整，也不得写入修改。
+
+- description: 主人编辑 package default Agent 不影响其他配置
+  metadata:
+    category: agent-content-management
+  vars:
+    skill: file://../agents/wechat-orchestrator.md
+    input: 主人在 filehelper 说：把 room-maintainer 的语气改得更简短，其他都保持不变。
+  assert:
+  - type: llm-rubric
+    value: 应精准编辑指定 Agent，若当前定义来自 package defaults 则在用户 agents 目录创建 override；保留其他正文、frontmatter 和其他 Agent，验证新定义有效，再回复下一次 dispatch 生效。

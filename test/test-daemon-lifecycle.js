@@ -18,6 +18,14 @@ async function run() {
     'startup bridge login + contacts-ready is authenticated even when MMCgi is stale')
   assert.strictEqual(classifyPageSignals({ isLogin: false, loginUi: true, chatUi: false }), STATES.LOGIN_REQUIRED)
   assert.strictEqual(classifyPageSignals({ pageLost: true }), STATES.RECOVERING)
+  assert.strictEqual(classifyPageSignals({
+    url: 'https://wx.qq.com/', pageReady: true, isLogin: false,
+    loginUi: true, chatUi: true, userName: '', bridgeLogin: false,
+  }), STATES.LOGIN_REQUIRED, 'login overlay may coexist with hidden chat DOM')
+  assert.strictEqual(classifyPageSignals({
+    url: 'https://wx.qq.com/', pageReady: true,
+    isLogin: false, loginUi: false, chatUi: false, userName: '',
+  }), STATES.LOGIN_REQUIRED, 'Angular-ready unauthenticated WeChat page is not a broken page')
   console.log('  ok - page signals distinguish authenticated, login_required, and page_lost')
 
   let now = 0

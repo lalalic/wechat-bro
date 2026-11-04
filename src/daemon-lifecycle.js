@@ -37,7 +37,17 @@ function classifyPageSignals(signals) {
 
   const loginUi = !!signals.loginUi
   const chatUi = !!signals.chatUi
-  if (signals.loginRequired || (signals.isLogin === false && loginUi && !chatUi)) {
+  // WeChat keeps the chat DOM mounted behind the login overlay. DOM
+  // existence alone must not make an unauthenticated login page look broken.
+  if (signals.loginRequired ||
+      (signals.isLogin === false && loginUi && !hasAccount && !signals.bridgeLogin)) {
+    return STATES.LOGIN_REQUIRED
+  }
+  // wx.qq.com's login screen may not use the legacy .login_box/.qrcode
+  // selectors. After Angular is ready, no account, no chat UI and false
+  // MMCgi.isLogin means normal login_required, not a crashed browser.
+  if (signals.pageReady !== false && signals.isLogin === false && !hasAccount && !chatUi &&
+      /^https:\/\/wx\.qq\.com(?:\/|$)/.test(String(signals.url || ''))) {
     return STATES.LOGIN_REQUIRED
   }
   if (signals.url && !loginUi && !chatUi && signals.isLogin === false) return STATES.RECOVERING

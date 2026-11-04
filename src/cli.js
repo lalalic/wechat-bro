@@ -3,7 +3,7 @@
 /**
  * cli.js — WebSocket + stdin JSON-line interface for AI agents.
  *
- * Runs a single long-lived Chrome process logged into wx.qq.com.
+ * Uses a long-lived WebHelm Chrome tab for wx.qq.com; never starts Chrome.
  * Supports multiple agents via WebSocket (ws://localhost:9231).
  * Also reads JSON commands from stdin for backward compatibility.
  *
@@ -41,7 +41,7 @@ const path = require('path')
 const os = require('os')
 const { execSync } = require('child_process')
 const readline = require('readline')
-const puppeteer = require('puppeteer')
+const { WebHelmBrowser, findSystemChrome } = require('./cdp')
 const qrcode = require('qrcode-terminal')
 // NOTE: WeChat login QR code is intentionally NOT drawn in the terminal.
 // The scan event emits {url} — open it in a browser window (headless mode)
@@ -56,11 +56,6 @@ const WECHAT_BRO_VERSION = require('../package.json').version
 
 // Overridable for tests so unit suites never touch the real ~/.wechat-bro
 const DATA_DIR = process.env.WECHAT_BRO_DATA_DIR || path.join(os.homedir(), '.wechat-bro')
-// Tell puppeteer where to find/store Chromium
-process.env.PUPPETEER_CACHE_DIR = path.join(DATA_DIR, 'chromium')
-
-const COOKIE_FILE = path.join(DATA_DIR, 'cookies.json')
-const BROWSER_PROFILE_DIR = path.join(DATA_DIR, 'browser-profile')
 const MESSAGES_FILE = path.join(DATA_DIR, 'messages.jsonl')
 const CONTACTS_DIR = path.join(DATA_DIR, 'contacts')
 
@@ -70,44 +65,15 @@ const HEADED = process.argv.includes('--headed')
 const QUIET = process.argv.includes('--quiet') || !process.stdin.isTTY
 const LOGIN_TIMEOUT = 300_000
 
-// ── Chrome detection ──────────────────────────────────────────────────────
-async function findChrome() {
-  const browserDir = path.join(DATA_DIR, 'chromium')
-  fs.mkdirSync(browserDir, { recursive: true })
-  const { Browser, BrowserTag, detectBrowserPlatform, install, resolveBuildId } = require('@puppeteer/browsers')
-  const platform = detectBrowserPlatform()
-  const buildId = await resolveBuildId(Browser.CHROME, platform, BrowserTag.STABLE)
-  const installed = await install({ browser: Browser.CHROME, buildId, cacheDir: browserDir, platform })
-  return installed.executablePath
-}
-
+// WebHelm owns Chrome, cookies and profile.
 function toLoginUrl(qrUrl) {
   if (!qrUrl || typeof qrUrl !== 'string') return null
   return qrUrl.replace('/qrcode/', '/l/')
 }
 
-function getBrowserLaunchOptions(executablePath = chromePath) {
-  return {
-    executablePath,
-    headless: !HEADED,
-    userDataDir: BROWSER_PROFILE_DIR,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-web-security', '--disable-features=IsolateOrigins,site-per-process'],
-    defaultViewport: { width: 1280, height: 900 },
-  }
-}
-
-async function loadCookieBackup(nextPage, file = COOKIE_FILE) {
-  if (!fs.existsSync(file)) return
-  try {
-    const raw = JSON.parse(fs.readFileSync(file, 'utf-8'))
-    const cookies = Array.isArray(raw) ? raw : (raw.cookies || [])
-    if (cookies.length) await nextPage.setCookie(...cookies)
-  } catch (e) { log('Cookie load:', e.message) }
-}
-
 let lastQrUrl = null
 let lastQrPayload = null
-let chromePath = null  // detected in main(), used by mermaid render
+let chromePath = null  // used only by media renderers
 let _wsBroadcast = null  // set by main() for event broadcasting
 
 // ── Persist binary content (base64) in events to disk → file path ────────
@@ -338,11 +304,13 @@ function log(...args) {
 let _wsServer = null  // set by main()
 let _exitSave = null  // set by main(): flush cookies to disk before exit
 let _lifecycle = null  // daemon-owned auth/lifecycle state
+let _releaseBrowser = null
 
 function shutdown() {
   log('Shutting down...')
   if (_lifecycle) { try { _lifecycle.stop() } catch {} }
   if (_exitSave) { try { _exitSave() } catch {} }
+  if (_releaseBrowser) { try { Promise.resolve(_releaseBrowser()).catch(e => log('Session release:', e.message)) } catch {} }
   if (_wsServer) {
     try { _wsServer.close() } catch {}
   }
@@ -352,40 +320,9 @@ function shutdown() {
 process.on('SIGINT', () => { shutdown(); setTimeout(() => process.exit(0), 2500) })
 process.on('SIGTERM', () => { shutdown(); setTimeout(() => process.exit(0), 2500) })
 
-// ── Cookie persistence ───────────────────────────────────────────────────
-// Cookies carry the whole session: login auth + the wx_last_msg_time replay
-// marker (the bridge updates that cookie in the browser as messages arrive).
-// A single save after contacts-ready is not enough:
-//   - shutdown before contacts-ready (up to 2 min) loses the fresh login →
-//     QR scan required on next start
-//   - messages arriving during the session never reach disk → replay marker
-//     stays 0 → duplicated events on next start
-// So: save right after login, periodically, and on every exit path.
-let _savingCookies = false
-
-async function saveCookies(page, file = COOKIE_FILE) {
-  if (_savingCookies) return
-  _savingCookies = true
-  try {
-    // Race the CDP call with a timeout so a hung browser can never leave
-    // _savingCookies stuck true (which would kill all future saves).
-    const c = await Promise.race([
-      page.cookies(),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('page.cookies() timeout')), 5000)),
-    ])
-    fs.writeFileSync(file, JSON.stringify(c, null, 2))
-  } catch (e) {
-    log('saveCookies:', e.message)
-  } finally {
-    _savingCookies = false
-  }
-}
-
-/** Exit-path cookie save: race a short timeout so a hung CDP call cannot
- *  block process.exit. */
-async function saveCookiesOnExit(page, timeoutMs = 2000) {
-  await Promise.race([saveCookies(page), new Promise(r => setTimeout(r, timeoutMs))])
-}
+// WebHelm persists its own Chrome profile. Never export login cookies here.
+async function saveCookies() {}
+async function saveCookiesOnExit() {}
 
 // ── CLI command parser ────────────────────────────────────────────────────
 // ── Port resolution (--port, --port=N, backward-compat --ws-port) ───────
@@ -724,8 +661,8 @@ async function main() {
   // spawn). Chrome + WebSocket server; serves all clients until `exit`.
   fs.mkdirSync(DATA_DIR, { recursive: true })
 
-  chromePath = process.env.CHROME_PATH || await findChrome()
-  log('Chrome:', chromePath, HEADED ? '(headed)' : '(headless)')
+  chromePath = findSystemChrome()
+  log('Browser: managed by WebHelm (WeChat group)')
 
   // Commands that arrive before the page is injected/initiated wait on this
   // promise (see _markPageReady below), instead of failing with
@@ -757,8 +694,10 @@ async function main() {
     process.exit(1)
   }
 
-  let browser = await puppeteer.launch(getBrowserLaunchOptions())
+  let browser = await WebHelmBrowser.open({ url: 'about:blank', headed: HEADED, dataDir: DATA_DIR })
   let page = (await browser.pages())[0]
+  _releaseBrowser = () => browser.close()
+  let bootstrapping = true
   let msgFd
   try { msgFd = fs.openSync(MESSAGES_FILE, 'a') } catch {}
 
@@ -774,7 +713,7 @@ async function main() {
   _lifecycle = lifecycle
   lifecycle.setPage(page).start()
 
-  async function handlePuppeteerEvent(event, data) {
+  async function handleBrowserEvent(event, data) {
     lifecycle.handleBridgeEvent(event)
     if (data && data.voiceBase64 && (event === 'message:voice' || (event === 'message' && data.MsgType === 34))) {
       transcribeVoice(data)
@@ -788,16 +727,14 @@ async function main() {
       try { fs.writeSync(msgFd, JSON.stringify(line) + '\n') } catch {}
     }
     if (event === 'scan' && data) {
+      // Report QR but never open login tabs or attempt login without user action.
       lastQrPayload = data
-      if (data.url && !HEADED && data.url !== lastQrUrl) {
-        lastQrUrl = data.url
-        const openCmd = process.platform === 'win32' ? 'start' : (process.platform === 'darwin' ? 'open' : 'xdg-open')
-        execSync(`${openCmd} "${data.url}" 2>/dev/null || true`, { shell: true })
-      }
+      lastQrUrl = data.url || null
     }
   }
 
   function wireBrowser(nextBrowser) {
+    nextBrowser.on('heartbeat-error', (error) => log('WebHelm heartbeat:', error.message))
     nextBrowser.on('disconnected', () => {
       if (nextBrowser === browser) lifecycle.pageLost('browser disconnected')
     })
@@ -806,7 +743,7 @@ async function main() {
   async function wirePage(nextPage) {
     nextPage.on('dialog', async (dialog) => { log('Dialog:', dialog.message()); await dialog.accept() })
     nextPage.on('framenavigated', async (frame) => {
-      if (nextPage !== page || frame !== nextPage.mainFrame() || !frame.url().includes('wx.qq.com')) return
+      if (bootstrapping || nextPage !== page || frame !== nextPage.mainFrame() || !frame.url().includes('wx.qq.com')) return
       lifecycle.pageReplaced(nextPage, 'page navigation')
       log('Page navigated — re-injecting')
       try {
@@ -823,41 +760,34 @@ async function main() {
     nextPage.on('close', () => {
       if (nextPage === page) lifecycle.pageLost('page closed')
     })
-    await nextPage.exposeFunction('sendToPuppeteer', handlePuppeteerEvent)
+    await nextPage.exposeFunction('sendToWebHelm', handleBrowserEvent)
   }
 
   async function reconnectBrowser(reason) {
     const oldBrowser = browser
     const oldPage = page
-    try { await saveCookiesOnExit(oldPage) } catch {}
+    bootstrapping = true
     page = null
     browser = null
     try { await oldBrowser.close() } catch {}
-    try {
-      const processHandle = oldBrowser && oldBrowser.process && oldBrowser.process()
-      if (processHandle && !processHandle.killed) processHandle.kill('SIGTERM')
-    } catch {}
-
-    browser = await puppeteer.launch(getBrowserLaunchOptions())
+    browser = await WebHelmBrowser.open({ url: 'about:blank', headed: HEADED, dataDir: DATA_DIR })
+    _releaseBrowser = () => browser.close()
     page = (await browser.pages())[0]
     lifecycle.setPage(page)
     wireBrowser(browser)
     await wirePage(page)
-    await loadCookieBackup(page)
     await page.goto(WX_URL, { waitUntil: 'domcontentloaded', timeout: 30000 })
     await page.waitForFunction(() => typeof angular !== 'undefined' && angular.element(document).injector(), { timeout: 30000 })
     await page.evaluate(INJECT_SCRIPT)
     await page.evaluate(() => { if (window.WechatyBro && !window.WechatyBro.vars.initState) return window.WechatyBro.init(); return { code: 304 } })
     await page.evaluate(() => { if (window.WechatyBro) window.WechatyBro._loadLastMsgTime() })
+    bootstrapping = false
     log('Browser/page recovered after', reason)
     return page
   }
 
   wireBrowser(browser)
   await wirePage(page)
-
-  // Load cookies
-  await loadCookieBackup(page)
 
   await page.goto(WX_URL, { waitUntil: 'domcontentloaded', timeout: 30000 })
   await page.waitForFunction(() => typeof angular !== 'undefined' && angular.element(document).injector(), { timeout: 30000 })
@@ -870,29 +800,15 @@ async function main() {
   })
   log('Init:', initResult.code, initResult.message)
 
-  // Login
+  // Unauthenticated is a normal, intentional state. Do not block waiting
+  // for QR or contacts; serve status and fail fast on authenticated commands.
   const isLoggedIn = await page.evaluate(() => !!(window.MMCgi && window.MMCgi.isLogin))
-  if (!isLoggedIn) {
-    log('Waiting for QR scan...')
-    try { await page.waitForFunction(() => window.WechatyBro && window.WechatyBro.vars.loginState === true, { timeout: LOGIN_TIMEOUT }); log('Login detected') } catch (e) { log('Login timeout') }
-  } else { log('Already logged in') }
-
-  // Persist the session immediately after login — contacts-ready can take up
-  // to 2 minutes; a shutdown before it must not lose the login (QR again).
-  await saveCookies(page)
-
-  try { await page.waitForFunction(() => window.WechatyBro && window.WechatyBro.vars.contactsReady === true, { timeout: 120_000 }); log('Contacts ready') } catch {}
-  await saveCookies(page)
+  if (isLoggedIn) {
+    log('Already logged in')
+    try { await page.waitForFunction(() => window.WechatyBro && window.WechatyBro.vars.contactsReady === true, { timeout: 120_000 }) } catch {}
+  } else { log('login_required: user has not signed in') }
+  bootstrapping = false
   await lifecycle.revalidate('startup ready')
-
-  // Periodic snapshot: session cookies rotate and the bridge keeps updating
-  // the wx_last_msg_time replay marker as messages arrive — persist both.
-  // 15s bounds the duplicate-replay window on a hard kill (crash / kill -9);
-  // clean exits flush immediately. (unref: don't hold the loop open for this)
-  const cookieSaver = setInterval(() => { saveCookies(page) }, 15_000)
-  if (cookieSaver.unref) cookieSaver.unref()
-  // Exit paths flush cookies first (see shutdown() + 'exit' command below)
-  _exitSave = () => saveCookiesOnExit(page)
 
   // Emit a "ready" event so the agent knows it can start sending commands
   write({ event: 'ready', data: lifecycle.readyData(!!(lifecycle.lastSignals && lifecycle.lastSignals.contactsReady)) })
@@ -918,13 +834,6 @@ async function main() {
   _markPageReady()
 
   log('Daemon ready — serving WebSocket clients on ws://localhost:' + WS_PORT)
-  
-  // Send notification to filehelper when daemon is ready
-  try {
-    await sendText(page, 'filehelper', '✅✅✅✅✅')
-  } catch (e) {
-    log('Failed to send notification to filehelper:', e.message)
-  }
   
   // Daemon stays alive until `exit` command, SIGINT or SIGTERM.
   // (No stdin reader: background-spawned daemons have no stdin.)
@@ -1189,11 +1098,7 @@ if (require.main === module) {
 
 // Exported for unit tests
 module.exports = {
-  getBrowserLaunchOptions,
-  loadCookieBackup,
   parseSegments,
   saveBinaryContent,
   simplifyMessageEvent,
-  saveCookies,
-  saveCookiesOnExit,
 }

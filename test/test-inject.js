@@ -26,7 +26,7 @@
 
 'use strict'
 
-const puppeteer = require('puppeteer')
+const { WebHelmBrowser } = require('../src/cdp')
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
@@ -35,7 +35,6 @@ const qrTerm = require('qrcode-terminal')
 const { transcribeVoice } = require('../src/transcribe')
 
 const DATA_DIR = path.join(os.homedir(), '.wechat-bro')
-const COOKIE_FILE = path.join(DATA_DIR, 'cookies.json')
 const WX_URL = 'https://wx.qq.com'
 const INJECT_SCRIPT = fs.readFileSync(path.join(__dirname, '..', 'src', 'wechat-bro.js'), 'utf-8')
 
@@ -44,32 +43,6 @@ fs.mkdirSync(DATA_DIR, { recursive: true })
 const FIRST_LOGIN = process.argv.includes('--first-login')
 const HEADED = process.argv.includes('--headed')
 const LOGIN_TIMEOUT = 300_000  // 5 min for QR scan
-
-// ── Chrome detection ──────────────────────────────────────────────────────
-function findChrome() {
-  const { platform } = process
-  const isWin = platform === 'win32'
-  const candidates = [
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    '/Applications/Chromium.app/Contents/MacOS/Chromium',
-    '/usr/bin/google-chrome',
-    '/usr/bin/chromium-browser',
-    '/usr/bin/google-chrome-stable',
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-    path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'Application', 'chrome.exe'),
-  ]
-  for (const p of candidates) {
-    if (fs.existsSync(p)) return p
-  }
-  try {
-    const whichCmd = isWin ? 'where' : 'which'
-    const nullDev = isWin ? 'nul' : '/dev/null'
-    return execSync(`${whichCmd} google-chrome chrome chromium chromium-browser 2>${nullDev}`, { encoding: 'utf-8', shell: true }).trim().split(/\r?\n/)[0]
-  } catch { /* fall through */ }
-  console.error('Chrome not found. Set CHROME_PATH env var.')
-  process.exit(1)
-}
 
 // ── URL conversion (pure, no browser needed) ──────────────────────────────
 function toLoginUrl(qrUrl) {
@@ -114,41 +87,13 @@ async function main() {
   eq(toLoginUrl(123), null, 'returns null for non-string')
   eq(toLoginUrl('/qrcode/x'), '/l/x', 'works with relative path')
 
-  // ── Launch browser ────────────────────────────────────────────────────
-  const chromePath = process.env.CHROME_PATH || findChrome()
-  console.log(`\n  Chrome: ${chromePath}`)
-
-  const browser = await puppeteer.launch({
-    executablePath: chromePath,
-    headless: !HEADED,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-web-security',
-      '--disable-features=IsolateOrigins,site-per-process',
-    ],
-    defaultViewport: { width: 1280, height: 900 },
-  })
-  const page = (await browser.pages())[0]
-
-  suite('2. Browser launch')
-
-  ok(true, 'browser launched successfully')
-  ok(page !== null, 'page is available')
-  ok(!browser.process().killed, 'browser process is alive')
-
-  // ── Cookie load ───────────────────────────────────────────────────────
-  if (!FIRST_LOGIN && fs.existsSync(COOKIE_FILE)) {
-    try {
-      const cookies = JSON.parse(fs.readFileSync(COOKIE_FILE, 'utf-8'))
-      if (cookies.length) {
-        await page.setCookie(...cookies)
-        console.log(`    Loaded ${cookies.length} cookies from ${COOKIE_FILE}`)
-      }
-    } catch (e) {
-      console.log(`    Cookie load skipped (${e.message})`)
-    }
-  }
+  // ── Allocate a WeChat tab through WebHelm; do not start Chrome ───────
+  const browser = await WebHelmBrowser.open({ url: 'about:blank', headed: HEADED, dataDir: DATA_DIR })
+  const page = browser.page
+  suite('2. WebHelm-managed browser')
+  ok(!!browser.sessionId, 'WebHelm Session was leased')
+  ok(page !== null, 'CDP page is available')
+  ok(browser.closed === false, 'Session is active')
 
   // ── Navigate to wx.qq.com ──────────────────────────────────────────────
   await page.goto(WX_URL, { waitUntil: 'domcontentloaded', timeout: 30000 })
@@ -167,7 +112,7 @@ async function main() {
   // ── Expose event bridge & inject ──────────────────────────────────────
   const receivedEvents = []
 
-  await page.exposeFunction('sendToPuppeteer', (event, data) => {
+  await page.exposeFunction('sendToWebHelm', (event, data) => {
     // Transcribe voice messages (synchronous, modifies data in-place)
     if (data && data.voiceBase64 &&
         (event === 'message:voice' || (event === 'message' && data.MsgType === 34))) {
@@ -209,36 +154,11 @@ async function main() {
 
   suite('5. Login detection')
 
-  if (isLoggedIn) {
-    ok(true, 'already logged in via cookies')
-
-    // Save cookies for next run
-    const cookies = await page.cookies()
-    fs.writeFileSync(COOKIE_FILE, JSON.stringify(cookies, null, 2))
-    console.log(`    Saved ${cookies.length} cookies`)
-  } else {
-    // Wait for QR scan — we need to detect scan events
-    console.log('    Not logged in — waiting for QR scan (up to 5 min)...')
-    ok(true, 'login page shown (QR code expected)')
-
-    // The bridge's WechatyBro will emit scan events via sendToPuppeteer
-    // We can watch receivedEvents for login event
-    try {
-      await page.waitForFunction(
-        () => window.WechatyBro && window.WechatyBro.vars.loginState === true,
-        { timeout: LOGIN_TIMEOUT }
-      )
-      ok(true, 'login detected within timeout')
-
-      // Save cookies after login
-      const cookies = await page.cookies()
-      fs.writeFileSync(COOKIE_FILE, JSON.stringify(cookies, null, 2))
-      console.log(`    Saved ${cookies.length} cookies after login`)
-    } catch (e) {
-      ok(false, `login timeout (${LOGIN_TIMEOUT / 1000}s) — scan QR and re-run`)
-      // Continue with whatever state we have
-    }
+  if (!isLoggedIn) {
+    await browser.close()
+    throw new Error('login_required: intentionally unauthenticated; manual login required before live tests')
   }
+  ok(true, 'account is authenticated in the WebHelm Chrome profile')
 
   // ── Wait for contacts-ready ───────────────────────────────────────────
   suite('6. Contacts-ready event')
@@ -604,7 +524,7 @@ async function main() {
       // emit with old CreateTime should NOT create additional events.
       // Actually simulateMessage already emits events. Let me think...
       // simulateMessage internally calls WechatyBro.emit('message', data) which
-      // goes to sendToPuppeteer, not through emitTypedMessage.
+      // goes to sendToWebHelm, not through emitTypedMessage.
       // So the suppression in emitTypedMessage wouldn't catch it.
       // Let me use a different approach: directly call emitTypedMessage.
       ok(true, 'replay suppression tested via emitTypedMessage path')
@@ -979,7 +899,7 @@ async function main() {
        `voiceText produced: "${voiceData.voiceText}"`)
 
     // 2) Test that the bridge's emitEvent path also transcribes.
-    // Emit a voice message from the browser page; the test's sendToPuppeteer
+    // Emit a voice message from the browser page; the test's sendToWebHelm
     // handler captures it. We then check that voiceText is present.
     const beforeVoice = receivedEvents.length
 
@@ -1146,9 +1066,7 @@ async function main() {
   let shutdownCalled = false
   process.on('SIGINT', async () => {
     shutdownCalled = true
-    const cookies = await page.cookies()
-    fs.writeFileSync(COOKIE_FILE, JSON.stringify(cookies, null, 2))
-    console.log(`    SIGINT: saved ${cookies.length} cookies`)
+    // WebHelm persists profile and cookies on graceful shutdown.
     await browser.close()
     process.exit(0)
   })

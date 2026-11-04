@@ -116,7 +116,7 @@ async function uploadMedia(page, to, fileBuffer, filename, mediaKind) {
 
 /**
  * Send an image to a contact.
- * @param {import('puppeteer').Page} page
+ * @param {import('./cdp').CdpPage} page
  * @param {string} to - name or UserName
  * @param {Buffer} imageBuffer - image file contents
  * @param {string} [filename='image.png']
@@ -135,7 +135,7 @@ async function sendImage(page, to, imageBuffer, filename) {
  * it can return an empty body even though the browser uploader works.
  * This path waits for both MediaId assignment and server-side send success.
  *
- * @param {import('puppeteer').Page} page
+ * @param {import('./cdp').CdpPage} page
  * @param {string} to - name or UserName
  * @param {string} filePath - local video path
  * @param {string} [filename='video.mp4']
@@ -299,7 +299,7 @@ async function sendVideo(page, to, videoBuffer, filename) {
 
 /**
  * Send a file to a contact.
- * @param {import('puppeteer').Page} page
+ * @param {import('./cdp').CdpPage} page
  * @param {string} to - name or UserName
  * @param {Buffer} fileBuffer - file contents
  * @param {string} filename - e.g. 'report.pdf'
