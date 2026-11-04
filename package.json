@@ -13,11 +13,12 @@
   ],
   "scripts": {
     "start": "node src/cli.js",
-    "test": "node test/test-cdp.js && node test/test-browser-profile.js && node test/test-cookies.js && node test/test-daemon-lifecycle.js && node test/test-transcribe-async.js && node test/test-simplify.js && node test/test-orchestrator.js && node test/test-ws-server.js && node test/test-watch-control.js && node test/test-next-action.js && node test/test-send-video.js && node test/test-parse.js && node test/test-ai-media-origin.js",
+    "test": "node test/test-webhelm-dependency.js && node test/test-bridge-compat.js && node test/test-cdp.js && node test/test-browser-profile.js && node test/test-cookies.js && node test/test-daemon-lifecycle.js && node test/test-transcribe-async.js && node test/test-simplify.js && node test/test-orchestrator.js && node test/test-ws-server.js && node test/test-watch-control.js && node test/test-next-action.js && node test/test-send-video.js && node test/test-parse.js && node test/test-ai-media-origin.js",
     "eval:skill": "npx promptfoo@latest eval -c skills/wechat-bro/evals/promptfooconfig.yaml",
     "push": "GIT_SSH_COMMAND=\"ssh -i ~/.ssh/id_ed25519_1 -o IdentitiesOnly=yes\" git push",
     "test:live": "node test/test-inject.js",
-    "test:live:exit": "node test/test-daemon-exit.js"
+    "test:live:exit": "node test/test-daemon-exit.js",
+    "doctor": "node src/cli.js doctor"
   },
   "engines": {
     "node": ">=18"

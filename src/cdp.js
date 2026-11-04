@@ -15,7 +15,6 @@
  * injected bridge (wechat-bro.js) and its callers stay unchanged.
  */
 
-const { execFile } = require('child_process')
 const { EventEmitter } = require('events')
 const fs = require('fs')
 const net = require('net')
@@ -23,24 +22,11 @@ const os = require('os')
 const path = require('path')
 const WebSocket = require('ws')
 
-const DEFAULT_ENDPOINT = 'http://127.0.0.1:9222'
+const MIN_WEBHELM_VERSION = '1.0.1'
 const HEARTBEAT_MS = 45_000
 const SESSION_FILE = 'webhelm-session.json'
 const WECHAT_WORKSPACE = 'WeChat'
 const COOKIE_FIELDS = ['name', 'value', 'url', 'domain', 'path', 'secure', 'httpOnly', 'sameSite', 'expires', 'priority']
-
-// ── webhelm CLI ───────────────────────────────────────────────────────────
-function webhelmBin() { return process.env.WEBHELM_BIN || 'webhelm' }
-function webhelmEnv() { return { ...process.env, NODE_NO_WARNINGS: '1' } }
-
-function webhelm(args, timeout = 30_000) {
-  return new Promise((resolve, reject) => {
-    execFile(webhelmBin(), args, { encoding: 'utf8', timeout, env: webhelmEnv() }, (err, stdout, stderr) => {
-      if (err) return reject(new Error(`webhelm ${args.join(' ')} failed: ${String(stderr || err.message).trim().slice(0, 300)}`))
-      resolve(stdout)
-    })
-  })
-}
 
 // App-owned Workspaces are provisioned through WebHelm's daemon IPC.
 // Never attach a tab without a WebHelm Session lease.
@@ -81,22 +67,65 @@ function requestRuntime(payload, timeout = 30000) {
   })
 }
 
-function parseJson(text) {
-  const s = String(text)
-  const i = s.indexOf('{')
-  return JSON.parse(i >= 0 ? s.slice(i) : s)
+/**
+ * WebHelm is a REQUIRED external runtime/service, not a Node dependency.
+ * Validate the IPC protocol and managed Chrome before allocating any tabs.
+ * Do not silently attach to an unrelated browser on 127.0.0.1:9222.
+ */
+function versionAtLeast(actual, required = MIN_WEBHELM_VERSION) {
+  const version = String(actual || '').match(/^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/)
+  if (!version) return false
+  const current = version.slice(1, 4).map(Number)
+  const min = required.split('.').map(Number)
+  for (let i = 0; i < 3; i++) {
+    if (current[i] !== min[i]) return current[i] > min[i]
+  }
+  return true
 }
 
-async function resolveEndpoint() {
-  if (process.env.WEBHELM_CDP_ENDPOINT) return process.env.WEBHELM_CDP_ENDPOINT
+function wsBase(endpoint) { return endpoint.replace(/^http/, "ws").replace(/\/+$/, "") }
+
+function dependencyError(message) {
+  const error = new Error('webhelm_unavailable: ' + message +
+    '. Install/setup WebHelm and verify its daemon: webhelm setup; webhelm status')
+  error.code = 'webhelm_unavailable'
+  return error
+}
+
+async function resolveEndpoint({ request = requestRuntime, env = process.env } = {}) {
+  let status
   try {
-    const status = parseJson(await webhelm(['status'], 15_000))
-    if (status && status.managed_chrome && status.managed_chrome.endpoint) return status.managed_chrome.endpoint
-  } catch {}
-  return DEFAULT_ENDPOINT
+    status = await request({ op: 'ping' }, 10000)
+  } catch (error) {
+    throw dependencyError('Session IPC not responding (' + error.message + ')')
+  }
+  if (!status || !status.ok) throw dependencyError('Session IPC ping returned an invalid response')
+  if (!versionAtLeast(status.version)) {
+    throw dependencyError('Runtime version ' + String(status.version || 'unknown') +
+      ' is older than required ' + MIN_WEBHELM_VERSION)
+  }
+  const endpoint = status.managed_chrome && status.managed_chrome.endpoint
+  if (typeof endpoint !== 'string' || !/^https?:\/\//.test(endpoint)) {
+    throw dependencyError('Runtime did not report a managed Chrome CDP endpoint')
+  }
+  if (env.WEBHELM_CDP_ENDPOINT &&
+      env.WEBHELM_CDP_ENDPOINT.replace(/\/+$/, '') !== endpoint.replace(/\/+$/, '')) {
+    throw dependencyError('WEBHELM_CDP_ENDPOINT differs from the WebHelm-owned Chrome endpoint')
+  }
+  let guard = status.chrome_guard
+  if (!guard || guard.status !== 'healthy') {
+    try {
+      const recovered = await request({ op: 'guard-check' }, 15000)
+      guard = recovered && recovered.chrome_guard
+    } catch (error) {
+      throw dependencyError('managed Chrome health check failed (' + error.message + ')')
+    }
+  }
+  if (!guard || (guard.status !== 'healthy' && !guard.skipped)) {
+    throw dependencyError('managed Chrome is ' + String(guard && guard.status || 'unavailable'))
+  }
+  return { endpoint, version: status.version, profile: status.managed_chrome.profile_dir }
 }
-
-function wsBase(endpoint) { return endpoint.replace(/^http/, 'ws').replace(/\/+$/, '') }
 
 /**
  * A daemon exclusively owns the named WeChat workspace. Never touch another
@@ -468,7 +497,7 @@ class WebHelmBrowser extends EventEmitter {
 
   /** Open one tab through WebHelm. Never launches or kills Chrome. */
   static async open({ url = 'about:blank', headed = false, dataDir, viewport } = {}) {
-    const endpoint = await resolveEndpoint()
+    const { endpoint } = await resolveEndpoint()
     await reapStaleSession(dataDir)
     await requestRuntime({ op: 'workspace-create', name: WECHAT_WORKSPACE, pool_size: 1 })
     const started = await requestRuntime({ op: 'start', workspace: WECHAT_WORKSPACE, url })
@@ -519,4 +548,4 @@ function findSystemChrome() {
   return candidates.find((p) => fs.existsSync(p)) || null
 }
 
-module.exports = { WebHelmBrowser, CdpPage, CdpConnection, findSystemChrome, serializeArgs, requestRuntime, destroyWechatWorkspace }
+module.exports = { WebHelmBrowser, CdpPage, CdpConnection, findSystemChrome, serializeArgs, requestRuntime, destroyWechatWorkspace, resolveEndpoint, versionAtLeast, MIN_WEBHELM_VERSION, wsBase }

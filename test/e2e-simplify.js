@@ -13,7 +13,8 @@ const os = require('os')
 const path = require('path')
 const { WebHelmBrowser } = require('../src/cdp')
 
-const DATA_DIR = path.join(os.homedir(), '.wechat-bro')
+const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-bro-simplify-e2e-'))
+process.env.WECHAT_BRO_DATA_DIR = DATA_DIR
 const WX_URL = 'https://wx.qq.com'
 const INJECT_SCRIPT = fs.readFileSync(path.join(__dirname, '..', 'src', 'wechat-bro.js'), 'utf8')
 const { saveBinaryContent, simplifyMessageEvent } = require('../src/cli.js')
@@ -25,8 +26,10 @@ function record(event, data) {
   console.log('\n=== EVENT:', event, '===\n' + JSON.stringify(line))
 }
 
- ;(async () => {
+let activeBrowser = null
+;(async () => {
   const browser = await WebHelmBrowser.open({ url: 'about:blank', dataDir: DATA_DIR })
+  activeBrowser = browser
   const page = browser.page
   page.on('console', m => { const t = m.text(); console.log('[page]', t.slice(0, 220)) })
   page.on('pageerror', e => console.log('[pageerror]', e.message))
@@ -156,5 +159,12 @@ function record(event, data) {
 
   console.log(`\n--- E2E: passed ${pass}, failed ${fail} ---`)
   await browser.close()
+  activeBrowser = null
+  fs.rmSync(DATA_DIR, { recursive: true, force: true })
   process.exit(fail ? 1 : 0)
-})().catch(e => { console.error('E2E fatal:', e.message); process.exit(1) })
+})().catch(async e => {
+  console.error('E2E fatal:', e.message)
+  if (activeBrowser) { try { await activeBrowser.close() } catch {} }
+  fs.rmSync(DATA_DIR, { recursive: true, force: true })
+  process.exit(1)
+})

@@ -1,27 +1,12 @@
 #!/usr/bin/env node
 
 /**
- * test-inject.js — Real-account integration tests for wechat-bro
+ * Real-account WebHelm integration suite. Sends test messages to filehelper
+ * and, only if explicitly found, the approved testneo room. Never selects a
+ * random room. Reuses the WebHelm-owned Chrome authentication profile.
  *
- * Launches Chrome, loads wx.qq.com, logs in (cookies or QR), and verifies
- * the full lifecycle with a real WeChat account:
- *   - Chrome detection & browser launch
- *   - Page load & Angular bootstrap
- *   - wechat-bro.js injection & init
- *   - Scan / login / contacts-ready / heartbeat events
- *   - Cookie persistence (save + load across reloads)
- *   - Auto-reinject on navigation
- *   - Dialog handling
- *   - QR code rendering (stderr)
- *   - JSON event format
- *   - Graceful shutdown (SIGINT / SIGTERM)
- *   - toLoginUrl conversion
- *
- * Usage:
- *   node test-inject.js                     # Headless, use cookies if available
- *   node test-inject.js --headed            # Show browser window
- *   node test-inject.js --first-login       # Force QR scan, save new cookies
- *   node test-inject.js --headed --first-login
+ * Run only when the WeChat daemon is stopped and the real WeChat account is
+ * signed in. Does not import/export any login cookies.
  */
 
 'use strict'
@@ -30,19 +15,15 @@ const { WebHelmBrowser } = require('../src/cdp')
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
-const { execSync } = require('child_process')
-const qrTerm = require('qrcode-terminal')
 const { transcribeVoice } = require('../src/transcribe')
 
-const DATA_DIR = path.join(os.homedir(), '.wechat-bro')
+const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-bro-inject-e2e-'))
 const WX_URL = 'https://wx.qq.com'
 const INJECT_SCRIPT = fs.readFileSync(path.join(__dirname, '..', 'src', 'wechat-bro.js'), 'utf-8')
 
 fs.mkdirSync(DATA_DIR, { recursive: true })
 
-const FIRST_LOGIN = process.argv.includes('--first-login')
 const HEADED = process.argv.includes('--headed')
-const LOGIN_TIMEOUT = 300_000  // 5 min for QR scan
 
 // ── URL conversion (pure, no browser needed) ──────────────────────────────
 function toLoginUrl(qrUrl) {
@@ -71,6 +52,7 @@ function eq(a, b, msg) {
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────
+let activeBrowser = null
 async function main() {
   console.log('test-inject.js — Real-account integration tests')
   console.log('='.repeat(56))
@@ -89,6 +71,7 @@ async function main() {
 
   // ── Allocate a WeChat tab through WebHelm; do not start Chrome ───────
   const browser = await WebHelmBrowser.open({ url: 'about:blank', headed: HEADED, dataDir: DATA_DIR })
+  activeBrowser = browser
   const page = browser.page
   suite('2. WebHelm-managed browser')
   ok(!!browser.sessionId, 'WebHelm Session was leased')
@@ -150,7 +133,10 @@ async function main() {
   ok(varsExist, 'WechatyBro.vars is defined')
 
   // ── Check login state ─────────────────────────────────────────────────
-  const isLoggedIn = await page.evaluate(() => !!(window.MMCgi && window.MMCgi.isLogin))
+  const isLoggedIn = await page.evaluate(() => !!(
+    (window.MMCgi && window.MMCgi.isLogin) ||
+    (window.WechatyBro && window.WechatyBro.vars && window.WechatyBro.vars.loginState)
+  ))
 
   suite('5. Login detection')
 
@@ -388,7 +374,9 @@ async function main() {
   })
 
   // Test room: reuse the first room found earlier (if any)
-  contactInfo.testneo = rooms.length > 0 ? { name: rooms[0].name, isRoom: true } : null
+  // Do not send a live test message into an arbitrary 'first' room.
+  const approvedRoom = rooms.find(r => r.name === 'testneo')
+  contactInfo.testneo = approvedRoom ? { name: approvedRoom.name, isRoom: true } : null
 
   console.log(`    filehelper: "${contactInfo.filehelper.name}"`)
   if (contactInfo.testneo) console.log(`    test room: "${contactInfo.testneo.name}"`)
@@ -1085,11 +1073,15 @@ async function main() {
 
   // Close browser
   await browser.close()
+  activeBrowser = null
+  fs.rmSync(DATA_DIR, { recursive: true, force: true })
 
   if (fail > 0) process.exit(1)
 }
 
-main().catch(e => {
+main().catch(async e => {
   console.error('\n  FATAL:', e.message)
+  if (activeBrowser) { try { await activeBrowser.close() } catch {} }
+  fs.rmSync(DATA_DIR, { recursive: true, force: true })
   process.exit(1)
 })

@@ -524,9 +524,13 @@
 
     emit: function (event, data) {
       log('emit:', event, typeof data === 'object' ? JSON.stringify(data).substring(0, 120) : data)
-      if (typeof window.sendToWebHelm === 'function') {
-        window.sendToWebHelm(event, data)
-      }
+      // Prefer the WebHelm binding; retain the old callback for embedded
+      // Puppeteer/Playwright/Electron/iOS hosts that inject this bridge.
+      // This compatibility path does NOT launch or depend on Puppeteer.
+      var receiver = typeof window.sendToWebHelm === 'function'
+        ? window.sendToWebHelm
+        : window.sendToPuppeteer
+      if (typeof receiver === 'function') receiver(event, data)
     },
 
     angularIsReady: angularIsReady,

@@ -41,7 +41,7 @@ const path = require('path')
 const os = require('os')
 const { execSync } = require('child_process')
 const readline = require('readline')
-const { WebHelmBrowser, findSystemChrome } = require('./cdp')
+const { WebHelmBrowser, findSystemChrome, resolveEndpoint } = require('./cdp')
 const qrcode = require('qrcode-terminal')
 // NOTE: WeChat login QR code is intentionally NOT drawn in the terminal.
 // The scan event emits {url} — open it in a browser window (headless mode)
@@ -548,6 +548,7 @@ Usage:
                                     (error if no daemon is running)
   wechat-bro --help                 Show this help
   wechat-bro --version              Show version
+  wechat-bro doctor                 Verify WebHelm service/Chrome dependency without launching WeChat
 
 Flags:
   --headed          Show browser window (default: headless)
@@ -624,6 +625,15 @@ async function main() {
     try { version = require('../package.json').version } catch {}
     process.stdout.write(version + '\n')
     process.exit(0)
+  }
+
+  if (argv[0] === 'doctor') {
+    const info = await resolveEndpoint()
+    process.stdout.write(JSON.stringify({
+      ok: true, dependency: 'webhelm', version: info.version,
+      endpoint: info.endpoint, profile: info.profile,
+    }) + '\n')
+    return
   }
 
   const WS_PORT = parseInt(process.env.WS_PORT || extractPort(argv) || '9231', 10)
@@ -1115,7 +1125,9 @@ async function dispatch(cmd, args, page) {
 // Only auto-run when executed directly (not when required for tests)
 if (require.main === module) {
   main().catch(e => {
-    log('Fatal:', e.message)
+    // Fatal startup errors must be visible even with --quiet, daemon spawn,
+    // or when stdout is reserved for JSON events.
+    console.error('[cli] Fatal:', e && e.message || String(e))
     process.exit(1)
   })
 }

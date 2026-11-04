@@ -15,13 +15,24 @@ There is no Puppeteer dependency, separate Chrome process, login-cookie export, 
 
 ## Install
 
-Install WebHelm first and prepare its managed Chrome. Then install wechat-bro.
+WebHelm is a required **external service**, not a Node dependency. Use a
+separately installed WebHelm Runtime version 1.0.1 or newer; it owns the shared
+Chrome, profile, Tab Groups and Session IPC. WeChat-bro never installs or starts
+a second browser.
 
 ```bash
 webhelm setup
 npm install
 webhelm status
+npm run doctor       # or: wechat-bro doctor
 ```
+
+The doctor verifies WebHelm Session IPC, Runtime version, and Chrome health;
+wechat-bro also checks this at startup. Missing or outdated WebHelm returns
+a clear webhelm_unavailable error with setup instructions. CDP endpoints are
+obtained from WebHelm, never guessed from a fixed port. WEBHELM_SOCKET and
+WEBHELM_RUNTIME_DIR may point to an existing test runtime, but
+WEBHELM_CDP_ENDPOINT must match its managed Chrome.
 
 ## Quick start
 
