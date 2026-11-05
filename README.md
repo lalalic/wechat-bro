@@ -76,6 +76,13 @@ the bot by chatting with filehelper instead.
 Test with npm test (offline) and npm run test:live:ui (real WebHelm Chrome
 with mocked settings; no messages sent).
 
+The Chats contact selector follows the highlighted WeChat conversation
+automatically on panel open and on chat/title changes. It reads the active
+WeChat UserName and contact display name rather than the surrounding header
+which contains group member counts. A manually chosen contact is preserved
+until the highlighted chat changes. Test with npm run test:live:active-chat
+in an isolated Chrome tab without sending messages.
+
 The six dropdowns use a compact, keyboard-accessible Shadow DOM listbox
 instead of the native macOS select popup. This keeps option fonts, menu width,
 and positioning consistent even when Chrome renders native menus at a different

@@ -20,7 +20,8 @@
     "test:live:exit": "node test/test-daemon-exit.js",
     "doctor": "node src/cli.js doctor",
     "test:live:ui": "node test/test-ui-live.js",
-    "test:live:select": "node test/test-select-popup.js"
+    "test:live:select": "node test/test-select-popup.js",
+    "test:live:active-chat": "node test/test-active-chat-sync.js"
   },
   "engines": {
     "node": ">=18"

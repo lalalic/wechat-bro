@@ -285,31 +285,116 @@
       value:a.name,label:a.name+' ('+a.type+')'
     })),'自动选择')
     fill('agent',catalog.agents.map(a=>({value:a.name,label:a.name})))
-    updateSelection()
+    syncActiveChat(true)
   }
   function updateSelection() {
     const current = selectedChat()
     const s = catalog && catalog.orchestrator && catalog.orchestrator.contexts &&
       catalog.orchestrator.contexts.find(item => item.context === current)
-    if (s && s.agent) el('route').value = s.agent
-    if (s && s.mode) el('mode').value = s.mode
+    // A newly highlighted chat must not inherit the previous chat's
+    // selected Agent or assistant mode before a watch has been configured.
+    el('route').value = s && s.agent || ''
+    el('mode').value = s && s.mode || 'maintainer'
     syncSelect('route')
     syncSelect('mode')
     if (s) alert('当前：'+s.state+' · '+(s.agent||'未分配'))
+    else alert('')
   }
   function currentChat() {
+    // WeChat Web exposes getCurrentUserName(), not getCurrentChat().
+    // Prefer the active contact model and its display name: the surrounding
+    // header may also contain room member counts such as "(3)".
+    const title = document.querySelector('.title_wrap .title_name')
+    const active = document.querySelector('.chat_item.active[data-username]')
+    const headerId = title && title.getAttribute('data-username')
+    const listId = active && active.getAttribute('data-username')
+    let modelId = null
+    let contact = null
     try {
-      const injector = window.angular && angular.element(document).injector()
-      const chats = injector && injector.get('chatFactory')
-      const contacts = injector && injector.get('contactFactory')
-      let chat = chats && chats.getCurrentChat && chats.getCurrentChat()
-      if (!chat) return null
-      if (typeof chat === 'string') chat = contacts.getContact(chat)
-      else if (chat.UserName && contacts) chat = contacts.getContact(chat.UserName) || chat
-      return String(chat.getDisplayName ? chat.getDisplayName() :
-        (chat.RemarkName||chat.NickName||'')).trim() || null
-    } catch {return null}
+      const injector = window.angular && window.angular.element(document).injector()
+      if (injector) {
+        const chats = injector.get('chatFactory')
+        const contacts = injector.get('contactFactory')
+        modelId = chats.getCurrentUserName && chats.getCurrentUserName()
+        const selectedId = modelId || headerId || listId
+        if (selectedId) contact = contacts.getContact(selectedId)
+      }
+    } catch {}
+    const id = modelId || headerId || listId
+    if (!id) return null
+    // If Angular is not ready or the chat is absent from its cache, read
+    // only the name anchor (not .title_wrap with extra member counts).
+    let name = ''
+    try {
+      name = String(contact && (
+        (contact.getDisplayName && contact.getDisplayName()) ||
+        contact.RemarkName || contact.NickName
+      ) || '').trim()
+    } catch {}
+    if (!name && headerId === id) name = (title.textContent || '').trim()
+    if (!name) return null
+    const isRoom = !!(contact && contact.isRoomContact && contact.isRoomContact())
+    return { id, name, isRoom }
   }
+
+  let lastActiveSignature = null
+  let syncQueued = false
+  function syncActiveChat(force = false) {
+    if (!catalog) return
+    const selected = currentChat()
+    if (!selected) return
+    const signature = selected.id + '\n' + selected.name
+    if (!force && signature === lastActiveSignature) return
+    lastActiveSignature = signature
+
+    const dropdown = el('contacts')
+    // Remove only the prior temporary entry, not existing contacts.
+    for (const option of [...dropdown.options]) {
+      if (option.dataset.wbCurrentTemp === 'true') option.remove()
+    }
+    if (![...dropdown.options].some(option => option.value === selected.name)) {
+      // Some active conversations have not been loaded into the contacts
+      // catalogue yet. They must still be selectable without a manual entry.
+      const option = new Option(
+        (selected.isRoom ? '[群] ' : '') + selected.name, selected.name)
+      option.dataset.wbCurrentTemp = 'true'
+      dropdown.add(option)
+    }
+    dropdown.value = selected.name
+    el('context').value = ''
+    syncSelect('contacts')
+    if (openSelectId === 'contacts') closeSelectMenu()
+    updateSelection()
+  }
+
+  function scheduleActiveSync() {
+    if (syncQueued) return
+    syncQueued = true
+    Promise.resolve().then(() => {
+      syncQueued = false
+      syncActiveChat()
+    })
+  }
+
+  // WeChat changes the active chat in Angular and updates the title anchor.
+  // Listen to both (rather than polling the whole page) so selection updates
+  // even if the AI panel stays open while switching conversations.
+  try {
+    const injector = window.angular && window.angular.element(document).injector()
+    const rootScope = injector && injector.get('$rootScope')
+    const chats = injector && injector.get('chatFactory')
+    if (rootScope && chats && typeof chats.getCurrentUserName === 'function') {
+      rootScope.$watch(() => chats.getCurrentUserName(), scheduleActiveSync)
+    }
+  } catch {}
+  const chatTitle = document.querySelector('.title_wrap')
+  if (chatTitle) {
+    new MutationObserver(scheduleActiveSync).observe(chatTitle, {
+      subtree: true, characterData: true, childList: true,
+      attributes: true, attributeFilter: ['data-username'],
+    })
+  }
+  scheduleActiveSync()
   // A same-origin WeChat script must not be able to synthesize admin clicks.
   // CDP Input and real mouse/keyboard clicks set isTrusted; element.click()
   // and dispatchEvent() from page scripts do not.
@@ -317,14 +402,18 @@
     if (!event.isTrusted) return
     fn()
   })}
-  bind('open',()=>{el('panel').hidden = !el('panel').hidden; if(!el('panel').hidden) attempt(refresh)})
+  bind('open',()=>{
+    el('panel').hidden = !el('panel').hidden
+    if (!el('panel').hidden) {
+      syncActiveChat(true)
+      attempt(refresh)
+    }
+  })
   bind('close',()=>{el('panel').hidden = true})
   bind('refresh',()=>attempt(refresh,'状态已刷新'))
   bind('current',()=>{
-    const name = currentChat()
-    if (!name) return alert('无法获取当前聊天，请从列表选择',true)
-    el('context').value = name
-    updateSelection()
+    if (!currentChat()) return alert('无法获取当前聊天，请从列表选择',true)
+    syncActiveChat(true)
   })
   el('contacts').addEventListener('change',()=>{el('context').value='';updateSelection()})
   el('context').addEventListener('change',updateSelection)
