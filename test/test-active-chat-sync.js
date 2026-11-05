@@ -73,17 +73,18 @@ async function selected() {
     'temp:[...select.options].filter(o=>o.dataset.wbCurrentTemp==="true").map(o=>o.value),'+
     'route:root.getElementById("route").value,mode:root.getElementById("mode").value};})()')
 }
-async function switchChat(id,name,room) {
+async function switchChat(id,name,room,expectedName=name) {
   await evaluate('(() => {'+
     'const id='+JSON.stringify(id)+',name='+JSON.stringify(name)+',room='+JSON.stringify(room)+';'+
     'window.__currentChatId=id;'+
     'window.__contacts[id]={UserName:id,NickName:name,getDisplayName:()=>name,isRoomContact:()=>room};'+
     'const title=document.querySelector(".title_wrap .title_name");'+
-    'title.setAttribute("data-username",id);title.textContent=name;'+
+    'title.setAttribute("data-username",id);'+
+    '(name.includes("<img")?title.innerHTML=name:title.textContent=name);'+
     'document.querySelector(".chat_item.active").setAttribute("data-username",id);'+
     'window.__watchChat?.();'+
   '})()')
-  await waitFor('document.getElementById("wechat-bro-management").shadowRoot.getElementById("contacts").value==='+JSON.stringify(name))
+  await waitFor('document.getElementById("wechat-bro-management").shadowRoot.getElementById("contacts").value==='+JSON.stringify(expectedName))
 }
 async function test() {
   await connect()
@@ -106,7 +107,7 @@ async function test() {
       'n==="$rootScope"?{$watch:(fn,cb)=>{window.__watchChat=cb}}:null})})};'+
     'window.wechatBroUiBridge=(nonce,id,payload)=>{'+
       'const data=payload.action==="catalog"?'+
-      '{contacts:["Claire","filehelper"],rooms:["testneo"],'+
+      '{contacts:["Claire","filehelper"],rooms:["testneo","🌹️MobileNet手机上网电视"],'+
         'agents:[{name:"agent-a",type:"contact"},{name:"agent-b",type:"room"}],'+
         'orchestrator:{contexts:[]},daemon:{healthy:true}}:{};'+
       'Promise.resolve().then(()=>window.__wechatBroUiResponse(id,{ok:true,data}))};'+
@@ -154,6 +155,33 @@ async function test() {
   assert.deepEqual(value.temp,['临时群'])
   assert.equal(value.label,'[群] 临时群')
   console.log('uncatalogued active group PASS',JSON.stringify(value))
+
+  // The real MobileNet room's getDisplayName() contains two WeChat emoji
+  // images; the daemon canonical name strips an invalid emoji codepoint and
+  // keeps the rose. The UI MUST select the same routable name, not raw HTML.
+  const emojiHtml = '<img class="emoji emoji1f339" text="rose_web" src="/spacer.gif" />' +
+    '<img class="emoji emoji3320e3" text="_web" src="/spacer.gif" />' +
+    '️MobileNet手机上网电视'
+  const canonical = '🌹️MobileNet手机上网电视'
+  await evaluate('window.WechatyBro={_userNameToName:{"@@mobile":'+JSON.stringify(canonical)+'}}')
+  await switchChat('@@mobile', emojiHtml, true, canonical)
+  value=await selected()
+  assert.equal(value.value, canonical, 'correct canonical routing identity')
+  assert.equal(value.label, '[群] ' + canonical, 'no HTML in dropdown')
+  assert.deepEqual(value.temp, [], 'existing canonical room is used, not a duplicate')
+  assert(!value.label.includes('<img'), 'raw img markup must not be displayed')
+  console.log('MobileNet emoji HTML canonical map PASS', JSON.stringify(value))
+
+  // Even if the cached name map is unavailable, use the exact same
+  // cleanName normalizer as the daemon.
+  await switchChat('@claire', 'Claire', false)
+  await evaluate('delete window.WechatyBro')
+  await switchChat('@@mobile', emojiHtml, true, canonical)
+  value=await selected()
+  assert.equal(value.value, canonical)
+  assert.equal(value.label, '[群] ' + canonical)
+  assert.deepEqual(value.temp, [])
+  console.log('MobileNet emoji HTML fallback normalization PASS')
 
   await switchChat('@@testneo','testneo',true)
   value=await selected()

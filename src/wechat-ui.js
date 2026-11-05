@@ -300,6 +300,16 @@
     if (s) alert('当前：'+s.state+' · '+(s.agent||'未分配'))
     else alert('')
   }
+  function cleanRoutingName(value) {
+    // Match WechatyBro.cleanName() exactly: contact routing and UI must use
+    // the same canonical name, not an HTML nickname containing emoji <img>.
+    return String(value || '')
+      .replace(/<img[^>]*class="emoji emoji([0-9a-f]+)"[^>]*>/gi, (_, code) => {
+        try { return String.fromCodePoint(parseInt(code, 16)) } catch { return '' }
+      })
+      .replace(/<[^>]+>/g, '').trim()
+  }
+
   function currentChat() {
     // WeChat Web exposes getCurrentUserName(), not getCurrentChat().
     // Prefer the active contact model and its display name: the surrounding
@@ -326,12 +336,22 @@
     // only the name anchor (not .title_wrap with extra member counts).
     let name = ''
     try {
-      name = String(contact && (
-        (contact.getDisplayName && contact.getDisplayName()) ||
-        contact.RemarkName || contact.NickName
-      ) || '').trim()
+      // Prefer WechatyBro's canonical UserName -> name map. It already
+      // normalizes emoji <img> elements to Unicode for command routing.
+      const canonical = window.WechatyBro &&
+        window.WechatyBro._userNameToName &&
+        window.WechatyBro._userNameToName[id]
+      if (typeof canonical === 'string' && canonical.trim()) name = canonical.trim()
+      if (!name && contact) {
+        const raw = (contact.getDisplayName && contact.getDisplayName()) ||
+          contact.RemarkName || contact.NickName || ''
+        name = cleanRoutingName(raw)
+        if ((contact.isFileHelper && contact.isFileHelper()) ||
+            id === 'filehelper' || name === '文件传输助手' ||
+            name === 'File Transfer') name = 'filehelper'
+      }
     } catch {}
-    if (!name && headerId === id) name = (title.textContent || '').trim()
+    if (!name && headerId === id) name = cleanRoutingName(title.textContent)
     if (!name) return null
     const isRoom = !!(contact && contact.isRoomContact && contact.isRoomContact())
     return { id, name, isRoom }
