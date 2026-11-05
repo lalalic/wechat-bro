@@ -76,6 +76,13 @@ the bot by chatting with filehelper instead.
 Test with npm test (offline) and npm run test:live:ui (real WebHelm Chrome
 with mocked settings; no messages sent).
 
+The six dropdowns use a compact, keyboard-accessible Shadow DOM listbox
+instead of the native macOS select popup. This keeps option fonts, menu width,
+and positioning consistent even when Chrome renders native menus at a different
+scale. Run npm run test:live:select to test all six with real Chrome pointer
+events in a disposable about:blank tab (without touching the active WeChat
+session).
+
 ## Agent management through WeChat
 
 Use filehelper in the WeChat Web UI to list Agents, inspect and edit their

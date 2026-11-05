@@ -22,6 +22,16 @@
     'nav button.active{background:#e3f2eb;color:#087f5b;font-weight:bold}',
     'section[data-pane]{padding:13px}label{font-weight:600;font-size:12px;display:block;margin:7px 0 5px}',
     'input,select,textarea{width:100%;border:1px solid #ddd;border-radius:6px;padding:8px;color:#222;background:white}',
+    'select[data-wb-native]{display:none!important}',
+    '.wb-trigger{width:100%;min-height:38px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;text-align:left;border:1px solid #ddd;border-radius:6px;background:#fff;color:#222;font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;cursor:pointer}',
+    '.wb-trigger:focus-visible{outline:2px solid #087f5b;outline-offset:2px}',
+    '.wb-trigger .wb-value{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.wb-trigger .wb-chevron{font-size:12px;flex-shrink:0;color:#555}',
+    '#wb-menu{position:absolute;z-index:100;pointer-events:auto;overflow-y:auto;overscroll-behavior:contain;background:white;color:#222;border:1px solid #cfd6d2;border-radius:8px;box-shadow:0 8px 22px #0003;padding:4px;font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}',
+    '#wb-menu button{display:block;width:100%;text-align:left;font:inherit!important;line-height:1.45!important;font-size:13px!important;min-height:32px;padding:7px 9px;margin:0;background:transparent;border:0;border-radius:5px;color:inherit;cursor:pointer;white-space:nowrap;text-overflow:ellipsis;overflow:hidden}',
+    '#wb-menu button:hover,#wb-menu button.wb-active{background:#e7f4ee}',
+    '#wb-menu button[aria-selected="true"]{font-weight:600;color:#087f5b}',
+
     'textarea{height:210px;resize:vertical;font:12px ui-monospace,monospace;white-space:pre}',
     '.actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}',
     '.actions button{padding:8px 10px;border-radius:6px;border:1px solid #ddd;background:#f6f6f6;cursor:pointer}',
@@ -67,6 +77,149 @@
   const el = id => root.getElementById(id)
   const pending = new Map()
   let seq = 0, catalog = null, agentRev = null, docRev = null
+  // Replace native macOS select popups: they do not reliably respect the
+  // Shadow DOM's font size/viewport and can render huge and misplaced.
+  // Keep the original select elements as the single source of form state.
+  const menu = document.createElement('div')
+  menu.id = 'wb-menu'
+  menu.setAttribute('role', 'listbox')
+  menu.hidden = true
+  root.appendChild(menu)
+  const triggers = new Map()
+  let openSelectId = null
+  let activeOption = -1
+
+  function syncSelect(id) {
+    const select = el(id), trigger = triggers.get(id)
+    if (!trigger) return
+    const selected = [...select.options].find(option => option.value === select.value)
+    trigger.querySelector('.wb-value').textContent = selected ? selected.textContent : ''
+    trigger.querySelector('.wb-value').style.color = !select.value ? '#666' : '#222'
+  }
+
+  function closeSelectMenu() {
+    if (openSelectId) {
+      triggers.get(openSelectId).setAttribute('aria-expanded', 'false')
+    }
+    openSelectId = null
+    menu.hidden = true
+    menu.replaceChildren()
+  }
+
+  function activate(index) {
+    const items = [...menu.querySelectorAll('button[role="option"]')]
+    if (!items.length) return
+    activeOption = Math.min(items.length - 1, Math.max(0, index))
+    for (let i = 0; i < items.length; i++) {
+      items[i].classList.toggle('wb-active', i === activeOption)
+    }
+    items[activeOption].scrollIntoView({ block: 'nearest' })
+  }
+
+  function chooseOption(value) {
+    if (!openSelectId) return
+    const id = openSelectId
+    const select = el(id)
+    select.value = value
+    syncSelect(id)
+    closeSelectMenu()
+    select.dispatchEvent(new Event('change', { bubbles: true }))
+    // A programmatic change event is untrusted; this callback is only
+    // reachable from a verified pointer/keyboard gesture in our menu.
+    if (id === 'agent') {
+      agentRev = null
+      attempt(loadAgent)
+    }
+    triggers.get(id).focus()
+  }
+
+  function openSelectMenu(id) {
+    if (openSelectId === id) { closeSelectMenu(); return }
+    closeSelectMenu()
+    const select = el(id), trigger = triggers.get(id)
+    openSelectId = id
+    trigger.setAttribute('aria-expanded', 'true')
+    menu.setAttribute('aria-labelledby', trigger.id)
+    menu.replaceChildren()
+    const options = [...select.options].filter(option => !option.disabled)
+    options.forEach((option, index) => {
+      const item = document.createElement('button')
+      item.type = 'button'
+      item.setAttribute('role', 'option')
+      item.setAttribute('aria-selected', String(option.value === select.value))
+      item.textContent = option.textContent
+      item.title = option.textContent
+      item.addEventListener('click', event => {
+        if (event.isTrusted) chooseOption(option.value)
+      })
+      menu.appendChild(item)
+    })
+    if (!options.length) {
+      closeSelectMenu()
+      return
+    }
+    menu.hidden = false
+    const rect = trigger.getBoundingClientRect()
+    const menuHeight = Math.min(256, menu.scrollHeight)
+    const below = window.innerHeight - rect.bottom - 8
+    const above = rect.top - 8
+    const showAbove = below < Math.min(menuHeight, 128) && above > below
+    const available = Math.max(48, showAbove ? above : below)
+    const height = Math.min(menuHeight, available)
+    menu.style.maxHeight = height + 'px'
+    menu.style.width = Math.min(rect.width, window.innerWidth - 16) + 'px'
+    menu.style.left = Math.max(8, Math.min(rect.left, window.innerWidth - rect.width - 8)) + 'px'
+    menu.style.top = Math.max(4, showAbove ? rect.top - height - 4 : rect.bottom + 4) + 'px'
+    activeOption = options.findIndex(option => option.value === select.value)
+    activate(Math.max(0, activeOption))
+  }
+
+  for (const id of ['contacts', 'route', 'mode', 'agent', 'scope', 'kind']) {
+    const native = el(id)
+    native.dataset.wbNative = 'true'
+    const trigger = document.createElement('button')
+    trigger.id = id + '-button'
+    trigger.className = 'wb-trigger'
+    trigger.type = 'button'
+    trigger.setAttribute('aria-haspopup', 'listbox')
+    trigger.setAttribute('aria-controls', 'wb-menu')
+    trigger.setAttribute('aria-expanded', 'false')
+    const label = document.createElement('span')
+    label.className = 'wb-value'
+    const arrow = document.createElement('span')
+    arrow.className = 'wb-chevron'
+    arrow.textContent = '⌄'
+    arrow.setAttribute('aria-hidden', 'true')
+    trigger.append(label, arrow)
+    native.insertAdjacentElement('afterend', trigger)
+    triggers.set(id, trigger)
+    syncSelect(id)
+    trigger.addEventListener('click', event => {
+      if (event.isTrusted) openSelectMenu(id)
+    })
+    trigger.addEventListener('keydown', event => {
+      if (!event.isTrusted) return
+      if (event.key === 'Escape') { closeSelectMenu(); return }
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault()
+        if (openSelectId === id) {
+          const option = [...native.options].filter(item => !item.disabled)[activeOption]
+          if (option) chooseOption(option.value)
+        } else openSelectMenu(id)
+      } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault()
+        if (openSelectId !== id) openSelectMenu(id)
+        else activate(activeOption + (event.key === 'ArrowDown' ? 1 : -1))
+      } else if (event.key === 'Tab') closeSelectMenu()
+    })
+  }
+  root.addEventListener('pointerdown', event => {
+    if (openSelectId && !menu.contains(event.target) &&
+        event.target !== triggers.get(openSelectId) &&
+        !triggers.get(openSelectId).contains(event.target)) closeSelectMenu()
+  }, true)
+  el('panel').addEventListener('scroll', closeSelectMenu, { passive: true })
+  window.addEventListener('resize', closeSelectMenu)
   function alert(message, isError = false) {
     const node = el('feedback')
     node.hidden = !message
@@ -106,6 +259,8 @@
     if (placeholder) node.add(new Option(placeholder,''))
     for (const entry of entries) node.add(new Option(entry.label,entry.value))
     if ([...node.options].some(option => option.value === old)) node.value = old
+    syncSelect(id)
+    if (openSelectId === id) closeSelectMenu()
   }
   function selectedChat() { return el('context').value.trim() || el('contacts').value }
   async function attempt(fn, message) {
@@ -138,6 +293,8 @@
       catalog.orchestrator.contexts.find(item => item.context === current)
     if (s && s.agent) el('route').value = s.agent
     if (s && s.mode) el('mode').value = s.mode
+    syncSelect('route')
+    syncSelect('mode')
     if (s) alert('当前：'+s.state+' · '+(s.agent||'未分配'))
   }
   function currentChat() {
@@ -173,6 +330,7 @@
   el('context').addEventListener('change',updateSelection)
   for (const btn of root.querySelectorAll('nav button')) {
     btn.addEventListener('click',()=>{
+      closeSelectMenu()
       for(const other of root.querySelectorAll('nav button')) other.classList.toggle('active',other===btn)
       for(const panel of root.querySelectorAll('[data-pane]')) panel.hidden=panel.dataset.pane!==btn.dataset.tab
       alert('')

@@ -19,7 +19,8 @@
     "test:live": "node test/test-inject.js",
     "test:live:exit": "node test/test-daemon-exit.js",
     "doctor": "node src/cli.js doctor",
-    "test:live:ui": "node test/test-ui-live.js"
+    "test:live:ui": "node test/test-ui-live.js",
+    "test:live:select": "node test/test-select-popup.js"
   },
   "engines": {
     "node": ">=18"
