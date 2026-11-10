@@ -271,6 +271,11 @@ class DaemonLifecycle {
       await this.handleSleep('timer gap', { elapsedMs: elapsed })
       return this.handleWake('timer gap wake', { elapsedMs: elapsed })
     }
+    // Recover again on the next health tick if an earlier bounded recovery
+    // exhausted its retries. Do not touch a live or login-required page.
+    if (!this.page && this.state === STATES.RECOVERING && !this.recovery && this.recoverPage) {
+      return this.recover('periodic orphaned page retry')
+    }
     return null
   }
 

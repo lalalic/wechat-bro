@@ -13,6 +13,26 @@ AI multi-agent interface for WeChat Web, using WebHelm-managed Chrome.
 
 There is no Puppeteer dependency, separate Chrome process, login-cookie export, or custom browser pool.
 
+## Self-healing / service ownership
+
+Register `wechat-bro/daemon` and `wechat-bro/orchestrator` with
+`node skills/wechat-bro/bin/services.mjs setup` and monitor them via
+`node skills/wechat-bro/bin/services.mjs status` (PM2). PM2 restarts crashed
+processes; the orchestrator reconnects instead of spawning a competing daemon
+when PM2 owns it. Standalone orchestrators can still spawn their own child.
+
+On startup, the daemon reclaims a previous recorded Session when safe. If
+WebHelm reports **WeChat pool exhausted at size 1**, and its capacity shows
+one leased tab but **no live WeChat Session**, the daemon deletes **only** its
+app-owned WeChat Tab Group and retries allocation **once**. It never deletes a
+group with a registered live Session and does not reset on unrelated errors.
+If a page-recovery attempt exhausts retries, a subsequent lifecycle health tick
+tries again without touching authenticated or login-required sessions.
+WeChat login/profile data, other WebHelm groups and contact sessions remain
+untouched. See `npm test` (`test/test-self-heal.js`) for fault-injection tests.
+This deterministic recovery is not an autonomous code-editing agent: persistent
+errors are exposed in PM2 logs for diagnosis.
+
 ## Install
 
 WebHelm is a required **external service**, not a Node dependency. Use a

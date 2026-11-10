@@ -718,7 +718,7 @@ async function main() {
     process.exit(1)
   }
 
-  let browser = await WebHelmBrowser.open({ url: 'about:blank', headed: HEADED, dataDir: DATA_DIR })
+  let browser = await WebHelmBrowser.open({ url: 'about:blank', headed: HEADED, dataDir: DATA_DIR, allowOrphanRecovery: true })
   let page = (await browser.pages())[0]
   _releaseBrowser = () => browser.close()
   let bootstrapping = true
@@ -814,7 +814,7 @@ async function main() {
     page = null
     browser = null
     try { await oldBrowser.close() } catch {}
-    browser = await WebHelmBrowser.open({ url: 'about:blank', headed: HEADED, dataDir: DATA_DIR })
+    browser = await WebHelmBrowser.open({ url: 'about:blank', headed: HEADED, dataDir: DATA_DIR, allowOrphanRecovery: true })
     _releaseBrowser = () => browser.close()
     page = (await browser.pages())[0]
     lifecycle.setPage(page)

@@ -459,6 +459,37 @@ class CdpPage extends EventEmitter {
   close() { this.conn.close() }
 }
 
+/**
+ * Recover the one WeChat-owned tab after WebHelm lost its Session record.
+ * The CLI has already bound its exclusive WebSocket port before calling this,
+ * and startup has already reaped any durable receipt from an older daemon.
+ * Never touch the group if a live WeChat Session is still registered, or if
+ * the failure/capacity evidence does not match this exact orphan scenario.
+ */
+async function startWechatSession({ url, dataDir, allowOrphanRecovery = false, request = requestRuntime,
+  cleanup = destroyWechatWorkspace, report = message => console.error(message) }) {
+  const create = () => request({ op: 'workspace-create', name: WECHAT_WORKSPACE, pool_size: 1 })
+  const start = () => request({ op: 'start', workspace: WECHAT_WORKSPACE, url })
+  await create()
+  try {
+    return await start()
+  } catch (error) {
+    if (!allowOrphanRecovery || !/^Workspace WeChat pool is exhausted at size 1$/.test(String(error.message))) throw error
+    const capacity = await request({ op: 'capacity', workspace: WECHAT_WORKSPACE })
+    const active = await request({ op: 'list' })
+    if (capacity.poolSize !== 1 || capacity.idle !== 0 || capacity.leased !== 1 ||
+        !Array.isArray(active.sessions) || active.sessions.some(s => s.workspace === WECHAT_WORKSPACE)) {
+      throw error // live or uncertain ownership: never force-release
+    }
+    // The previous daemon has no live Session. Release only its app-owned
+    // tab group, then retry allocation exactly once (no unbounded reset loop).
+    await cleanup({ dataDir })
+    report('[wechat-bro] removed orphaned WebHelm WeChat tab (no live Session); retrying allocation')
+    await create()
+    return start()
+  }
+}
+
 // ── Browser (one WebHelm Session) ─────────────────────────────────────────
 class WebHelmBrowser extends EventEmitter {
   constructor({ sessionId, targetId, page, dataDir }) {
@@ -496,11 +527,10 @@ class WebHelmBrowser extends EventEmitter {
   }
 
   /** Open one tab through WebHelm. Never launches or kills Chrome. */
-  static async open({ url = 'about:blank', headed = false, dataDir, viewport } = {}) {
+  static async open({ url = 'about:blank', headed = false, dataDir, viewport, allowOrphanRecovery = false } = {}) {
     const { endpoint } = await resolveEndpoint()
     await reapStaleSession(dataDir)
-    await requestRuntime({ op: 'workspace-create', name: WECHAT_WORKSPACE, pool_size: 1 })
-    const started = await requestRuntime({ op: 'start', workspace: WECHAT_WORKSPACE, url })
+    const started = await startWechatSession({ url, dataDir, allowOrphanRecovery })
     if (!started.session_id || !started.target_id) throw new Error('webhelm session start returned no session_id/target_id')
     let conn
     try {
@@ -548,4 +578,4 @@ function findSystemChrome() {
   return candidates.find((p) => fs.existsSync(p)) || null
 }
 
-module.exports = { WebHelmBrowser, CdpPage, CdpConnection, findSystemChrome, serializeArgs, requestRuntime, destroyWechatWorkspace, resolveEndpoint, versionAtLeast, MIN_WEBHELM_VERSION, wsBase }
+module.exports = { WebHelmBrowser, CdpPage, CdpConnection, findSystemChrome, serializeArgs, requestRuntime, startWechatSession, destroyWechatWorkspace, resolveEndpoint, versionAtLeast, MIN_WEBHELM_VERSION, wsBase }

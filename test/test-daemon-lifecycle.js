@@ -120,6 +120,26 @@ async function run() {
   assert.strictEqual(delays.length, 2, 'backoff is only used between bounded attempts')
   console.log('  ok - bounded recovery/backoff')
 
+  let recoverOnTick = 0
+  const periodic = new DaemonLifecycle({
+    maxAttempts: 0,
+    observer: { start() {}, stop() {} },
+    probe: async () => ({ authenticated: true }),
+    recoverPage: async () => {
+      recoverOnTick++
+      if (recoverOnTick === 1) throw Error('temporary WebHelm outage')
+      return { generation: 2 }
+    },
+  }).setPage({ generation: 1 })
+  assert.strictEqual(await periodic.pageLost('disconnected'), STATES.RECOVERING)
+  assert.strictEqual(recoverOnTick, 1)
+  assert.strictEqual(await periodic.tick(), STATES.AUTHENTICATED)
+  assert.strictEqual(recoverOnTick, 2, 'next health tick retries exhausted page recovery')
+  await periodic.tick()
+  assert.strictEqual(recoverOnTick, 2, 'healthy page must not be recreated')
+  periodic.stop()
+  console.log('  ok - periodic health tick retries orphaned pages without touching healthy ones')
+
   assert.strictEqual(isAuthCommand('send-text'), true)
   assert.strictEqual(isAuthCommand('status'), false)
   const child = new EventEmitter()

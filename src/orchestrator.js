@@ -87,6 +87,12 @@ function log(...args) {
   process.stderr.write(`[orchestrator] ${args.join(' ')}\n`)
 }
 
+/** PM2 owns and restarts its separately registered daemon. In that mode the
+ * orchestrator only reconnects; spawning a second child causes port races. */
+function maySpawnDaemonChild(env = process.env) {
+  return env.WECHAT_BRO_NO_DAEMON_SPAWN !== '1' && !env.PM2_HOME
+}
+
 /** Probe whether a wechat-bro daemon answers on this port: the ws-server
  *  broadcasts a `connected` event to every new client as soon as it listens. */
 function probeDaemon(port, timeout = 2000) {
@@ -1482,11 +1488,11 @@ async function runOrchestrator({ port = 9231 } = {}) {
 
   // Daemon lifecycle: adopt a running daemon, or spawn one as OUR child —
   // it then lives and dies with this orchestrator (shutdown kills it), and
-  // is (re)spawned automatically whenever nothing answers on the port.
-  // `--daemon` forces a fresh child even when the port already answers.
-  // WECHAT_BRO_NO_DAEMON_SPAWN=1 disables spawning (unit tests: no Chrome).
+  // is (re)spawned whenever nothing answers on the port. PM2-managed
+  // orchestrators leave daemon ownership to the separately registered service.
+  // WECHAT_BRO_NO_DAEMON_SPAWN=1 explicitly disables child spawning in tests.
   let daemonChild = null
-  const noSpawn = process.env.WECHAT_BRO_NO_DAEMON_SPAWN === '1'
+  const noSpawn = !maySpawnDaemonChild()
   const spawnDaemonChild = () => {
     fs.mkdirSync(DATA_DIR, { recursive: true })
     const fd = fs.openSync(path.join(DATA_DIR, 'daemon.log'), 'a')
@@ -1532,7 +1538,7 @@ async function runOrchestrator({ port = 9231 } = {}) {
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
 
-  if (daemonFlag) spawnDaemonChild()
+  if (daemonFlag && !noSpawn) spawnDaemonChild()
   for (const entry of wakes.list()) {
     if (!controls.isWatched(entry.session)) wakes.take(entry.session)
   }
@@ -1552,4 +1558,5 @@ module.exports = {
   ContactQueue, makeDispatcher, ensureWorkerCli,
   CodexResidentAdapter,
   WAKE_MIN_SECONDS, WAKE_MAX_SECONDS, WAKE_MAX_OVERDUE_SECONDS, WAKES_FILE,
+  maySpawnDaemonChild,
 }
