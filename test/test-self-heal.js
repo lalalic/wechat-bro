@@ -12,9 +12,11 @@ const healthy = { session_id: 'new-session', target_id: 'new-target' }
 function harness({ firstError = EXHAUSTED, capacity = { poolSize: 1, idle: 0, leased: 1 },
   sessions = [], secondError = null, cleanupError = null } = {}) {
   const operations = []
+  const calls = []
   let starts = 0
   const request = async payload => {
     operations.push(payload.op)
+    calls.push(payload)
     if (payload.op === 'workspace-create') return { created: true }
     if (payload.op === 'start') {
       starts++
@@ -32,7 +34,7 @@ function harness({ firstError = EXHAUSTED, capacity = { poolSize: 1, idle: 0, le
     cleaned.push(args)
     if (cleanupError) throw new Error(cleanupError)
   }
-  return { operations, cleaned, messages,
+  return { operations, calls, cleaned, messages,
     start: () => startWechatSession({ url: 'about:blank', dataDir: '/tmp/wechat-test', allowOrphanRecovery: true, request, cleanup,
       report: message => messages.push(message) }) }
 }
@@ -41,6 +43,8 @@ async function run() {
   const normal = harness({ firstError: null })
   assert.deepEqual(await normal.start(), healthy)
   assert.deepEqual(normal.operations, ['workspace-create', 'start'])
+  assert.deepEqual(normal.calls[0], {op: 'workspace-create', name: 'WeChat', pool_size: 1, show_in_menu: false},
+    'initial WeChat Group must be hidden from Extension menu')
   assert.equal(normal.cleaned.length, 0)
 
   // The safety feature is opt-in: generic CDP test clients do not own port 9231.
@@ -54,6 +58,9 @@ async function run() {
   const orphan = harness()
   assert.deepEqual(await orphan.start(), healthy)
   assert.deepEqual(orphan.operations, ['workspace-create', 'start', 'capacity', 'list', 'workspace-create', 'start'])
+  assert.deepEqual(orphan.calls.filter(x=>x.op==='workspace-create'),
+    Array(2).fill({op: 'workspace-create', name: 'WeChat', pool_size: 1, show_in_menu: false}),
+    'recreated WeChat Group must remain hidden after orphan recovery')
   assert.deepEqual(orphan.cleaned, [{ dataDir: '/tmp/wechat-test' }])
   assert.match(orphan.messages[0], /removed orphaned/)
 

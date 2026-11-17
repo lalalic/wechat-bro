@@ -468,7 +468,7 @@ class CdpPage extends EventEmitter {
  */
 async function startWechatSession({ url, dataDir, allowOrphanRecovery = false, request = requestRuntime,
   cleanup = destroyWechatWorkspace, report = message => console.error(message) }) {
-  const create = () => request({ op: 'workspace-create', name: WECHAT_WORKSPACE, pool_size: 1 })
+  const create = () => request({ op: 'workspace-create', name: WECHAT_WORKSPACE, pool_size: 1, show_in_menu: false })
   const start = () => request({ op: 'start', workspace: WECHAT_WORKSPACE, url })
   await create()
   try {
